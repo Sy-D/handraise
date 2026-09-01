@@ -5,7 +5,10 @@ browser, let it ask a human — then continue from the exact same session.**
 
 ![CI](https://github.com/Sy-D/handraise/actions/workflows/ci.yml/badge.svg) ![npm](https://img.shields.io/npm/v/handraise) ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
-> 🎬 *Demo clip coming here.*
+> 🎬
+https://github.com/user-attachments/assets/2ccf6873-dbe7-4571-a489-2d769b5f5e0a
+
+
 
 ```sh
 npm install handraise
