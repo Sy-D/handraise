@@ -21,6 +21,11 @@ export interface RaiseHandOptions {
   timeoutMs?: number
   /** Print a scannable QR code for the handoff URL to the terminal. Default: true. */
   qr?: boolean
+  /**
+   * Solari API key used to create the relay sandbox. Defaults to
+   * `process.env.SOLARI_API_KEY`.
+   */
+  apiKey?: string
 }
 
 export type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>

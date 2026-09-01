@@ -624,7 +624,8 @@ const PAGE = `<!doctype html>
   var ENDINGS = {
     resolved: ["Handed back", "The agent is driving again."],
     aborted: ["Aborted", "You can close this tab."],
-    timeout: ["The agent stopped waiting", "Nobody picked this up in time."]
+    timeout: ["The agent stopped waiting", "Nobody picked this up in time."],
+    disconnected: ["Session lost", "The browser session died. The agent knows."]
   }
 
   function handle(raw) {
@@ -634,7 +635,7 @@ const PAGE = `<!doctype html>
     if (message.type === "frame") showFrame(message.data)
     else if (message.type === "state") reason.textContent = message.reason
     else if (message.type === "ended") {
-      var ending = ENDINGS[message.outcome] || ENDINGS.resolved
+      var ending = ENDINGS[message.outcome] || ["Session ended", "You can close this tab."]
       finish(ending[0], ending[1])
     }
   }

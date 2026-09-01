@@ -24,7 +24,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "lint": "biome check . && oxlint",
-    "test:e2e": "bun test e2e/"
+    "test:e2e": "bun --env-file=.env e2e/handoff.e2e.ts"
   },
   "dependencies": {
     "@solarisdk/browser": "^0.1.2",

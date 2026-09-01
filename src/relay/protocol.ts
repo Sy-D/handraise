@@ -24,7 +24,10 @@ export interface FrameMeta {
 export type AgentToHuman =
   | { type: "frame"; data: string; meta: FrameMeta }
   | { type: "state"; reason: string }
-  | { type: "ended"; outcome: "resolved" | "aborted" | "timeout" }
+  | {
+      type: "ended"
+      outcome: "resolved" | "aborted" | "timeout" | "disconnected"
+    }
 
 export type HumanToAgent =
   | { type: "tap"; fx: number; fy: number }

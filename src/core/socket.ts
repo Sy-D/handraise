@@ -1,0 +1,161 @@
+/**
+ * The agent's side of the relay WebSocket.
+ *
+ * Three behaviours from spikes/s1-report.md and spikes/a-report.md, none of
+ * them optional:
+ *
+ * 1. The preview proxy kills a silent WebSocket after exactly 60 s with close
+ *    code 1006. A ping every 20 s keeps it warm.
+ * 2. 1006 therefore means "reconnect", not "failed". The `agentWsUrl` stays
+ *    valid for an hour, so a dropped socket is recovered with backoff for as
+ *    long as the handoff is running.
+ * 3. The relay answers `ping` itself and does not forward it. A pong proves
+ *    the relay is alive; it proves nothing about the human. There is no signal
+ *    for "the human closed the tab" — the timeout is the honest answer.
+ */
+import WebSocket from "ws"
+
+import {
+  type AgentToHuman,
+  HEARTBEAT_INTERVAL_MS,
+  type Heartbeat,
+  type HumanToAgent,
+  type RelayMessage,
+} from "../relay/protocol"
+
+const MAX_BACKOFF_MS = 8_000
+const BASE_BACKOFF_MS = 500
+const CLOSE_GRACE_MS = 2_000
+
+export interface RelayConnectionOptions {
+  /** `wss://…/ws?role=agent&pt_token=…`, exactly as `startRelay()` returned it. */
+  url: string
+  /** Called for every message the human sends. Never called after `close()`. */
+  onMessage: (message: HumanToAgent) => void
+  /** Called on every successful connect, including reconnects. */
+  onOpen?: () => void
+  /** Heartbeat period. Defaults to the protocol's 20 s. */
+  heartbeatMs?: number
+}
+
+export interface RelayConnection {
+  /**
+   * Send one message. Resolves when the bytes have been handed to the socket,
+   * which is what makes it usable as screencast flow control. Resolves without
+   * sending while the socket is down — a stale frame is worth nothing.
+   */
+  send(message: AgentToHuman | Heartbeat): Promise<void>
+  isOpen(): boolean
+  /** Stop reconnecting and close. Idempotent. */
+  close(): Promise<void>
+}
+
+function toText(data: WebSocket.RawData): string {
+  if (Array.isArray(data)) return Buffer.concat(data).toString("utf8")
+  if (Buffer.isBuffer(data)) return data.toString("utf8")
+  return Buffer.from(data).toString("utf8")
+}
+
+function parse(raw: string): RelayMessage | null {
+  try {
+    // SAFETY: the relay forwards payloads verbatim and only this library and
+    // the relay's own mobile page write to that socket, so every frame on it
+    // is a RelayMessage. A payload that is not JSON at all is caught here and
+    // dropped; a JSON payload with an unknown `type` falls through the switch
+    // in `handle` without being acted on.
+    return JSON.parse(raw) as RelayMessage
+  } catch {
+    return null
+  }
+}
+
+/** Connect to the relay and keep the connection alive for the whole handoff. */
+export function connectRelay(options: RelayConnectionOptions): RelayConnection {
+  const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_INTERVAL_MS
+  let socket: WebSocket | null = null
+  let shuttingDown = false
+  let attempt = 0
+  let heartbeat: ReturnType<typeof setInterval> | null = null
+  let reconnect: ReturnType<typeof setTimeout> | null = null
+
+  const send = (message: AgentToHuman | Heartbeat): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const live = socket
+      if (!live || live.readyState !== WebSocket.OPEN) {
+        resolve()
+        return
+      }
+      live.send(JSON.stringify(message), () => resolve())
+    })
+
+  const handle = (message: RelayMessage): void => {
+    switch (message.type) {
+      case "ping":
+        void send({ type: "pong" })
+        return
+      case "tap":
+      case "char":
+      case "key":
+      case "scroll":
+      case "handback":
+      case "abort":
+        if (!shuttingDown) options.onMessage(message)
+        return
+      default:
+        // pong, and anything the agent never expects to receive.
+        return
+    }
+  }
+
+  const open = (): void => {
+    const live = new WebSocket(options.url)
+    socket = live
+
+    live.on("open", () => {
+      attempt = 0
+      options.onOpen?.()
+    })
+    live.on("message", (data: WebSocket.RawData) => {
+      const message = parse(toText(data))
+      if (message) handle(message)
+    })
+    // An error is always followed by a close, which owns the retry.
+    live.on("error", () => undefined)
+    live.on("close", () => {
+      if (socket === live) socket = null
+      if (shuttingDown) return
+      const backoff = Math.min(BASE_BACKOFF_MS * 2 ** attempt, MAX_BACKOFF_MS)
+      attempt += 1
+      reconnect = setTimeout(open, backoff + Math.random() * 250)
+    })
+  }
+
+  open()
+  heartbeat = setInterval(() => void send({ type: "ping" }), heartbeatMs)
+
+  return {
+    send,
+    isOpen: () => socket?.readyState === WebSocket.OPEN,
+    close() {
+      shuttingDown = true
+      if (heartbeat) clearInterval(heartbeat)
+      if (reconnect) clearTimeout(reconnect)
+      heartbeat = null
+      reconnect = null
+      const live = socket
+      socket = null
+      if (!live) return Promise.resolve()
+      return new Promise<void>((resolve) => {
+        const giveUp = setTimeout(() => {
+          live.terminate()
+          resolve()
+        }, CLOSE_GRACE_MS)
+        live.once("close", () => {
+          clearTimeout(giveUp)
+          resolve()
+        })
+        live.close()
+      })
+    },
+  }
+}
