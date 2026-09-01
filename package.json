@@ -1,6 +1,6 @@
 {
   "name": "handraise",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Human-in-the-loop handoff for Solari cloud browsers. Your agent already knows when it's stuck — handraise lets it raise its hand.",
   "license": "MIT",
   "type": "module",
