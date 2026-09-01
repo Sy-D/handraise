@@ -45,6 +45,7 @@
     "prepublishOnly": "bun run lint && bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {
+    "@solarisdk/browser": "^0.1.2",
     "@solarisdk/sdk": "^0.1.2",
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.21.3"
@@ -57,7 +58,6 @@
     "@ai-sdk/openai-compatible": "^3.0.41",
     "@biomejs/biome": "^2.0.0",
     "@oxlint/plugins": "1.80.0",
-    "@solarisdk/browser": "^0.1.2",
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.5.13",
     "ai": "^7.0.87",
@@ -66,5 +66,8 @@
     "playwright-core": "^1.62.1",
     "tsup": "^8.5.1",
     "typescript": "^5.7.2"
+  },
+  "bin": {
+    "handraise": "./dist/cli.js"
   }
 }

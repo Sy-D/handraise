@@ -5,6 +5,7 @@
     "": {
       "name": "handraise",
       "dependencies": {
+        "@solarisdk/browser": "^0.1.2",
         "@solarisdk/sdk": "^0.1.2",
         "qrcode-terminal": "^0.12.0",
         "ws": "^8.21.3",
@@ -14,7 +15,6 @@
         "@ai-sdk/openai-compatible": "^3.0.41",
         "@biomejs/biome": "^2.0.0",
         "@oxlint/plugins": "1.80.0",
-        "@solarisdk/browser": "^0.1.2",
         "@types/qrcode-terminal": "^0.12.2",
         "@types/ws": "^8.5.13",
         "ai": "^7.0.87",

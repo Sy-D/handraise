@@ -24,12 +24,13 @@
  * does not fit every terminal, and a wrapped QR code is not a QR code — hence
  * the width check in `printHandoffQr`.
  */
-// Namespace import, not `import { generate }`. qrcode-terminal's `generate`
-// reads its error-correction level off `this`, so a destructured reference
-// throws "bad rs block @ typeNumber:1/errorCorrectLevel:undefined" — which
-// this module used to swallow into a log line, printing no QR code at all.
-// Typechecked, linted, silently broken; caught by running it.
-import * as qrcodeTerminal from "qrcode-terminal"
+// Default import, and neither `import { generate }` nor `import * as`:
+// destructuring loses the `this` the library reads its error level off, and a
+// namespace import of this CJS module is `{ default: exports }` under Node's
+// ESM interop — `.generate` was undefined in the BUILT dist while every
+// bun-driven test passed. Caught by running the shipped artifact under node;
+// the dist smoke in CI now pins this path.
+import qrcodeTerminal from "qrcode-terminal"
 import { type Logger, quietLogger } from "./logger"
 
 /** Assumed width when stdout is not a TTY (a pipe, a CI log, a test). */

@@ -53,6 +53,16 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   text already in a remote field could not be removed. The buttons keep focus
   in the input, so the soft keyboard stays open. `clear` is select-all plus
   backspace — keyboard-equivalent, so the human's message set stays closed.
+- **`npx handraise`** — a one-command demo. With only a `SOLARI_API_KEY`, it
+  deploys its own small TOTP-walled portal into a sandbox, opens a cloud
+  browser against it, raises a hand and prints the QR (plus the currently
+  valid code — the demo shows the handoff mechanics, not secrecy).
+- **`handoffQr(url)` export** — render the handoff QR yourself for channels
+  other than the terminal.
+- **Rescue benchmark** (`e2e/rescue-bench.ts`): of 20 workflows blocked on a
+  real TOTP wall, baseline completed 0, with handraise 19 (median human time
+  5.5s, scripted); the one failure was the platform's session death,
+  correctly reported as `disconnected`.
 - **Terminal-width aware QR.** A handoff URL is ~427 characters (362 of them
   Solari's `pt_token`), so the code needs 75 columns. When the terminal is
   narrower, handraise prints the reason and the link instead of a wrapped —

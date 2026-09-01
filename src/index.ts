@@ -21,6 +21,7 @@ export {
   noopLogger,
   quietLogger,
 } from "./logger"
+export { handoffQr } from "./qr"
 export {
   createNeedHumanTool,
   type NeedHumanDefaults,

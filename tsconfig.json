@@ -11,7 +11,8 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["bun-types"]
+    "types": ["bun-types"],
+    "esModuleInterop": true
   },
   "include": ["src", "e2e", "test-app", "demo"]
 }

@@ -31,6 +31,10 @@ jobs:
         run: bun test --coverage src/ test-app/
       - name: build
         run: bun run build
+      - name: dist smoke — run the shipped artifact under node
+        # Pins the CJS-interop path a consumer actually executes; bun-driven
+        # tests cannot catch dist-only breakage (learned from a broken QR).
+        run: node scripts/dist-smoke.mjs
       # e2e (bun run test:e2e) is intentionally not run in CI: it needs a real
       # SOLARI_API_KEY and spends plan quota. It is the pre-publish gate, run
       # locally against the live API.

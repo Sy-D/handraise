@@ -64,7 +64,9 @@ const PONG_TIMEOUT_MS = 10_000
 /** Ping samples per run, pooled across runs into one inputRttMs distribution. */
 const RTT_SAMPLES = 5
 /** Relaunch the browser at this age — comfortably under the ~10 min hard death. */
-const BROWSER_MAX_AGE_MS = 4 * 60_000
+// One benched session died at ~240s (rescue run 12), earlier than S4's 319s
+// minimum — 3 minutes keeps the reuse window under the youngest observed death.
+const BROWSER_MAX_AGE_MS = 3 * 60_000
 /** Breather between runs so a just-killed relay sandbox is off the books. */
 const COOLDOWN_MS = 1_500
 const RESULTS_PATH = new URL("../spikes/bench-results.json", import.meta.url)

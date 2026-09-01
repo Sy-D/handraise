@@ -229,6 +229,22 @@ leaked sandboxes.** Raw per-run data: [`spikes/bench-results.json`](spikes/bench
 | — of which: relay sandbox cold start | 2.7s | 2.7s | 2.9s |
 | Input round trip through the relay (150 samples) | 186ms | 191ms | 286ms |
 
+And the number that matters more than any latency — what handraise does to
+workflows that would otherwise fail. 40 runs against a live portal with a real
+TOTP wall, interleaved arms, same completion test on both:
+
+| | completed | median human time |
+|---|---|---|
+| baseline agent (no human available) | 0/20 | — |
+| with handraise | **19/20** | 5.5s |
+
+Of 20 workflows blocked on a human-only wall, handraise rescued 19. The 0/20
+baseline is the design fact, not a crippled agent: it tried, and a machine
+cannot know a TOTP code. The 5.5s is a scripted human — the machine floor of
+the handoff, not human reading speed. The one failure was the platform's ~10min
+session death landing mid-handoff; handraise reported `disconnected` instead of
+claiming success. Raw data: [`spikes/rescue-results.json`](spikes/rescue-results.json).
+
 At N=30 the right-hand column is the worst observation, not a fitted p99 — we
 say what we measured. The input round trip sits on the network RTT floor from
 Germany to the us-west edge; the relay itself adds nothing measurable (pass
