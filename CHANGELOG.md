@@ -38,7 +38,9 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   pinger.
 - **Pluggable structured logging** via `logger` and **wide-event telemetry** via
   `onEvent` — one wide `HandoffEvent` per handoff, carrying the outcome, timings
-  and identifiers, for canonical-log-line style observability.
+  and identifiers, for canonical-log-line style observability. Quiet by
+  default: only warnings and errors reach stderr; pass `consoleLogger` for the
+  full JSON lines including the per-handoff wide event.
 - **`baseUrl` option** to point handraise at a specific Solari endpoint or region
   for the relay sandbox.
 

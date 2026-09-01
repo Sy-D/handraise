@@ -10,7 +10,7 @@
 // this module used to swallow into a log line, printing no QR code at all.
 // Typechecked, linted, silently broken; caught by running it.
 import * as qrcodeTerminal from "qrcode-terminal"
-import { consoleLogger, type Logger } from "./logger"
+import { type Logger, quietLogger } from "./logger"
 
 /**
  * Render a QR code for `url` as terminal text.
@@ -21,7 +21,7 @@ import { consoleLogger, type Logger } from "./logger"
  */
 export function handoffQr(
   url: string,
-  logger: Logger = consoleLogger,
+  logger: Logger = quietLogger,
 ): string | null {
   try {
     let drawn: string | null = null
@@ -46,10 +46,12 @@ export function handoffQr(
 export function printHandoffQr(
   url: string,
   reason: string,
-  logger: Logger = consoleLogger,
+  logger: Logger = quietLogger,
 ): void {
   console.log(`\nhandraise: ${reason}`)
-  console.log(`handraise: open ${url}\n`)
   const code = handoffQr(url, logger)
   if (code) console.log(code)
+  // The QR is the primary path; the raw URL comes after it, as the fallback
+  // for a terminal that can't render the code or a human without a camera.
+  console.log(`handraise: or open ${url}\n`)
 }

@@ -117,7 +117,7 @@ browser back. Re-read the page and continue.").
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
 | `qr` | `boolean` | `true` | Print a QR code to the terminal. |
 | `apiKey` | `string` | `$SOLARI_API_KEY` | Solari key used to create the relay sandbox. |
-| `logger` | `Logger` | — | Pluggable structured logging. |
+| `logger` | `Logger` | warn/error only | Structured logging sink. Pass `consoleLogger` for full JSON lines incl. the per-handoff wide event. |
 | `onEvent` | `(e: HandoffEvent) => void` | — | One wide event per handoff (outcome, timings, ids). |
 | `baseUrl` | `string` | — | Solari endpoint/region for the relay sandbox. |
 

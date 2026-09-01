@@ -39,8 +39,10 @@ function line(level: Level, event: string, fields?: LogFields): string {
 }
 
 /**
- * The default. `debug`/`info` go to stdout, `warn`/`error` to stderr, so the
- * wide event and the diagnostics land where a log collector expects them.
+ * Full structured logging: `debug`/`info` to stdout, `warn`/`error` to stderr,
+ * so the wide event and the diagnostics land where a log collector expects
+ * them. Opt-in — pass `logger: consoleLogger` to get the one `handoff` JSON
+ * line per handoff.
  */
 export const consoleLogger: Logger = {
   debug(event, fields) {
@@ -63,4 +65,22 @@ export const noopLogger: Logger = {
   info() {},
   warn() {},
   error() {},
+}
+
+/**
+ * The default: a library should not write to stdout uninvited. Warnings and
+ * errors still reach stderr because they describe failure paths the caller
+ * would otherwise debug blind; `debug`/`info` — including the per-handoff wide
+ * event — are dropped. Pass `consoleLogger` (or your own sink) to collect them,
+ * or use `onEvent` for just the wide event.
+ */
+export const quietLogger: Logger = {
+  debug() {},
+  info() {},
+  warn(event, fields) {
+    consoleLogger.warn(event, fields)
+  },
+  error(event, fields) {
+    consoleLogger.error(event, fields)
+  },
 }

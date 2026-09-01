@@ -17,7 +17,7 @@
  */
 import type { CDPSession, Page } from "playwright-core"
 import type { HandoffEvent } from "../events"
-import { consoleLogger, type Logger } from "../logger"
+import { type Logger, quietLogger } from "../logger"
 import { printHandoffQr } from "../qr"
 import { startRelay } from "../relay/deploy"
 import type { AgentToHuman, HumanToAgent } from "../relay/protocol"
@@ -297,7 +297,7 @@ export async function raiseHand(
   page: Page,
   options: RaiseHandOptions,
 ): Promise<HandoffResult> {
-  const logger = options.logger ?? consoleLogger
+  const logger = options.logger ?? quietLogger
   const apiKey = options.apiKey ?? process.env.SOLARI_API_KEY
   if (!apiKey) {
     throw new Error(

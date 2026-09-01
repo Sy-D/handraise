@@ -19,6 +19,7 @@ export {
   type LogFields,
   type Logger,
   noopLogger,
+  quietLogger,
 } from "./logger"
 export {
   createNeedHumanTool,

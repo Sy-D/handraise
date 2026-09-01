@@ -12,6 +12,7 @@ import {
   type LogFields,
   type Logger,
   noopLogger,
+  quietLogger,
 } from "./logger"
 
 /** The console methods, captured so a test can restore them. */
@@ -101,4 +102,18 @@ test("both loggers satisfy the same interface", () => {
   // point of the pluggable logger.
   const loggers: Logger[] = [consoleLogger, noopLogger]
   expect(loggers).toHaveLength(2)
+})
+
+test("quietLogger drops debug/info but forwards warn/error — the library default stays off stdout", () => {
+  const lines = capture()
+  quietLogger.debug("d")
+  quietLogger.info("handoff", { outcome: "resolved" })
+  quietLogger.warn("w", { detail: 1 })
+  quietLogger.error("e")
+
+  expect(lines.filter((l) => l.stream === "out")).toHaveLength(0)
+  const err = lines.filter((l) => l.stream === "err")
+  expect(err).toHaveLength(2)
+  expect(err[0]?.parsed.event).toBe("w")
+  expect(err[1]?.parsed.event).toBe("e")
 })

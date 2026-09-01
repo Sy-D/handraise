@@ -15,7 +15,7 @@ import {
   SolariClient,
 } from "@solarisdk/sdk"
 
-import { consoleLogger, type Logger } from "../logger"
+import { type Logger, quietLogger } from "../logger"
 import { GUEST_SERVER_JS } from "./guest-source"
 import { RELAY_PORT } from "./protocol"
 
@@ -54,7 +54,7 @@ export interface StartRelayOptions {
   timeoutMs?: number
   /** Gateway base URL. Defaults to the SDK's `https://api.getsolari.com`. */
   baseUrl?: string
-  /** Where deploy diagnostics go. Defaults to `consoleLogger`. */
+  /** Where deploy diagnostics go. Defaults to `quietLogger` (warn/error only). */
   logger?: Logger
 }
 
@@ -153,7 +153,7 @@ export async function startRelay(
   options: StartRelayOptions,
 ): Promise<RelayHandle> {
   const startedAt = Date.now()
-  const logger = options.logger ?? consoleLogger
+  const logger = options.logger ?? quietLogger
   const client = new SolariClient(
     options.baseUrl
       ? { apiKey: options.apiKey, baseUrl: options.baseUrl }
