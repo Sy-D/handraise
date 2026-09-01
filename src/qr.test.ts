@@ -9,10 +9,10 @@
  */
 import { expect, test } from "bun:test"
 import { noopLogger } from "./logger"
-import { handoffQr } from "./qr"
+import { handoffQr, printHandoffQr } from "./qr"
 
 /** A realistic handoff URL: preview subdomain plus a token-sized tail. */
-const URL = `https://aabbccddeeff00112233-3000.preview.getsolari.com/?pt_token=${"x".repeat(240)}`
+const URL = `https://aabbccddeeff00112233-3000.preview.getsolari.com/?pt_token=${"x".repeat(362)}`
 
 /** The four glyphs qrcode-terminal's `small` mode draws, plus the newline. */
 const HALF_BLOCKS = new Set([" ", "▄", "▀", "█"])
@@ -53,4 +53,39 @@ test("returns null instead of throwing when the payload cannot be encoded", () =
   // Far past QR's capacity at any version: the library throws, and handoffQr
   // must swallow that rather than take a handoff down with it.
   expect(handoffQr("x".repeat(10_000), noopLogger)).toBeNull()
+})
+
+test("a terminal too narrow for the code gets the link, not a wrapped QR", () => {
+  const printed: string[] = []
+  const realLog = console.log
+  console.log = (text: string) => {
+    printed.push(String(text))
+  }
+  try {
+    printHandoffQr(URL, "needs a human", noopLogger, 40)
+  } finally {
+    console.log = realLog
+  }
+  const joined = printed.join("\n")
+  // No QR glyphs at all — a wrapped symbol is worse than none.
+  expect(joined).not.toContain("\u2580")
+  expect(joined).not.toContain("\u2584")
+  expect(joined).toContain("widen it to scan")
+  expect(joined).toContain(URL)
+})
+
+test("a wide enough terminal gets the code itself", () => {
+  const printed: string[] = []
+  const realLog = console.log
+  console.log = (text: string) => {
+    printed.push(String(text))
+  }
+  try {
+    printHandoffQr(URL, "needs a human", noopLogger, 120)
+  } finally {
+    console.log = realLog
+  }
+  const joined = printed.join("\n")
+  expect(joined).toContain("\u2588")
+  expect(joined).toContain(URL)
 })
