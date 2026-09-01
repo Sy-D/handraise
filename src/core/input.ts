@@ -134,6 +134,31 @@ async function dispatchKey(
   await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...shared })
 }
 
+/**
+ * Modifier bitmask (spikes/s3-report.md): Alt 1, Ctrl 2, Meta 4, Shift 8. The
+ * remote page runs on Linux Chromium, so select-all is Ctrl+A, never Meta+A.
+ */
+const CTRL = 2
+
+/**
+ * Select everything in the focused field.
+ *
+ * `rawKeyDown` with no `text`, because any modifier other than Shift has to
+ * suppress `text` — a `keyDown` carrying "a" here types an "a" into the field
+ * instead of selecting its contents (verified in spikes/s3-report.md).
+ */
+async function selectAll(cdp: CdpChannel): Promise<void> {
+  const shared = {
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    nativeVirtualKeyCode: 65,
+    modifiers: CTRL,
+  }
+  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...shared })
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...shared })
+}
+
 async function typeCharacter(cdp: CdpChannel, ch: string): Promise<void> {
   if (ch.length === 0) return
   const keyCode = ch.toUpperCase().charCodeAt(0)
@@ -197,7 +222,7 @@ export interface InputTarget {
    */
   drain(): Promise<void>
   /**
-   * Taps, characters, keys and scrolls actually dispatched to the page. Dropped
+   * Taps, characters, keys, clears and scrolls dispatched to the page. Dropped
    * messages (an over-long char, an unmapped key, a flood past the cap) and the
    * `handback`/`abort` lifecycle messages do not count.
    */
@@ -248,6 +273,15 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
         // cannot index a prototype member or reach an unmapped key.
         if (!Object.hasOwn(KEY_TABLE, message.key)) return
         await dispatchKey(cdp, message.key, KEY_TABLE[message.key])
+        appliedCount += 1
+        return
+      case "clear":
+        // Nothing focused means Ctrl+A selects the document instead of a field
+        // value, and the Backspace then goes nowhere: harmless, and the phone
+        // greys the key out anyway. Both halves are ordinary key events, so a
+        // page with a keydown listener sees exactly what a human would send.
+        await selectAll(cdp)
+        await dispatchKey(cdp, "Backspace", KEY_TABLE.Backspace)
         appliedCount += 1
         return
       case "scroll": {

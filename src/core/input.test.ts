@@ -33,6 +33,8 @@ interface CdpParams {
   code?: string
   text?: string
   unmodifiedText?: string
+  /** Alt 1, Ctrl 2, Meta 4, Shift 8 (spikes/s3-report.md). */
+  modifiers?: number
   windowsVirtualKeyCode?: number
   nativeVirtualKeyCode?: number
   x?: number
@@ -183,6 +185,54 @@ test("Backspace and Tab are rawKeyDown with no text", async () => {
     windowsVirtualKeyCode: 9,
   })
   expect(calls[2]?.params.text).toBeUndefined()
+})
+
+test("clear is Ctrl+A without text, then one Backspace", async () => {
+  const { cdp, calls } = recorder()
+  await createInputTarget(cdp).apply({ type: "clear" }, META)
+
+  expect(calls.map((call) => call.method)).toEqual([
+    "Input.dispatchKeyEvent",
+    "Input.dispatchKeyEvent",
+    "Input.dispatchKeyEvent",
+    "Input.dispatchKeyEvent",
+  ])
+  // Ctrl is bit 2, and the remote page is Linux Chromium — Meta+A selects
+  // nothing there. rawKeyDown with no text: a keyDown carrying "a" alongside
+  // the modifier types an "a" into the field instead of selecting it (S3).
+  expect(calls[0]?.params).toMatchObject({
+    type: "rawKeyDown",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    modifiers: 2,
+  })
+  expect(calls[0]?.params.text).toBeUndefined()
+  expect(calls[1]?.params).toMatchObject({
+    type: "keyUp",
+    key: "a",
+    modifiers: 2,
+  })
+  expect(calls[1]?.params.text).toBeUndefined()
+  // The delete half goes through the same KEY_TABLE path as the Backspace key.
+  expect(calls[2]?.params).toMatchObject({
+    type: "rawKeyDown",
+    key: "Backspace",
+    windowsVirtualKeyCode: 8,
+  })
+  expect(calls[2]?.params.text).toBeUndefined()
+  expect(calls[3]?.params).toMatchObject({ type: "keyUp", key: "Backspace" })
+})
+
+test("clear with nothing focused dispatches and resolves, never throws", async () => {
+  // The phone greys the key out when no field is focused, but a stale or
+  // hostile client can still send it. Ctrl+A then selects the document and the
+  // Backspace lands nowhere: four events out, no rejection, counted as applied.
+  const { cdp, calls } = recorder()
+  const target = createInputTarget(cdp)
+  await target.apply({ type: "clear" }, META)
+  expect(calls.length).toBe(4)
+  expect(target.applied()).toBe(1)
 })
 
 test("a scroll before any tap is aimed at the viewport centre", async () => {

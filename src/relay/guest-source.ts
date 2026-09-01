@@ -537,8 +537,13 @@ const PAGE = \`<!doctype html>
     background: var(--surface);
     padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
   }
+  /* Field and key bar on one line. The field takes the slack, the keys never
+     shrink and never wrap: a wrapped key bar on a 320px phone would push the
+     hint and the buttons below the fold. */
+  .bar { display: flex; align-items: stretch; gap: 8px; }
   input {
-    width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
     padding: 12px 14px;
     border-radius: var(--radius);
     border: 1px solid var(--field);
@@ -548,6 +553,28 @@ const PAGE = \`<!doctype html>
     font-size: 16px;
   }
   input:focus { outline: none; border-color: oklch(0.44 0 0); }
+  .keys { display: flex; flex: none; gap: 6px; }
+  /* 40 x 44 is the smallest tap target that still reads as comfortable on a
+     phone; the glyphs sit at muted weight so the bar does not compete with the
+     hand-back button below it. */
+  .key {
+    flex: none;
+    width: 40px;
+    min-height: 44px;
+    padding: 0;
+    border: 1px solid var(--field);
+    background: transparent;
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 16px;
+    line-height: 1;
+  }
+  .key:active:not(:disabled) {
+    color: var(--text);
+    border-color: oklch(0.44 0 0);
+    background: oklch(0.26 0 0 / 0.4);
+  }
+  .key:disabled { opacity: .38; cursor: default; }
   .hint {
     margin: 7px 2px 10px;
     color: var(--muted);
@@ -607,8 +634,16 @@ const PAGE = \`<!doctype html>
     <div id="focus-ring" hidden></div>
   </main>
   <footer>
-    <input id="kbd" type="text" autocomplete="off" autocapitalize="off" autocorrect="off"
-      spellcheck="false" enterkeyhint="enter" placeholder="Type here">
+    <div class="bar">
+      <input id="kbd" type="text" autocomplete="off" autocapitalize="off" autocorrect="off"
+        spellcheck="false" enterkeyhint="enter" placeholder="Type here">
+      <div class="keys">
+        <button id="key-back" class="key" type="button" aria-label="Backspace">&#9003;</button>
+        <button id="key-clear" class="key" type="button" aria-label="Clear the field" disabled>&#10005;</button>
+        <button id="key-tab" class="key" type="button" aria-label="Next field">&#8677;</button>
+        <button id="key-enter" class="key" type="button" aria-label="Enter">&#9166;</button>
+      </div>
+    </div>
     <p class="hint" id="hint">Typing goes straight to the browser</p>
     <div class="row">
       <button id="handback" class="primary">&#9995; Hand back to agent</button>
@@ -825,18 +860,90 @@ const PAGE = \`<!doctype html>
     for (var i = shared; i < next.length; i++) send({ type: "char", ch: next[i] })
     mirrored = next
   })
+  // The mirror and the field are one state: writing kbd.value fires no input
+  // event, so the diff above never sees these edits and never sends for them.
+  function resetMirror() {
+    kbd.value = ""
+    mirrored = ""
+  }
+
   kbd.addEventListener("keydown", function (e) {
     if (e.key === "Enter") {
       e.preventDefault()
       send({ type: "key", key: "Enter" })
-      kbd.value = ""
-      mirrored = ""
+      resetMirror()
       return
     }
     // An empty field fires no input event, so this is the only signal that the
     // human wants to delete a character the remote page still holds.
     if (e.key === "Backspace" && kbd.value === "") send({ type: "key", key: "Backspace" })
   })
+
+  /**
+   * The key bar. A phone's virtual keyboard is not a keyboard: on Android a
+   * Backspace on an empty field arrives as keyCode 229 / key "Unidentified" or
+   * as nothing at all, so the keydown path above never fires and text already
+   * in the remote field cannot be deleted. These four buttons send the message
+   * themselves and depend on no keyboard event.
+   *
+   * Focus is the whole difficulty. A button that takes focus blurs #kbd, and
+   * the soft keyboard slides away under every press. preventDefault on
+   * mousedown and touchstart stops the focus moving — but cancelling touchstart
+   * also suppresses the compatibility click, so the touch path has to act on
+   * touchend. touchedAt keeps a browser that still emits that click from
+   * running the handler twice: a doubled Backspace deletes a character the
+   * human never asked to lose.
+   */
+  function keyButton(id, run) {
+    var button = document.getElementById(id)
+    var touchedAt = 0
+    var hold = function (e) { e.preventDefault() }
+    button.addEventListener("mousedown", hold)
+    button.addEventListener("touchstart", hold, { passive: false })
+    button.addEventListener("touchend", function (e) {
+      e.preventDefault()
+      touchedAt = Date.now()
+      if (!button.disabled) run()
+    })
+    button.addEventListener("click", function () {
+      if (Date.now() - touchedAt < 700) return
+      if (!button.disabled) run()
+    })
+    return button
+  }
+
+  keyButton("key-back", function () {
+    // Trim the mirror with the field, so the character is deleted once: this
+    // message speaks for it, and the diff has nothing left to report.
+    if (kbd.value.length > 0) {
+      kbd.value = kbd.value.slice(0, -1)
+      mirrored = kbd.value
+    }
+    send({ type: "key", key: "Backspace" })
+  })
+  var clearKey = keyButton("key-clear", function () {
+    send({ type: "clear" })
+    resetMirror()
+  })
+  // Tab moves to another field, Enter usually submits: either way what the
+  // human types next belongs to a different context than what is mirrored here.
+  keyButton("key-tab", function () {
+    send({ type: "key", key: "Tab" })
+    resetMirror()
+  })
+  keyButton("key-enter", function () {
+    send({ type: "key", key: "Enter" })
+    resetMirror()
+  })
+
+  /**
+   * Clearing needs a focused field: with nothing focused, the select-all half
+   * of it would mark the whole remote page instead of a value. The agent tells
+   * us what is focused, so offer the key exactly when it has a target.
+   */
+  function setClearEnabled() {
+    clearKey.disabled = !(focus && focus.rect)
+  }
 
   function finish(title, note) {
     finished = true
@@ -848,6 +955,7 @@ const PAGE = \`<!doctype html>
     focus = null
     placeRing()
     setHint()
+    setClearEnabled()
     kbd.blur()
     if (ws) ws.close()
   }
@@ -878,6 +986,7 @@ const PAGE = \`<!doctype html>
       focus = readFocus(message)
       placeRing()
       setHint()
+      setClearEnabled()
     }
     else if (message.type === "ended") {
       var ending = ENDINGS[message.outcome] || ["Session ended", "You can close this tab."]

@@ -51,6 +51,13 @@ export type HumanToAgent =
   | { type: "tap"; fx: number; fy: number }
   | { type: "char"; ch: string }
   | { type: "key"; key: "Enter" | "Backspace" | "Tab" }
+  /**
+   * Empty the focused field. Deliberately keyboard-equivalent — select-all
+   * followed by one Backspace — rather than a value assignment: the page must
+   * see the same events a human produces, and the message set stays closed and
+   * small instead of growing an "execute this on the page" escape hatch.
+   */
+  | { type: "clear" }
   | { type: "scroll"; fdy: number }
   | { type: "handback" }
   | { type: "abort" }

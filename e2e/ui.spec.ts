@@ -26,7 +26,12 @@ import { fileURLToPath } from "node:url"
 import { type Browser, chromium, type Page } from "playwright-core"
 import WebSocket from "ws"
 
-import type { FocusRect, FrameMeta, RelayMessage } from "../src/relay/protocol"
+import type {
+  FocusRect,
+  FrameMeta,
+  HumanToAgent,
+  RelayMessage,
+} from "../src/relay/protocol"
 
 const SERVER_PATH = fileURLToPath(
   new URL("../src/relay/guest/server.js", import.meta.url),
@@ -353,6 +358,92 @@ test("multi-character input splits into one char message per keystroke", async (
   // Deleting one character mirrors as a single Backspace via the input diff.
   await page.keyboard.press("Backspace")
   expect(await agent.next()).toEqual({ type: "key", key: "Backspace" })
+  expect(consoleErrors).toEqual([])
+})
+
+/** What `document.activeElement` is right now, by id. */
+function activeId(target: Page): Promise<string> {
+  return target.evaluate(() => document.activeElement?.id ?? "")
+}
+
+test("every key button sends its message without taking the focus", async () => {
+  await showFrame()
+  // #key-clear is only offered while a remote field is focused.
+  agent.send({ type: "focus", rect: FOCUS_RECT, label: "Password" })
+  await waitForRing(page, true)
+
+  await page.locator("#kbd").focus()
+
+  const keys: { id: string; message: HumanToAgent }[] = [
+    { id: "#key-back", message: { type: "key", key: "Backspace" } },
+    { id: "#key-clear", message: { type: "clear" } },
+    { id: "#key-tab", message: { type: "key", key: "Tab" } },
+    { id: "#key-enter", message: { type: "key", key: "Enter" } },
+  ]
+  for (const key of keys) {
+    await page.locator(key.id).click()
+    expect(await agent.next()).toEqual(key.message)
+    // A button that steals the focus closes the phone's soft keyboard, and the
+    // human has to tap the field again between every keystroke.
+    expect(await activeId(page)).toBe("kbd")
+  }
+  expect(consoleErrors).toEqual([])
+})
+
+test("the backspace key deletes one character and sends exactly one Backspace", async () => {
+  await showFrame()
+
+  const kbd = page.locator("#kbd")
+  await kbd.focus()
+  await kbd.pressSequentially("ab")
+  expect(await agent.next()).toEqual({ type: "char", ch: "a" })
+  expect(await agent.next()).toEqual({ type: "char", ch: "b" })
+
+  await page.locator("#key-back").click()
+  expect(await agent.next()).toEqual({ type: "key", key: "Backspace" })
+  expect(await kbd.inputValue()).toBe("a")
+
+  // The regression this test exists for: if the local mirror kept the deleted
+  // character, the next keystroke's diff would send a second Backspace before
+  // the character — one character too many gone from the remote field.
+  await kbd.pressSequentially("c")
+  expect(await agent.next()).toEqual({ type: "char", ch: "c" })
+  expect(consoleErrors).toEqual([])
+})
+
+test("the clear key is offered only while a remote field is focused", async () => {
+  await showFrame()
+
+  // Nothing focused yet: Ctrl+A would mark the whole remote page.
+  expect(await page.locator("#key-clear").isDisabled()).toBe(true)
+
+  agent.send({ type: "focus", rect: FOCUS_RECT, label: "Password" })
+  await waitForRing(page, true)
+  expect(await page.locator("#key-clear").isEnabled()).toBe(true)
+
+  agent.send({ type: "focus", rect: null, label: null })
+  await waitForRing(page, false)
+  expect(await page.locator("#key-clear").isDisabled()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})
+
+test("the key bar stays on one line on a narrow phone", async () => {
+  await page.setViewportSize({ width: 320, height: 568 })
+  await showFrame()
+
+  const field = await page.locator("#kbd").boundingBox()
+  const keys = await page.locator(".keys").boundingBox()
+  if (!field || !keys) throw new Error("the input bar has no bounding box")
+
+  // Same row, keys to the right of the field, and every tap target usable.
+  expect(Math.abs(field.y - keys.y)).toBeLessThanOrEqual(6)
+  expect(keys.x).toBeGreaterThan(field.x + field.width - 1)
+  expect(field.width).toBeGreaterThan(60)
+  for (const id of ["#key-back", "#key-clear", "#key-tab", "#key-enter"]) {
+    const key = await page.locator(id).boundingBox()
+    if (!key) throw new Error(`${id} has no bounding box`)
+    expect(key.height).toBeGreaterThanOrEqual(44)
+  }
   expect(consoleErrors).toEqual([])
 })
 

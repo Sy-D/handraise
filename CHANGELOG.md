@@ -47,6 +47,12 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   which field is focused, so the handoff page draws a ring around it on the live
   image and the keyboard bar names it ("Typing into: Password"). Only the
   field's label is read, never its value, and the label is rendered as text.
+- **A key bar on the phone** — backspace, clear, tab and enter as explicit
+  buttons next to the input. Deletion used to ride on a `keydown` a phone's
+  virtual keyboard often does not send (Android reports `keyCode 229`), so
+  text already in a remote field could not be removed. The buttons keep focus
+  in the input, so the soft keyboard stays open. `clear` is select-all plus
+  backspace — keyboard-equivalent, so the human's message set stays closed.
 - **Terminal-width aware QR.** A handoff URL is ~427 characters (362 of them
   Solari's `pt_token`), so the code needs 75 columns. When the terminal is
   narrower, handraise prints the reason and the link instead of a wrapped —
