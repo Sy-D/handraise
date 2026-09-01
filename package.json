@@ -61,6 +61,6 @@
     "oxlint": "1.80.0",
     "playwright-core": "^1.62.1",
     "tsup": "^8.5.1",
-    "typescript": "^5.7.2"
+    "typescript": "^7.0.2"
   }
 }
