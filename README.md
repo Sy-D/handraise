@@ -99,6 +99,30 @@ tool, no self-hosted server, no second account — the same API key that runs
 your browser runs the escape hatch. The phone's end of it is a tokenized URL
 served from `*.preview.getsolari.com`, and nothing else.
 
+## What the human sees on the phone
+
+The handoff link opens a dark, minimal page: the live browser session on top,
+one input bar at the bottom. Tap the live view to click; drag to scroll. A
+ring marks the field that currently has focus, and the bar names it
+("Typing into: Password") — typing goes straight into that field, character by
+character.
+
+Four keys sit next to the input, because a phone's virtual keyboard cannot be
+trusted to send them:
+
+| Key | What it does |
+|---|---|
+| ⌫ | Delete one character in the remote field |
+| ✕ | Clear the focused field (select-all + backspace; disabled while nothing is focused) |
+| ⇥ | Move to the next field |
+| ⏎ | Submit / press Enter |
+
+Below that, two ways out: **✋ Hand back to agent** ends the handoff as
+`resolved` — the agent continues. **Can't help** ends it as `aborted` — the
+agent is told a human looked and could not solve it, so it should not retry
+the same step. The dot in the header shows the connection: white is live, grey
+is reconnecting, red means the handoff has ended.
+
 ## Getting notified
 
 Three ways, no vendor lock-in:
