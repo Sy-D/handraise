@@ -28,5 +28,3 @@ export type {
   StorageState,
 } from "./types"
 export type { WebhookPayload } from "./webhook"
-
-export const VERSION = "0.0.1"

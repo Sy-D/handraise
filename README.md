@@ -9,11 +9,14 @@ the agent continues — same session, same cookies, no restart.
 
 > 🎬 *Demo clip coming here.*
 
+Set `SOLARI_API_KEY` in your environment — handraise uses it to create the
+relay sandbox (or pass `apiKey` in the options).
+
 ```ts
 import { Solari } from "@solarisdk/browser"
 import { raiseHand } from "handraise"
 
-const browser = await new Solari({ apiKey }).launch()
+const browser = await new Solari({ apiKey: process.env.SOLARI_API_KEY }).launch()
 const page = await browser.newPage()
 
 await page.goto("https://github.com/login")
@@ -83,14 +86,14 @@ the spec is plain JSON Schema:
 
 ```ts
 import { tool, jsonSchema } from "ai" // Vercel AI SDK
-import { createNeedHumanTool, needHumanToolSpec } from "handraise"
+import { createNeedHumanTool, needHumanToolSpec, type NeedHumanInput } from "handraise"
 
 const needHuman = createNeedHumanTool(page)
 
 const tools = {
   needHuman: tool({
     description: needHumanToolSpec.description,
-    inputSchema: jsonSchema(needHumanToolSpec.inputSchema),
+    inputSchema: jsonSchema<NeedHumanInput>(needHumanToolSpec.inputSchema),
     execute: needHuman,
   }),
 }
@@ -111,6 +114,7 @@ browser back. Re-read the page and continue.").
 | `webhookUrl` | `string` | — | Generic JSON POST when the link is ready. |
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
 | `qr` | `boolean` | `true` | Print a QR code to the terminal. |
+| `apiKey` | `string` | `$SOLARI_API_KEY` | Solari key used to create the relay sandbox. |
 
 ### `HandoffResult`
 
@@ -136,25 +140,36 @@ the worst moment is worse than no tool.
   connection, never the control plane). That's why the default wait is 5
   minutes, why there is deliberately no keep-alive pinger, and why
   `storageState` exists on the result.
-- **The agent process is killed mid-handoff** → the relay sandbox has its own
-  idle timeout and self-destructs; no zombie infrastructure, no orphaned
-  public URL.
+- **The agent process is killed mid-handoff** → the relay sandbox is created
+  with `lifecycle: { onTimeout: "kill" }` and a bounded idle window, so it
+  destroys itself; no zombie infrastructure, no orphaned public URL.
 - **The relay WebSocket drops** → Solari's preview proxy kills idle sockets
   after exactly 60s, so both ends heartbeat every 20s and treat close code
   1006 as "reconnect", not "failed". The relay replays the last frame to a
-  late-joining phone.
-- **After every outcome** — including errors — the relay is destroyed before
-  `raiseHand` returns. One handoff, one sandbox, cents.
+  late-joining phone — and stops replaying it the moment the handoff ends, so
+  whoever opens the link afterward sees the ending, not the logged-in page.
+- **After every outcome** — including errors — the relay sandbox is destroyed
+  before `raiseHand` returns, with the deletion confirmed and retried on
+  transient failure. One handoff, one sandbox.
 
 ## Security
 
 - The handoff URL contains a Solari preview token scoped to that one sandbox
   and port, with a 1-hour lifetime. When the handoff ends, the sandbox — and
   with it the URL — is destroyed.
-- The relay accepts one agent and one human connection; a new human connection
-  replaces the old one.
-- The relay is a dumb router. Frames and keystrokes pass through it; nothing
-  is stored, nothing is logged, nothing persists after the sandbox dies.
+- **The agent role is a separate credential, not the handoff link.** Anyone
+  with the phone link can view and solve; only a client holding a per-handoff
+  secret (minted by `startRelay`, appended only to the agent's own URL) may
+  connect as the agent that reads keystrokes and drives the browser. A foreign
+  `Origin` is refused, so the preview cookie can't be ridden from another page.
+- **The relay is a dumb router with a closed message set.** The human side can
+  send taps, characters, a few named keys, scroll, hand-back and abort — and
+  nothing else; there is no path from the link to arbitrary browser control.
+  Inputs are length- and rate-bounded.
+- **No frame or keystroke data is stored or persisted.** The relay keeps only
+  the latest frame in memory to paint a late-joining phone, and drops it when
+  the handoff ends. It logs connection events (not their contents) inside the
+  sandbox, which is destroyed at the end.
 - Your Solari API key never leaves the agent process. The phone only ever
   sees the preview URL.
 
@@ -167,7 +182,8 @@ On the $20 Solari plan, from Europe:
 | Raise → phone sees the live session | ~3s (sandbox cold start) + first frame ~200–300ms |
 | Live view bandwidth while a human solves 2FA | 23–80 KB/s |
 | Input round trip (tap on phone → click in browser) | ~1 RTT (the relay adds nothing measurable) |
-| Cost per handoff | one sandbox for the duration of the handoff — cents |
+| Full handoff, agent stuck → solved → signed in | ~6s in the e2e |
+| Sandboxes consumed per handoff | one, destroyed when the handoff ends |
 
 ## Verified how
 

@@ -245,6 +245,7 @@ export async function raiseHand(
   })
 
   const startedAt = Date.now()
+  let endedAt = startedAt
   let webhook: Promise<void> = Promise.resolve()
   let end: HandoffEnd = { outcome: "disconnected" }
 
@@ -269,6 +270,9 @@ export async function raiseHand(
   } catch (error) {
     console.error("handraise: the handoff failed", error)
   } finally {
+    // Captured before teardown: durationMs is the time the human had, not the
+    // time the sandbox took to shut down afterwards.
+    endedAt = Date.now()
     await webhook
     await relay.kill().catch((error) => {
       console.error("handraise: could not release the relay sandbox", error)
@@ -277,7 +281,7 @@ export async function raiseHand(
 
   const result: HandoffResult = {
     outcome: end.outcome,
-    durationMs: Date.now() - startedAt,
+    durationMs: endedAt - startedAt,
     url: relay.humanUrl,
   }
   if (end.storageState) result.storageState = end.storageState

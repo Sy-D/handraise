@@ -51,11 +51,11 @@ export interface HandoffResult {
  *
  * Resolves when the human clicks "hand back" (outcome: "resolved"), the human
  * aborts (outcome: "aborted"), `timeoutMs` elapses (outcome: "timeout"), or
- * the browser session dies mid-handoff (outcome: "disconnected" — Solari
- * browser sessions have a hard ~10 minute lifetime and the sessions API keeps
- * reporting "active" after death, so liveness comes from the connection, not
- * the control plane). All relay infrastructure is destroyed before this
- * promise settles, on every path including errors.
+ * the browser session dies mid-handoff (outcome: "disconnected" — on the plan
+ * we measured, Solari browser sessions had a hard ~10 minute lifetime and the
+ * sessions API kept reporting "active" after death, so liveness comes from the
+ * connection, not the control plane). All relay infrastructure is destroyed
+ * before this promise settles, on every path including errors.
  */
 export type RaiseHand = (
   page: Page,

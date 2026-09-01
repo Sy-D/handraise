@@ -22,7 +22,7 @@ const GUEST_DIR = "/opt/relay"
 const GUEST_PATH = `${GUEST_DIR}/server.mjs`
 const GUEST_LOG = "/var/log/relay.log"
 
-/** Idle window for the sandbox. Comfortably longer than raiseHand's 15 min default. */
+/** Idle window for the sandbox. Comfortably longer than raiseHand's 5 min default. */
 const DEFAULT_TIMEOUT_MS = 20 * 60_000
 
 /**
