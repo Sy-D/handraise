@@ -55,6 +55,12 @@ const peers = new Map()
 /** Replay buffer for a human who joins (or rejoins) after the agent started. */
 let lastState = null
 let lastFrame = null
+/**
+ * The newest `focus`. The agent only sends this on change, so a human who
+ * reconnects mid-handoff would otherwise show no focus ring until the human
+ * next touched something.
+ */
+let lastFocus = null
 /** The terminal `ended` message, once the agent has sent it. */
 let lastEnded = null
 /**
@@ -230,12 +236,14 @@ function route(peer, payload, opcode) {
     if (peer.role === "agent") {
       if (type === "frame") lastFrame = payload
       else if (type === "state") lastState = payload
+      else if (type === "focus") lastFocus = payload
       else if (type === "ended") {
         // Terminal: keep the ending for a late human, drop everything that
         // could show the logged-in page to whoever opens the link next.
         lastEnded = payload
         lastFrame = null
         lastState = null
+        lastFocus = null
         pendingForAgent = null
       }
     } else if (type === "handback" || type === "abort") {
@@ -244,6 +252,7 @@ function route(peer, payload, opcode) {
       pendingForAgent = payload
       lastFrame = null
       lastState = null
+      lastFocus = null
     }
   }
   // Newest frame wins: drop a frame bound for a backpressured receiver rather
@@ -364,6 +373,8 @@ server.on("upgrade", (req, socket, head) => {
     else {
       if (lastState) write(peer, lastState, OP_TEXT)
       if (lastFrame) write(peer, lastFrame, OP_TEXT)
+      // After the frame: the page positions the ring against the frame it has.
+      if (lastFocus) write(peer, lastFocus, OP_TEXT)
     }
   }
 
@@ -398,15 +409,19 @@ const PAGE = `<!doctype html>
 <meta name="robots" content="noindex">
 <title>handraise</title>
 <style>
+  /* cmpinf.com's dark palette, verbatim: monochrome at chroma 0 throughout,
+     with exactly one colour in the whole interface — the destructive red on
+     the "Can't help" button. oklch has shipped in every mobile browser that
+     can run this page since 2023. */
   :root {
-    --bg: #08090b;
-    --surface: #101216;
-    --line: #1e2127;
-    --text: #e7e9ec;
-    --muted: #8b919b;
-    --live: #34d399;
-    --wait: #fbbf24;
-    --danger: #f87171;
+    --bg: oklch(0.11 0 0);
+    --surface: oklch(0.145 0 0);
+    --line: oklch(0.24 0 0);
+    --field: oklch(0.26 0 0);
+    --text: oklch(0.985 0 0);
+    --muted: oklch(0.68 0 0);
+    --danger: oklch(0.65 0.2 25);
+    --radius: 0.625rem;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
@@ -438,7 +453,7 @@ const PAGE = `<!doctype html>
     width: 9px;
     height: 9px;
     border-radius: 50%;
-    background: var(--live);
+    background: var(--text);
   }
   .dot::after {
     content: "";
@@ -446,12 +461,14 @@ const PAGE = `<!doctype html>
     inset: -4px;
     border-radius: 50%;
     border: 1px solid currentColor;
-    color: var(--live);
+    color: var(--text);
     opacity: 0;
     animation: pulse 2s ease-out infinite;
   }
-  .dot.waiting { background: var(--wait); }
-  .dot.waiting::after { color: var(--wait); animation-duration: .9s; }
+  .dot.waiting { background: var(--muted); }
+  .dot.waiting::after { color: var(--muted); animation-duration: .9s; }
+  .dot.dead { background: var(--danger); }
+  .dot.dead::after { animation: none; }
   @keyframes pulse {
     0% { transform: scale(.6); opacity: .9; }
     100% { transform: scale(1.6); opacity: 0; }
@@ -481,13 +498,30 @@ const PAGE = `<!doctype html>
     height: 100%;
     touch-action: none;
     display: block;
-    border-radius: 10px;
+    border-radius: var(--radius);
   }
   #placeholder {
     position: absolute;
     color: var(--muted);
     font-size: 14px;
     pointer-events: none;
+  }
+  /* The ring around the focused remote field. A sibling of the canvas, never
+     drawn on it: every frame repaints the canvas and would wipe it out.
+     pointer-events: none keeps taps going to the canvas underneath. */
+  #focus-ring {
+    position: absolute;
+    pointer-events: none;
+    border: 2px solid var(--text);
+    /* Most login pages are light, and a near-white ring on a white form is
+       invisible. The 1px dark keyline outside it is not decoration: it is what
+       makes the ring readable on a page whose colours we do not control. */
+    outline: 1px solid var(--bg);
+    border-radius: 2px;
+    transition: left .12s ease, top .12s ease, width .12s ease, height .12s ease;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #focus-ring { transition: none; }
   }
   footer {
     border-top: 1px solid var(--line);
@@ -497,35 +531,43 @@ const PAGE = `<!doctype html>
   input {
     width: 100%;
     padding: 12px 14px;
-    border-radius: 10px;
-    border: 1px solid var(--line);
-    background: #0b0d10;
+    border-radius: var(--radius);
+    border: 1px solid var(--field);
+    background: var(--bg);
     color: var(--text);
     font: inherit;
     font-size: 16px;
   }
-  input:focus { outline: none; border-color: #39404a; }
-  .hint { margin: 7px 2px 10px; color: var(--muted); font-size: 12.5px; }
+  input:focus { outline: none; border-color: oklch(0.44 0 0); }
+  .hint {
+    margin: 7px 2px 10px;
+    color: var(--muted);
+    font-size: 12.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .row { display: flex; align-items: center; gap: 10px; }
-  button { font: inherit; font-weight: 600; border-radius: 10px; cursor: pointer; }
+  button { font: inherit; font-weight: 600; border-radius: var(--radius); cursor: pointer; }
+  /* Inverted, the way shadcn's dark primary is: near-white on near-black. */
   .primary {
     flex: 1 1 auto;
     padding: 13px 16px;
     border: none;
-    background: var(--live);
-    color: #04180f;
+    background: var(--text);
+    color: oklch(0.205 0 0);
     letter-spacing: -0.01em;
   }
-  .primary:active { background: #2bbb87; }
+  .primary:active { background: oklch(0.9 0 0); }
   .ghost {
     flex: none;
     padding: 13px 14px;
-    border: 1px solid var(--line);
+    border: 1px solid var(--field);
     background: transparent;
     color: var(--danger);
     font-weight: 500;
   }
-  .ghost:active { background: rgba(248, 113, 113, .1); }
+  .ghost:active { border-color: var(--danger); background: oklch(0.65 0.2 25 / 0.1); }
   #overlay {
     position: fixed;
     inset: 0;
@@ -537,7 +579,7 @@ const PAGE = `<!doctype html>
     gap: 8px;
     padding: 32px;
     text-align: center;
-    background: rgba(8, 9, 11, .92);
+    background: oklch(0.11 0 0 / 0.92);
     backdrop-filter: blur(8px);
   }
   #overlay[hidden] { display: none; }
@@ -550,14 +592,15 @@ const PAGE = `<!doctype html>
     <span id="dot" class="dot"></span>
     <span id="reason">Connecting to the browser…</span>
   </header>
-  <main>
+  <main id="stage">
     <canvas id="view"></canvas>
     <p id="placeholder">Waiting for the first frame…</p>
+    <div id="focus-ring" hidden></div>
   </main>
   <footer>
     <input id="kbd" type="text" autocomplete="off" autocapitalize="off" autocorrect="off"
       spellcheck="false" enterkeyhint="enter" placeholder="Type here">
-    <p class="hint">Typing goes straight to the browser</p>
+    <p class="hint" id="hint">Typing goes straight to the browser</p>
     <div class="row">
       <button id="handback" class="primary">&#9995; Hand back to agent</button>
       <button id="abort" class="ghost">Can't help</button>
@@ -572,8 +615,11 @@ const PAGE = `<!doctype html>
   var dot = document.getElementById("dot")
   var reason = document.getElementById("reason")
   var placeholder = document.getElementById("placeholder")
+  var stage = document.getElementById("stage")
   var canvas = document.getElementById("view")
   var ctx = canvas.getContext("2d")
+  var ring = document.getElementById("focus-ring")
+  var hint = document.getElementById("hint")
   var kbd = document.getElementById("kbd")
   var overlay = document.getElementById("overlay")
   var overlayTitle = document.getElementById("overlay-title")
@@ -593,6 +639,11 @@ const PAGE = `<!doctype html>
   var frameW = 0
   var frameH = 0
   var box = { x: 0, y: 0, w: 0, h: 0 }
+  // The newest frame's CDP metadata and the newest focus report. Both are
+  // needed to place the ring, and they arrive in separate messages.
+  var meta = null
+  var focus = null
+  var HINT_DEFAULT = "Typing goes straight to the browser"
 
   function send(message) {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(message))
@@ -621,6 +672,73 @@ const PAGE = `<!doctype html>
     }
     ctx.imageSmoothingQuality = "high"
     ctx.drawImage(img, box.x * dpr, box.y * dpr, box.w * dpr, box.h * dpr)
+    // The letterbox just moved, so the ring has to follow it.
+    placeRing()
+  }
+
+  function finiteNumber(value) {
+    return typeof value === "number" && isFinite(value)
+  }
+
+  /**
+   * Place the ring over the focused field.
+   *
+   * The inverse of toFrame(), one hop longer. The agent reports the box in the
+   * remote page's CSS viewport pixels, so:
+   *
+   *   frame px = page px * pageScaleFactor * jpegWidth / deviceWidth
+   *   canvas px = box.x + frame px * box.w / frameW
+   *
+   * The first factor is the scaling Chromium applied to the JPEG and left out
+   * of the metadata; the second is this page's own letterbox.
+   */
+  function placeRing() {
+    if (!focus || !focus.rect || !meta || !frameW || !frameH || !box.w) {
+      ring.hidden = true
+      return
+    }
+    var zoom = meta.pageScaleFactor > 0 ? meta.pageScaleFactor : 1
+    var kx = (meta.jpegWidth / meta.deviceWidth) * zoom * (box.w / frameW)
+    var ky = (meta.jpegHeight / meta.deviceHeight) * zoom * (box.h / frameH)
+    if (!isFinite(kx) || !isFinite(ky) || kx <= 0 || ky <= 0) {
+      ring.hidden = true
+      return
+    }
+    // The ring is positioned against <main>, the canvas is centred inside it.
+    var here = canvas.getBoundingClientRect()
+    var host = stage.getBoundingClientRect()
+    var rect = focus.rect
+    ring.style.left = (here.left - host.left + box.x + rect.x * kx) + "px"
+    ring.style.top = (here.top - host.top + box.y + rect.y * ky) + "px"
+    ring.style.width = (rect.width * kx) + "px"
+    ring.style.height = (rect.height * ky) + "px"
+    ring.hidden = false
+  }
+
+  /**
+   * Name the field the keyboard is driving. textContent, never innerHTML: the
+   * label comes from whatever page the agent got stuck on.
+   */
+  function setHint() {
+    var named = focus && focus.rect && focus.label
+    hint.textContent = named ? "Typing into: " + focus.label : HINT_DEFAULT
+  }
+
+  /** Accept a focus message only in the shape the ring maths can use. */
+  function readFocus(message) {
+    var rect = message.rect
+    var usable =
+      rect &&
+      finiteNumber(rect.x) &&
+      finiteNumber(rect.y) &&
+      finiteNumber(rect.width) &&
+      finiteNumber(rect.height)
+    return {
+      rect: usable
+        ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+        : null,
+      label: typeof message.label === "string" ? message.label : null
+    }
   }
 
   img.onload = function () {
@@ -640,7 +758,8 @@ const PAGE = `<!doctype html>
 
   // Newest frame wins: a phone that decodes slower than the stream arrives must
   // fall behind in quality of service, never in wall-clock time.
-  function showFrame(data) {
+  function showFrame(data, frameMeta) {
+    if (frameMeta) meta = frameMeta
     var src = "data:image/jpeg;base64," + data
     if (decoding) { queued = src; return }
     decoding = true
@@ -715,6 +834,11 @@ const PAGE = `<!doctype html>
     overlayTitle.textContent = title
     overlayNote.textContent = note
     overlay.hidden = false
+    dot.className = "dot dead"
+    // Nothing is being typed into anymore; drop the ring and the field name.
+    focus = null
+    placeRing()
+    setHint()
     kbd.blur()
     if (ws) ws.close()
   }
@@ -739,8 +863,13 @@ const PAGE = `<!doctype html>
     var message
     try { message = JSON.parse(raw) } catch (err) { return }
     if (!message) return
-    if (message.type === "frame") showFrame(message.data)
+    if (message.type === "frame") showFrame(message.data, message.meta)
     else if (message.type === "state") reason.textContent = message.reason
+    else if (message.type === "focus") {
+      focus = readFocus(message)
+      placeRing()
+      setHint()
+    }
     else if (message.type === "ended") {
       var ending = ENDINGS[message.outcome] || ["Session ended", "You can close this tab."]
       finish(ending[0], ending[1])

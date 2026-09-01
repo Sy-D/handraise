@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url"
 import { type Browser, chromium, type Page } from "playwright-core"
 import WebSocket from "ws"
 
-import type { FrameMeta, RelayMessage } from "../src/relay/protocol"
+import type { FocusRect, FrameMeta, RelayMessage } from "../src/relay/protocol"
 
 const SERVER_PATH = fileURLToPath(
   new URL("../src/relay/guest/server.js", import.meta.url),
@@ -249,6 +249,40 @@ afterEach(async () => {
   relay.process.kill("SIGKILL")
 })
 
+/** A field on the remote page, in its CSS viewport pixels — what the agent sends. */
+const FOCUS_RECT: FocusRect = { x: 400, y: 240, width: 200, height: 40 }
+
+const DEFAULT_HINT = "Typing goes straight to the browser"
+
+/**
+ * Where the ring must end up, computed here the long way round so a mistake in
+ * the page's own maths cannot cancel out: page CSS px → frame px (the JPEG
+ * scaling Chromium left out of the metadata) → canvas px (this page's
+ * letterbox). Viewport-relative, like every Playwright bounding box.
+ */
+function expectedRing(canvas: Box, frame: Box): Box {
+  const kx =
+    ((META.jpegWidth / META.deviceWidth) * META.pageScaleFactor * frame.w) /
+    FRAME_W
+  const ky =
+    ((META.jpegHeight / META.deviceHeight) * META.pageScaleFactor * frame.h) /
+    FRAME_H
+  return {
+    x: canvas.x + frame.x + FOCUS_RECT.x * kx,
+    y: canvas.y + frame.y + FOCUS_RECT.y * ky,
+    w: FOCUS_RECT.width * kx,
+    h: FOCUS_RECT.height * ky,
+  }
+}
+
+/** Resolve once the ring is visible (or hidden, with `visible: false`). */
+async function waitForRing(target: Page, visible: boolean): Promise<void> {
+  await target.waitForFunction((want: boolean) => {
+    const ring = document.getElementById("focus-ring")
+    return ring ? !ring.hidden === want : false
+  }, visible)
+}
+
 /** Wait until the terminal overlay is shown (its `hidden` attribute cleared). */
 async function waitForOverlay(target: Page): Promise<void> {
   await target.waitForFunction(() => {
@@ -340,7 +374,9 @@ test("abort sends abort and shows the aborted overlay", async () => {
   expect(await agent.next()).toEqual({ type: "abort" })
 
   await waitForOverlay(page)
-  expect(await page.locator("#overlay-title").textContent()).toBe("Told the agent")
+  expect(await page.locator("#overlay-title").textContent()).toBe(
+    "Told the agent",
+  )
   expect(consoleErrors).toEqual([])
 })
 
@@ -357,6 +393,87 @@ test("an ended message shows the matching terminal overlay", async () => {
     "The browser session died. The agent knows.",
   )
   expect(consoleErrors).toEqual([])
+})
+
+test("a focus message rings the remote field and names it in the bar", async () => {
+  await showFrame()
+
+  const canvas = await page.locator("#view").boundingBox()
+  if (!canvas) throw new Error("canvas has no bounding box")
+  const want = expectedRing(
+    { x: canvas.x, y: canvas.y, w: canvas.width, h: canvas.height },
+    letterbox(canvas.width, canvas.height),
+  )
+
+  agent.send({ type: "focus", rect: FOCUS_RECT, label: "Password" })
+  await waitForRing(page, true)
+  // Longer than the ring's 120 ms move transition, so the box read below is
+  // the one it settled on and not a frame somewhere along the way.
+  await page.waitForTimeout(200)
+
+  const ring = await page.locator("#focus-ring").boundingBox()
+  if (!ring) throw new Error("the focus ring has no bounding box")
+  expect(Math.abs(ring.x - want.x)).toBeLessThanOrEqual(2)
+  expect(Math.abs(ring.y - want.y)).toBeLessThanOrEqual(2)
+  expect(Math.abs(ring.width - want.w)).toBeLessThanOrEqual(2)
+  expect(Math.abs(ring.height - want.h)).toBeLessThanOrEqual(2)
+
+  expect(await page.locator("#hint").textContent()).toBe(
+    "Typing into: Password",
+  )
+  expect(consoleErrors).toEqual([])
+})
+
+test("clearing the focus hides the ring and restores the default hint", async () => {
+  await showFrame()
+
+  agent.send({ type: "focus", rect: FOCUS_RECT, label: "Password" })
+  await waitForRing(page, true)
+
+  agent.send({ type: "focus", rect: null, label: null })
+  await waitForRing(page, false)
+
+  expect(await page.locator("#hint").textContent()).toBe(DEFAULT_HINT)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a hostile field label reaches the bar as text, never as markup", async () => {
+  await showFrame()
+
+  // The label is copied out of whatever page the agent got stuck on, so it is
+  // attacker-controlled input by construction.
+  const hostile = "<img src=x onerror=\"window.name = 'pwned'\">"
+  agent.send({ type: "focus", rect: FOCUS_RECT, label: hostile })
+  await waitForRing(page, true)
+
+  expect(await page.locator("#hint").textContent()).toBe(
+    `Typing into: ${hostile}`,
+  )
+  expect(await page.locator("#hint img").count()).toBe(0)
+  expect(await page.evaluate(() => window.name)).not.toBe("pwned")
+  expect(consoleErrors).toEqual([])
+})
+
+test("a human who joins late is replayed the current focus", async () => {
+  await showFrame()
+  agent.send({ type: "focus", rect: FOCUS_RECT, label: "Password" })
+  await waitForRing(page, true)
+
+  // A second phone takes the human role. The relay replays state, frame and
+  // focus, in that order — the ring can only appear once the frame decodes.
+  const late = await browser.newPage({
+    viewport: { width: 390, height: 844 },
+    deviceScaleFactor: 1,
+  })
+  try {
+    await late.goto(`http://127.0.0.1:${relay.port}/`)
+    await waitForRing(late, true)
+    expect(await late.locator("#hint").textContent()).toBe(
+      "Typing into: Password",
+    )
+  } finally {
+    await late.close()
+  }
 })
 
 test("the page reconnects after its socket drops, with a single live human", async () => {

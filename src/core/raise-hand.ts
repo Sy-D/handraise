@@ -28,6 +28,7 @@ import type {
   StorageState,
 } from "../types"
 import { notifyWebhook } from "../webhook"
+import { NO_FOCUS, probeFocus } from "./focus"
 import { createInputTarget } from "./input"
 import { DEFAULT_PROFILE, type FramePump, startFramePump } from "./screencast"
 import { connectRelay, type RelayConnection } from "./socket"
@@ -170,6 +171,36 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   let link: RelayConnection | null = null
 
   let terminal = false
+
+  // The phone cannot see a caret in a 60-quality JPEG, so the agent tells it
+  // where the typing lands. Strictly off the critical path: a probe is never
+  // awaited by the input it follows, it holds no timer, and the newest result
+  // is only sent when it differs from the last one — a human moving between
+  // two fields is a handful of tiny messages, not a second stream.
+  let lastFocusJson = JSON.stringify(NO_FOCUS)
+  let probing = false
+  const refreshFocus = (): void => {
+    // One probe at a time. A fast typist would otherwise queue a CDP round
+    // trip per keystroke, all of them answering the same question.
+    if (probing || terminal) return
+    probing = true
+    void probeFocus(page)
+      .then((focus) => {
+        if (terminal) return
+        const json = JSON.stringify(focus)
+        if (json === lastFocusJson) return
+        lastFocusJson = json
+        void link?.send({ type: "focus", ...focus })
+      })
+      // probeFocus swallows its own failures; this covers a send that races
+      // teardown. A probe still in flight when the handoff ends is simply
+      // orphaned — there is nothing to clean up.
+      .catch(() => undefined)
+      .finally(() => {
+        probing = false
+      })
+  }
+
   const onHuman = (message: HumanToAgent): void => {
     if (message.type === "handback") {
       terminal = true
@@ -187,10 +218,17 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     // Input can only be mapped once a frame has defined the coordinate space.
     const meta = pump?.lastMeta()
     if (!meta || !input) return
-    void input.apply(message, meta).catch((error) => {
-      if (error instanceof Error && isBrowserGone(error)) settle("disconnected")
-      else logger.warn("input_rejected", { error: String(error) })
-    })
+    void input
+      .apply(message, meta)
+      // A tap moves the focus and a keystroke can too (Tab, or a page that
+      // advances an OTP box on its own), so the answer is only reliable once
+      // the input has actually reached the page.
+      .then(refreshFocus)
+      .catch((error) => {
+        if (error instanceof Error && isBrowserGone(error))
+          settle("disconnected")
+        else logger.warn("input_rejected", { error: String(error) })
+      })
   }
 
   const connection = connectRelay({
@@ -215,7 +253,13 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       // a base64 payload is ASCII, so its char length is its byte length.
       framesSent += 1
       bytesSent += data.length
-      if (firstFrameMs === undefined) firstFrameMs = Date.now() - startedAt
+      if (firstFrameMs === undefined) {
+        firstFrameMs = Date.now() - startedAt
+        // The phone now has a picture to draw on. If the agent left a field
+        // focused — the usual case, it got stuck on a login form — the human
+        // sees the ring on the first frame rather than after their first tap.
+        refreshFocus()
+      }
     })
   } catch (error) {
     firstError = String(error)

@@ -21,9 +21,27 @@ export interface FrameMeta {
   pageScaleFactor: number
 }
 
+/**
+ * The focused field's box in **CSS viewport pixels of the remote page** — the
+ * same space `frameToPage()` maps a tap into, so the phone inverts that maths
+ * to draw it. Never frame pixels: the frame is scaled and the metadata is not.
+ */
+export interface FocusRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 export type AgentToHuman =
   | { type: "frame"; data: string; meta: FrameMeta }
   | { type: "state"; reason: string }
+  /**
+   * Where the human's typing currently lands. `rect: null` means nothing is
+   * focused; `label` is a human-readable field name taken from the remote
+   * page's own markup, never from the field's value.
+   */
+  | { type: "focus"; rect: FocusRect | null; label: string | null }
   | {
       type: "ended"
       outcome: "resolved" | "aborted" | "timeout" | "disconnected"
