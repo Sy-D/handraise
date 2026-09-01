@@ -36,4 +36,7 @@ export interface HandoffResult {
  * The session is kept alive for the whole wait; all relay infrastructure is
  * destroyed before this promise settles, on every path including errors.
  */
-export type RaiseHand = (page: Page, options: RaiseHandOptions) => Promise<HandoffResult>
+export type RaiseHand = (
+  page: Page,
+  options: RaiseHandOptions,
+) => Promise<HandoffResult>
