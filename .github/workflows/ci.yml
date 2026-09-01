@@ -22,6 +22,13 @@ jobs:
         run: bun run lint
       - name: unit + integration tests
         run: bun test src/ test-app/ e2e/ui.spec.ts
+      - name: coverage summary (reporting only)
+        # Reporting, not an enforced gate — deliberately. deploy.ts and
+        # webhook.ts are exercised by the live e2e (bun run test:e2e), not by
+        # unit tests, because unit-testing them would mean mocking the Solari
+        # SDK, which the anti-slop no-module-mocking rule forbids. A hard unit
+        # threshold would therefore be a fake gate. The number is here to read.
+        run: bun test --coverage src/ test-app/
       - name: build
         run: bun run build
       # e2e (bun run test:e2e) is intentionally not run in CI: it needs a real

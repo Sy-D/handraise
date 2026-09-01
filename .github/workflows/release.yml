@@ -1,0 +1,60 @@
+name: release
+
+# Publishes handraise to npm on a version tag (or a manual dispatch), but only
+# after the full CI gate passes. Publishing is guarded: without an NPM_TOKEN
+# repo secret the job runs green and simply skips the publish step, so a tag
+# push today succeeds without shipping anything. Once the maintainer adds
+# NPM_TOKEN, the very same workflow publishes on the next tag / dispatch.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # secrets can't be used in a step `if:` directly, so bridge to a plain
+      # env flag here (job-level env may reference secrets).
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: install chromium for the UI e2e
+        run: bunx playwright-core install --with-deps chromium
+      - name: typecheck
+        run: bun run typecheck
+      - name: lint (biome + oxlint + relay embed sync)
+        run: bun run lint
+      - name: unit + integration tests
+        run: bun test src/ test-app/ e2e/ui.spec.ts
+      - name: build
+        run: bun run build
+
+      # --- publish (guarded) ---
+      - name: setup node for npm publish
+        if: env.HAS_NPM_TOKEN == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: publish to npm
+        if: env.HAS_NPM_TOKEN == 'true'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: no NPM_TOKEN → skipping publish
+        if: env.HAS_NPM_TOKEN != 'true'
+        run: |
+          echo "NPM_TOKEN secret is not set — build and all gates passed, but"
+          echo "nothing was published. Add NPM_TOKEN as a repo secret and push"
+          echo "a new v* tag (or run this workflow via workflow_dispatch) to publish."

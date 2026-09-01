@@ -38,7 +38,8 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "lint": "biome check . && oxlint && bun scripts/embed-guest.ts --check",
-    "test": "bun test src/ test-app/",
+    "test": "bun test src/ test-app/ e2e/ui.spec.ts",
+    "test:coverage": "bun test --coverage src/ test-app/",
     "test:e2e": "bun --env-file=.env e2e/handoff.e2e.ts",
     "prepublishOnly": "bun run lint && bun run typecheck && bun run test && bun run build"
   },
