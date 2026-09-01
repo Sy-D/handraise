@@ -2,6 +2,8 @@
 
 **Human-in-the-loop handoff for [Solari](https://getsolari.com) cloud browsers.**
 
+![CI](https://github.com/Sy-D/handraise/actions/workflows/ci.yml/badge.svg) ![npm](https://img.shields.io/npm/v/handraise) ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+
 Your agent already knows when it's stuck. handraise lets it raise its hand: the
 browser session appears live on your phone, you solve the 2FA prompt (or the
 captcha it couldn't, or the dialog it doesn't understand), tap *Hand back*, and
@@ -115,6 +117,9 @@ browser back. Re-read the page and continue.").
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
 | `qr` | `boolean` | `true` | Print a QR code to the terminal. |
 | `apiKey` | `string` | `$SOLARI_API_KEY` | Solari key used to create the relay sandbox. |
+| `logger` | `Logger` | — | Pluggable structured logging. |
+| `onEvent` | `(e: HandoffEvent) => void` | — | One wide event per handoff (outcome, timings, ids). |
+| `baseUrl` | `string` | — | Solari endpoint/region for the relay sandbox. |
 
 ### `HandoffResult`
 
@@ -194,6 +199,27 @@ app ([`test-app/`](test-app/), deployed into a sandbox), hits the 2FA wall,
 raises its hand, a scripted "human" types the code through the real handoff
 UI, and the test asserts the signed-in page. Injected events arrive with
 `isTrusted: true`.
+
+## How this compares
+
+Human-in-the-loop for cloud browsers isn't new — that's the point. The demand is
+proven, and handraise brings the same escape hatch to a runtime that doesn't have
+one yet.
+
+- **Browserbase Live View, Cloudflare Browser Run, Scrapfly, AuthLoop** are
+  platform features of their own clouds — a live-view panel or a session-takeover
+  flow baked into the service that runs your browser. They're hosted, mature, and
+  supported by the vendor. If you already run on one of those, use theirs.
+- **handraise** brings the same handoff to **Solari** browsers, which don't have a
+  native live view (Solari's VNC is desktop-only). It's a small, self-contained,
+  open-source library rather than a platform feature: you `npm install` it, call
+  `raiseHand`, and the handoff UI itself runs on Solari — no extra service to host,
+  no second account.
+
+The honest trade-off: the platform solutions are more polished and fully hosted;
+handraise is lightweight and portable, and it works where those don't. Its scope
+is deliberately narrow — the handoff muscle, not wall detection (see
+[`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
 
 ## Limitations (v1)
 
