@@ -13,5 +13,5 @@
     "noEmit": true,
     "types": ["bun-types"]
   },
-  "include": ["src", "e2e", "test-app"]
+  "include": ["src", "e2e", "test-app", "demo"]
 }

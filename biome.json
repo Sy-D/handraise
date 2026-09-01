@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.0.0/schema.json",
   "files": {
-    "includes": ["src/**", "e2e/**", "test-app/**", "*.json"]
+    "includes": ["src/**", "e2e/**", "test-app/**", "demo/**", "*.json"]
   },
   "formatter": {
     "enabled": true,
@@ -33,7 +33,9 @@
           "complexity": {
             "noExcessiveCognitiveComplexity": {
               "level": "error",
-              "options": { "maxAllowedComplexity": 59 }
+              "options": {
+                "maxAllowedComplexity": 59
+              }
             }
           }
         }
