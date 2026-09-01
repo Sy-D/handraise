@@ -4,12 +4,21 @@
   "description": "Human-in-the-loop handoff for Solari cloud browsers. Your agent already knows when it's stuck — handraise lets it raise its hand.",
   "license": "MIT",
   "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Sy-D/handraise.git"
+    "url": "git+https://github.com/Sy-D/handraise.git"
   },
+  "homepage": "https://github.com/Sy-D/handraise#readme",
+  "bugs": "https://github.com/Sy-D/handraise/issues",
   "keywords": [
     "solari",
     "human-in-the-loop",
@@ -22,24 +31,31 @@
     "playwright"
   ],
   "scripts": {
+    "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "lint": "biome check . && oxlint",
-    "test:e2e": "bun --env-file=.env e2e/handoff.e2e.ts"
+    "lint": "biome check . && oxlint && bun scripts/embed-guest.ts --check",
+    "test": "bun test src/ test-app/",
+    "test:e2e": "bun --env-file=.env e2e/handoff.e2e.ts",
+    "prepublishOnly": "bun run lint && bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {
-    "@solarisdk/browser": "^0.1.2",
     "@solarisdk/sdk": "^0.1.2",
-    "playwright-core": "^1.62.1",
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.21.3"
+  },
+  "peerDependencies": {
+    "playwright-core": ">=1.40.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",
     "@oxlint/plugins": "1.80.0",
+    "@solarisdk/browser": "^0.1.2",
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.5.13",
     "bun-types": "^1.4.0",
     "oxlint": "1.80.0",
+    "playwright-core": "^1.62.1",
+    "tsup": "^8.5.1",
     "typescript": "^5.7.2"
   }
 }
