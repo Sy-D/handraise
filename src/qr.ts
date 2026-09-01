@@ -10,6 +10,7 @@
 // this module used to swallow into a log line, printing no QR code at all.
 // Typechecked, linted, silently broken; caught by running it.
 import * as qrcodeTerminal from "qrcode-terminal"
+import { consoleLogger, type Logger } from "./logger"
 
 /**
  * Render a QR code for `url` as terminal text.
@@ -18,7 +19,10 @@ import * as qrcodeTerminal from "qrcode-terminal"
  * and still scans on a phone. Returns `null` rather than throwing: a terminal
  * that cannot draw this is not a reason to fail a handoff.
  */
-export function handoffQr(url: string): string | null {
+export function handoffQr(
+  url: string,
+  logger: Logger = consoleLogger,
+): string | null {
   try {
     let drawn: string | null = null
     qrcodeTerminal.generate(url, { small: true }, (code) => {
@@ -26,15 +30,26 @@ export function handoffQr(url: string): string | null {
     })
     return drawn
   } catch (error) {
-    console.error("handraise: could not draw the QR code", error)
+    logger.warn("qr_render_failed", { error: String(error) })
     return null
   }
 }
 
-/** Print the handoff URL, the reason, and a scannable code, to stdout. */
-export function printHandoffQr(url: string, reason: string): void {
+/**
+ * Print the handoff URL, the reason, and a scannable code, to stdout.
+ *
+ * These `console.log` lines are the terminal UX a person reads to scan the
+ * code — not observability. The tokenised URL is deliberately not sent through
+ * the structured logger, which would both destroy the QR rendering and log a
+ * bearer credential.
+ */
+export function printHandoffQr(
+  url: string,
+  reason: string,
+  logger: Logger = consoleLogger,
+): void {
   console.log(`\nhandraise: ${reason}`)
   console.log(`handraise: open ${url}\n`)
-  const code = handoffQr(url)
+  const code = handoffQr(url, logger)
   if (code) console.log(code)
 }

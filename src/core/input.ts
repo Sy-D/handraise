@@ -196,6 +196,12 @@ export interface InputTarget {
    * page while it is being snapshotted and torn down.
    */
   drain(): Promise<void>
+  /**
+   * Taps, characters, keys and scrolls actually dispatched to the page. Dropped
+   * messages (an over-long char, an unmapped key, a flood past the cap) and the
+   * `handback`/`abort` lifecycle messages do not count.
+   */
+  applied(): number
 }
 
 /**
@@ -210,6 +216,9 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
   let lastTap: PagePoint | null = null
   let queue: Promise<void> = Promise.resolve()
   let depth = 0
+  // Incremented only after an input reaches the page, so the wide event counts
+  // what the human actually did, not what a hostile client tried to send.
+  let appliedCount = 0
 
   const anchor = (meta: FrameMeta): PagePoint => lastTap ?? viewportCentre(meta)
 
@@ -222,6 +231,7 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
         const at = frameToPage(message.fx, message.fy, meta)
         lastTap = at
         await clickAt(cdp, at)
+        appliedCount += 1
         return
       }
       case "char":
@@ -230,6 +240,7 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
         // payload into the page. Drop it rather than type it.
         if (message.ch.length !== 1) return
         await typeCharacter(cdp, message.ch)
+        appliedCount += 1
         return
       case "key":
         // `key` is typed as SendableKey but arrives as untrusted JSON. Reject
@@ -237,6 +248,7 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
         // cannot index a prototype member or reach an unmapped key.
         if (!Object.hasOwn(KEY_TABLE, message.key)) return
         await dispatchKey(cdp, message.key, KEY_TABLE[message.key])
+        appliedCount += 1
         return
       case "scroll": {
         // A scroll message carries no anchor point, and mouseWheel needs one.
@@ -249,6 +261,7 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
           deltaX: 0,
           deltaY: frameDeltaToPage(message.fdy, meta),
         })
+        appliedCount += 1
         return
       }
       case "handback":
@@ -260,6 +273,7 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
 
   return {
     anchor,
+    applied: () => appliedCount,
     apply(message, meta) {
       if (depth >= MAX_QUEUE_DEPTH) return Promise.resolve()
       depth += 1

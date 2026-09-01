@@ -16,6 +16,8 @@
  *   once.
  */
 import type { CDPSession, Page } from "playwright-core"
+import type { HandoffEvent } from "../events"
+import { consoleLogger, type Logger } from "../logger"
 import { printHandoffQr } from "../qr"
 import { startRelay } from "../relay/deploy"
 import type { AgentToHuman, HumanToAgent } from "../relay/protocol"
@@ -101,16 +103,52 @@ interface HandoffEnd {
   storageState?: StorageState
 }
 
+/** Everything one handoff needs, plus the relay-level facts for its wide event. */
+export interface HandoffRun {
+  page: Page
+  agentWsUrl: string
+  options: RaiseHandOptions
+  timeoutMs: number
+  /** Correlation key; the relay's preview subdomain. */
+  handoffId: string
+  /** Measured by `startRelay()` and mirrored into the event. */
+  relayColdStartMs: number
+  logger: Logger
+}
+
+/**
+ * Emit the canonical wide event exactly once: as a `logger.info` line and, if
+ * the caller supplied one, through `onEvent`. A throw from `onEvent` is caught
+ * so a broken callback never breaks the handoff.
+ */
+function emitHandoffEvent(
+  options: RaiseHandOptions,
+  logger: Logger,
+  event: HandoffEvent,
+): void {
+  logger.info("handoff", { ...event })
+  try {
+    options.onEvent?.(event)
+  } catch (error) {
+    logger.error("on_event_threw", { error: String(error) })
+  }
+}
+
 /**
  * Run one handoff to its end. Never throws, never leaves a timer, a listener
- * or a CDP session behind.
+ * or a CDP session behind. Emits the wide event exactly once before it settles.
+ *
+ * Exported for `handoff.test.ts`, which drives it against a local relay with a
+ * fake page; `raiseHand` is the supported entry point.
  */
-async function runHandoff(
-  page: Page,
-  agentWsUrl: string,
-  options: RaiseHandOptions,
-  timeoutMs: number,
-): Promise<HandoffEnd> {
+export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
+  const { page, agentWsUrl, options, timeoutMs, logger } = run
+  const startedAt = Date.now()
+  let framesSent = 0
+  let bytesSent = 0
+  let firstFrameMs: number | undefined
+  let firstError: string | undefined
+
   let settle: (outcome: HandoffOutcome) => void = () => undefined
   // A promise resolves once; that is where "settled exactly once" comes from.
   const finished = new Promise<HandoffOutcome>((resolve) => {
@@ -151,7 +189,7 @@ async function runHandoff(
     if (!meta || !input) return
     void input.apply(message, meta).catch((error) => {
       if (error instanceof Error && isBrowserGone(error)) settle("disconnected")
-      else console.error("handraise: input was rejected", error)
+      else logger.warn("input_rejected", { error: String(error) })
     })
   }
 
@@ -170,16 +208,25 @@ async function runHandoff(
   try {
     cdp = await page.context().newCDPSession(page)
     input = createInputTarget(cdp)
-    pump = await startFramePump(cdp, DEFAULT_PROFILE, (data, meta) =>
+    pump = await startFramePump(cdp, DEFAULT_PROFILE, async (data, meta) => {
       // The ack that paces the cast waits on this write. See screencast.ts.
-      connection.send({ type: "frame", data, meta }),
-    )
+      await connection.send({ type: "frame", data, meta })
+      // Counted with the same "send resolved" semantics as pump.frameCount():
+      // a base64 payload is ASCII, so its char length is its byte length.
+      framesSent += 1
+      bytesSent += data.length
+      if (firstFrameMs === undefined) firstFrameMs = Date.now() - startedAt
+    })
   } catch (error) {
-    console.error("handraise: could not start the live view", error)
+    firstError = String(error)
+    logger.error("live_view_start_failed", { error: firstError })
     settle("disconnected")
   }
 
   const outcome = await finished
+  // The handoff is over the instant it settles; teardown below is not the
+  // human's time, so the event's durationMs is measured here.
+  const durationMs = Date.now() - startedAt
 
   // Handback is only "resolved-pending" until the page is proven still usable.
   let finalOutcome = outcome
@@ -199,7 +246,7 @@ async function runHandoff(
         "storageState capture",
       )
     } catch (error) {
-      console.error("handraise: could not capture storageState", error)
+      logger.warn("storage_state_capture_failed", { error: String(error) })
     }
     // Handback can win the promise by milliseconds just as the session hits its
     // ~10-min hard death (spikes/s4-report.md). If the page is gone the caller
@@ -220,6 +267,27 @@ async function runHandoff(
   await connection.close()
   await cdp?.detach().catch(() => undefined)
 
+  // The one canonical line for this handoff, built after teardown so every
+  // counter is final. Optional fields are added only when they carry a value
+  // (exactOptionalPropertyTypes).
+  const event: HandoffEvent = {
+    handoffId: run.handoffId,
+    outcome: finalOutcome,
+    reason: options.reason,
+    timeoutMs,
+    durationMs,
+    relayColdStartMs: run.relayColdStartMs,
+    framesSent,
+    bytesSent,
+    inputsApplied: input?.applied() ?? 0,
+    reconnects: connection.stats().reconnects,
+    storageStateCaptured: storageState !== undefined,
+  }
+  if (firstFrameMs !== undefined) event.firstFrameMs = firstFrameMs
+  if (options.baseUrl !== undefined) event.baseUrl = options.baseUrl
+  if (firstError !== undefined) event.error = firstError
+  emitHandoffEvent(options, logger, event)
+
   if (storageState === undefined) return { outcome: finalOutcome }
   return { outcome: finalOutcome, storageState }
 }
@@ -229,6 +297,7 @@ export async function raiseHand(
   page: Page,
   options: RaiseHandOptions,
 ): Promise<HandoffResult> {
+  const logger = options.logger ?? consoleLogger
   const apiKey = options.apiKey ?? process.env.SOLARI_API_KEY
   if (!apiKey) {
     throw new Error(
@@ -239,10 +308,16 @@ export async function raiseHand(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   // Throwing here is allowed and correct: no URL exists yet, so no human has
   // been asked for anything and the caller can retry or give up cleanly.
-  const relay = await startRelay({
-    apiKey,
-    timeoutMs: timeoutMs + RELAY_SLACK_MS,
-  })
+  const relay = await startRelay(
+    options.baseUrl
+      ? {
+          apiKey,
+          timeoutMs: timeoutMs + RELAY_SLACK_MS,
+          baseUrl: options.baseUrl,
+          logger,
+        }
+      : { apiKey, timeoutMs: timeoutMs + RELAY_SLACK_MS, logger },
+  )
 
   const startedAt = Date.now()
   let endedAt = startedAt
@@ -253,29 +328,43 @@ export async function raiseHand(
     try {
       options.onUrl?.(relay.humanUrl)
     } catch (error) {
-      console.error("handraise: the onUrl callback threw", error)
+      logger.warn("on_url_threw", { error: String(error) })
     }
     if (options.qr !== false) printHandoffQr(relay.humanUrl, options.reason)
     if (options.webhookUrl) {
       // Deliberately not awaited: the human may already be scanning the QR
       // code while a slow Slack endpoint is still thinking.
-      webhook = notifyWebhook(options.webhookUrl, {
-        url: relay.humanUrl,
-        reason: options.reason,
-        sessionId: handoffId(relay.humanUrl),
-      })
+      webhook = notifyWebhook(
+        options.webhookUrl,
+        {
+          url: relay.humanUrl,
+          reason: options.reason,
+          sessionId: handoffId(relay.humanUrl),
+        },
+        logger,
+      )
     }
 
-    end = await runHandoff(page, relay.agentWsUrl, options, timeoutMs)
+    end = await runHandoff({
+      page,
+      agentWsUrl: relay.agentWsUrl,
+      options,
+      timeoutMs,
+      handoffId: handoffId(relay.humanUrl),
+      relayColdStartMs: relay.coldStartMs,
+      logger,
+    })
   } catch (error) {
-    console.error("handraise: the handoff failed", error)
+    // runHandoff does not throw, so this only fires on an unexpected fault; the
+    // handoff event is emitted inside runHandoff, on every ordinary path.
+    logger.error("handoff_failed", { error: String(error) })
   } finally {
     // Captured before teardown: durationMs is the time the human had, not the
     // time the sandbox took to shut down afterwards.
     endedAt = Date.now()
     await webhook
     await relay.kill().catch((error) => {
-      console.error("handraise: could not release the relay sandbox", error)
+      logger.error("relay_release_failed", { error: String(error) })
     })
   }
 

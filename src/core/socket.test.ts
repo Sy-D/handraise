@@ -290,6 +290,8 @@ test("a socket dropped mid-handoff comes back", async () => {
   await until("a second connect", () => opens === 2, 6000)
   expect(fake.sockets).toHaveLength(2)
   expect(connection.isOpen()).toBe(true)
+  // The recovered drop is counted for the wide event; the first connect is not.
+  expect(connection.stats().reconnects).toBe(1)
 })
 
 test("sendFinal waits for a reconnect before giving up on the ending", async () => {

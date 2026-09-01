@@ -7,6 +7,7 @@
  * integrations: a webhook the caller can point anywhere ages better than a
  * Slack client that needs a token and a scope.
  */
+import { consoleLogger, type Logger } from "./logger"
 
 /** Body of the notification POST. */
 export interface WebhookPayload {
@@ -28,6 +29,7 @@ const TIMEOUT_MS = 10_000
 export async function notifyWebhook(
   webhookUrl: string,
   payload: WebhookPayload,
+  logger: Logger = consoleLogger,
 ): Promise<void> {
   try {
     const response = await fetch(webhookUrl, {
@@ -37,11 +39,12 @@ export async function notifyWebhook(
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
     if (!response.ok) {
-      console.error(
-        `handraise: webhook answered ${response.status} ${response.statusText}`,
-      )
+      logger.warn("webhook_rejected", {
+        status: response.status,
+        statusText: response.statusText,
+      })
     }
   } catch (error) {
-    console.error("handraise: webhook failed", error)
+    logger.warn("webhook_failed", { error: String(error) })
   }
 }

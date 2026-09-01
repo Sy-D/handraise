@@ -1,4 +1,6 @@
 import type { BrowserContext, Page } from "playwright-core"
+import type { HandoffEvent } from "./events"
+import type { Logger } from "./logger"
 
 /** Why the agent is raising its hand — shown to the human on the handoff page. */
 export interface RaiseHandOptions {
@@ -26,6 +28,24 @@ export interface RaiseHandOptions {
    * `process.env.SOLARI_API_KEY`.
    */
   apiKey?: string
+  /**
+   * Where handraise's own logs go. Defaults to `consoleLogger`, which writes
+   * one structured JSON line per event. Pass `noopLogger` to silence it, or
+   * your own `Logger` to route it into your stack. No secret is ever logged.
+   */
+  logger?: Logger
+  /**
+   * Called exactly once at the end of every handoff — resolved, aborted,
+   * timeout or disconnected — with the full wide event. A throw from this
+   * callback is caught and logged; it never breaks the handoff.
+   */
+  onEvent?: (event: HandoffEvent) => void
+  /**
+   * Gateway base URL for the relay's Solari client. Defaults to the SDK's
+   * `https://api.getsolari.com`. Set it to reach a non-default Solari gateway;
+   * when set it is mirrored into the handoff event.
+   */
+  baseUrl?: string
 }
 
 export type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>

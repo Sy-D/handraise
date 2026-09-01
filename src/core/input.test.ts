@@ -216,6 +216,22 @@ test("handback and abort dispatch no input at all", async () => {
   expect(calls).toEqual([])
 })
 
+test("applied counts real inputs, never dropped or lifecycle messages", async () => {
+  const { cdp } = recorder()
+  const target = createInputTarget(cdp)
+  await target.apply({ type: "tap", fx: 400, fy: 250 }, META)
+  await target.apply({ type: "char", ch: "7" }, META)
+  await target.apply({ type: "key", key: "Enter" }, META)
+  await target.apply({ type: "scroll", fdy: 43 }, META)
+  // None of these reach the page, so none may be counted.
+  await target.apply({ type: "char", ch: "too long" }, META)
+  await target.apply(untrusted('{"type":"key","key":"F1"}'), META)
+  await target.apply({ type: "handback" }, META)
+  await target.apply({ type: "abort" }, META)
+
+  expect(target.applied()).toBe(4)
+})
+
 /**
  * A message straight off the wire, before any narrowing. The relay forwards
  * bytes verbatim, so a hostile phone can send JSON the type system forbids; the

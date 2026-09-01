@@ -53,8 +53,19 @@ export interface RelayConnection {
    */
   sendFinal(message: AgentToHuman): Promise<void>
   isOpen(): boolean
+  /** Observability counters for the wide event. */
+  stats(): RelayConnectionStats
   /** Stop reconnecting and close. Idempotent. */
   close(): Promise<void>
+}
+
+export interface RelayConnectionStats {
+  /**
+   * Times the socket re-opened after the first connect. The preview proxy cuts
+   * a silent socket at 60 s (close 1006) and the relay drops an agent when a
+   * second one connects; both are recovered here, and both count.
+   */
+  reconnects: number
 }
 
 function toText(data: WebSocket.RawData): string {
@@ -82,6 +93,10 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
   let socket: WebSocket | null = null
   let shuttingDown = false
   let attempt = 0
+  // Every successful open bumps this; the first is the initial connect, so
+  // reconnects are one fewer. Counted on open, not on close, so a drop that
+  // never recovers is not miscounted as a reconnect.
+  let opens = 0
   let heartbeat: ReturnType<typeof setInterval> | null = null
   let reconnect: ReturnType<typeof setTimeout> | null = null
 
@@ -144,6 +159,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
 
     live.on("open", () => {
       attempt = 0
+      opens += 1
       options.onOpen?.()
     })
     live.on("message", (data: WebSocket.RawData) => {
@@ -168,6 +184,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
     send,
     sendFinal,
     isOpen: () => socket?.readyState === WebSocket.OPEN,
+    stats: () => ({ reconnects: Math.max(0, opens - 1) }),
     close() {
       shuttingDown = true
       if (heartbeat) clearInterval(heartbeat)

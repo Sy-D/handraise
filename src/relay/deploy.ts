@@ -15,6 +15,7 @@ import {
   SolariClient,
 } from "@solarisdk/sdk"
 
+import { consoleLogger, type Logger } from "../logger"
 import { GUEST_SERVER_JS } from "./guest-source"
 import { RELAY_PORT } from "./protocol"
 
@@ -51,6 +52,10 @@ export interface StartRelayOptions {
   apiKey: string
   /** Sandbox idle window in ms. Default: 20 minutes. */
   timeoutMs?: number
+  /** Gateway base URL. Defaults to the SDK's `https://api.getsolari.com`. */
+  baseUrl?: string
+  /** Where deploy diagnostics go. Defaults to `consoleLogger`. */
+  logger?: Logger
 }
 
 export interface RelayHandle {
@@ -61,6 +66,8 @@ export interface RelayHandle {
    * cookie, and `k` is the secret that proves this side is the agent.
    */
   agentWsUrl: string
+  /** Time from `startRelay()` entry to the public URL answering, in ms. */
+  coldStartMs: number
   /** Destroy the sandbox. Idempotent; safe to call from a `finally`. */
   kill(): Promise<void>
 }
@@ -145,13 +152,21 @@ async function waitForHealth(healthUrl: string): Promise<void> {
 export async function startRelay(
   options: StartRelayOptions,
 ): Promise<RelayHandle> {
-  const client = new SolariClient({ apiKey: options.apiKey })
+  const startedAt = Date.now()
+  const logger = options.logger ?? consoleLogger
+  const client = new SolariClient(
+    options.baseUrl
+      ? { apiKey: options.apiKey, baseUrl: options.baseUrl }
+      : { apiKey: options.apiKey },
+  )
   const requestedTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const timeoutMs = Math.min(requestedTimeoutMs, MAX_TIMEOUT_MS)
   if (requestedTimeoutMs > MAX_TIMEOUT_MS) {
-    console.warn(
-      `handraise: timeoutMs ${requestedTimeoutMs}ms exceeds the ${MAX_TIMEOUT_MS}ms preview-token lifetime; capping to ${MAX_TIMEOUT_MS}ms to avoid an unannounced 401 mid-handoff.`,
-    )
+    logger.warn("relay_timeout_capped", {
+      requestedTimeoutMs,
+      cappedToMs: MAX_TIMEOUT_MS,
+      reason: "preview token lifetime; avoids an unannounced 401 mid-handoff",
+    })
   }
   // Only a client that holds this secret may claim role=agent. It is appended
   // to `agentWsUrl` alone, never to the human's link, so possession of the
@@ -210,11 +225,12 @@ export async function startRelay(
     return {
       humanUrl: relayUrl(previewUrl, "/"),
       agentWsUrl: agentUrl.toString().replace(/^https:/, "wss:"),
+      coldStartMs: Date.now() - startedAt,
       kill,
     }
   } catch (error) {
     await kill().catch((killError) => {
-      console.error("handraise: could not release the relay sandbox", killError)
+      logger.error("relay_release_failed", { error: String(killError) })
     })
     throw error
   }
