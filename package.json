@@ -41,6 +41,7 @@
     "test": "bun test src/ test-app/ e2e/ui.spec.ts",
     "test:coverage": "bun test --coverage src/ test-app/",
     "test:e2e": "bun --env-file=.env e2e/handoff.e2e.ts",
+    "bench": "bun --env-file=.env e2e/bench.ts",
     "prepublishOnly": "bun run lint && bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {

@@ -14,9 +14,32 @@
       "recommended": true,
       "suspicious": {
         "noExplicitAny": "error"
+      },
+      "complexity": {
+        "noExcessiveCognitiveComplexity": {
+          "level": "error",
+          "options": {
+            "maxAllowedComplexity": 28
+          }
+        }
       }
     }
   },
+  "overrides": [
+    {
+      "includes": ["src/relay/guest/server.js"],
+      "linter": {
+        "rules": {
+          "complexity": {
+            "noExcessiveCognitiveComplexity": {
+              "level": "error",
+              "options": { "maxAllowedComplexity": 59 }
+            }
+          }
+        }
+      }
+    }
+  ],
   "javascript": {
     "formatter": {
       "semicolons": "asNeeded",

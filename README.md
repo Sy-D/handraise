@@ -180,15 +180,29 @@ the worst moment is worse than no tool.
 
 ## Measured
 
-On the $20 Solari plan, from Europe:
+Benchmarked with the shipped harness (`bun run bench`): 30 consecutive real
+handoffs against the live API on the $20 Solari plan, one fresh relay sandbox
+each, a scripted human on the public WebSocket, measured from Germany against
+the default (us-west) endpoint. **30/30 resolved, zero reconnects, zero
+leaked sandboxes.** Raw per-run data: [`spikes/bench-results.json`](spikes/bench-results.json).
 
-| | |
-|---|---|
-| Raise → phone sees the live session | ~3s (sandbox cold start) + first frame ~200–300ms |
-| Live view bandwidth while a human solves 2FA | 23–80 KB/s |
-| Input round trip (tap on phone → click in browser) | ~1 RTT (the relay adds nothing measurable) |
-| Full handoff, agent stuck → solved → signed in | ~6s in the e2e |
-| Sandboxes consumed per handoff | one, destroyed when the handoff ends |
+| | p50 | p75 | worst of 30 |
+|---|---|---|---|
+| Agent raises its hand → the phone shows the live page | 3.5s | 3.6s | 3.7s |
+| — of which: relay sandbox cold start | 2.7s | 2.7s | 2.9s |
+| Input round trip through the relay (150 samples) | 186ms | 191ms | 286ms |
+
+At N=30 the right-hand column is the worst observation, not a fitted p99 — we
+say what we measured. The input round trip sits on the network RTT floor from
+Germany to the us-west edge; the relay itself adds nothing measurable (pass
+`baseUrl` to co-locate the relay with your region). Cold start is ~75% of
+time-to-visible, which is why a warm-relay option is the roadmap's next
+performance lever.
+
+Additional context: live-view bandwidth while a human solves a 2FA runs
+23–80 KB/s; the full e2e — sign-in wall, handoff, a scripted human typing a
+TOTP code, signed-in assertion — completes in ~6s; each handoff consumes one
+sandbox, destroyed when it ends.
 
 ## Verified how
 
