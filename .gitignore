@@ -3,3 +3,4 @@ node_modules/
 *.log
 spikes/**/out/
 dist/
+demo/.session.json
