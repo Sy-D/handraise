@@ -13,5 +13,5 @@
     "noEmit": true,
     "types": ["bun-types"]
   },
-  "include": ["src", "spikes", "e2e"]
+  "include": ["src", "e2e"]
 }
