@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-01
+
+Everything below shipped after 0.1.0 was published. **0.1.0 is broken and
+deprecated**: its bundle used a namespace import for `qrcode-terminal`, which
+resolves to `{ default: … }` under Node's ESM/CJS interop, so `generate` was
+undefined and the QR code — the whole onboarding path — silently failed to
+render. Bun-driven tests never saw it because bun's interop differs. CI now
+runs the shipped artifact under node after every build.
+
+### Added
+
+- **`npx handraise`** — a one-command demo. With only a `SOLARI_API_KEY`, it
+  deploys its own TOTP-walled portal into a sandbox, opens a cloud browser
+  against it, raises a hand and prints the QR.
+- **`handoffQr(url)` export** — render the handoff QR yourself.
+- **Focus feedback on the phone** — a ring around the focused field and a
+  "Typing into: Password" label, so the human can see where typing lands.
+  Only the field's label is read, never its value.
+- **A key bar on the phone** — backspace, clear, tab, enter as explicit
+  buttons. Deletion previously rode on a `keydown` that virtual keyboards
+  often do not send (Android reports `keyCode 229`), so text already in a
+  remote field could not be removed from a phone at all.
+
+### Fixed
+
+- **The QR code renders in the published bundle** (see above).
+- The QR is no longer printed when it would not fit the terminal — a wrapped
+  QR looks like a QR and does not scan.
+
+### Changed
+
+- Quiet by default: the library writes nothing to stdout unless you pass
+  `logger: consoleLogger` or an `onEvent` handler.
+
 ## [0.1.0] - 2026-09-01
 
 Initial release. Human-in-the-loop handoff for Solari cloud browsers.
@@ -43,30 +77,6 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   full JSON lines including the per-handoff wide event.
 - **`baseUrl` option** to point handraise at a specific Solari endpoint or region
   for the relay sandbox.
-- **Focus feedback on the phone.** After each applied input the agent reports
-  which field is focused, so the handoff page draws a ring around it on the live
-  image and the keyboard bar names it ("Typing into: Password"). Only the
-  field's label is read, never its value, and the label is rendered as text.
-- **A key bar on the phone** — backspace, clear, tab and enter as explicit
-  buttons next to the input. Deletion used to ride on a `keydown` a phone's
-  virtual keyboard often does not send (Android reports `keyCode 229`), so
-  text already in a remote field could not be removed. The buttons keep focus
-  in the input, so the soft keyboard stays open. `clear` is select-all plus
-  backspace — keyboard-equivalent, so the human's message set stays closed.
-- **`npx handraise`** — a one-command demo. With only a `SOLARI_API_KEY`, it
-  deploys its own small TOTP-walled portal into a sandbox, opens a cloud
-  browser against it, raises a hand and prints the QR (plus the currently
-  valid code — the demo shows the handoff mechanics, not secrecy).
-- **`handoffQr(url)` export** — render the handoff QR yourself for channels
-  other than the terminal.
-- **Rescue benchmark** (`e2e/rescue-bench.ts`): of 20 workflows blocked on a
-  real TOTP wall, baseline completed 0, with handraise 19 (median human time
-  5.5s, scripted); the one failure was the platform's session death,
-  correctly reported as `disconnected`.
-- **Terminal-width aware QR.** A handoff URL is ~427 characters (362 of them
-  Solari's `pt_token`), so the code needs 75 columns. When the terminal is
-  narrower, handraise prints the reason and the link instead of a wrapped —
-  and therefore unscannable — symbol.
 
 ### Security
 
@@ -90,4 +100,5 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   so two simultaneous handoffs is the plan-tier ceiling.
 - TypeScript/Node only.
 
+[0.2.0]: https://github.com/Sy-D/handraise/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Sy-D/handraise/releases/tag/v0.1.0
