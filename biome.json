@@ -1,7 +1,14 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.0.0/schema.json",
   "files": {
-    "includes": ["src/**", "e2e/**", "test-app/**", "demo/**", "*.json"]
+    "includes": [
+      "src/**",
+      "e2e/**",
+      "test-app/**",
+      "demo/**",
+      "*.json",
+      "!demo/.session.json"
+    ]
   },
   "formatter": {
     "enabled": true,

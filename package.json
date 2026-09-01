@@ -53,11 +53,14 @@
     "playwright-core": ">=1.40.0"
   },
   "devDependencies": {
+    "@ai-sdk/anthropic": "^4.0.46",
+    "@ai-sdk/openai-compatible": "^3.0.41",
     "@biomejs/biome": "^2.0.0",
     "@oxlint/plugins": "1.80.0",
     "@solarisdk/browser": "^0.1.2",
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.5.13",
+    "ai": "^7.0.87",
     "bun-types": "^1.4.0",
     "oxlint": "1.80.0",
     "playwright-core": "^1.62.1",

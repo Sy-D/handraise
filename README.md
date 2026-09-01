@@ -1,18 +1,15 @@
 # handraise ✋
 
-**Human-in-the-loop handoff for [Solari](https://getsolari.com) cloud browsers.**
+**When your agent gets stuck on a [Solari](https://getsolari.com) cloud
+browser, let it ask a human — then continue from the exact same session.**
 
 ![CI](https://github.com/Sy-D/handraise/actions/workflows/ci.yml/badge.svg) ![npm](https://img.shields.io/npm/v/handraise) ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
-Your agent already knows when it's stuck. handraise lets it raise its hand: the
-browser session appears live on your phone, you solve the 2FA prompt (or the
-captcha it couldn't, or the dialog it doesn't understand), tap *Hand back*, and
-the agent continues — same session, same cookies, no restart.
-
 > 🎬 *Demo clip coming here.*
 
-Set `SOLARI_API_KEY` in your environment — handraise uses it to create the
-relay sandbox (or pass `apiKey` in the options).
+```sh
+npm install handraise
+```
 
 ```ts
 import { Solari } from "@solarisdk/browser"
@@ -20,71 +17,40 @@ import { raiseHand } from "handraise"
 
 const browser = await new Solari({ apiKey: process.env.SOLARI_API_KEY }).launch()
 const page = await browser.newPage()
-
 await page.goto("https://github.com/login")
-// ... agent fills credentials, then hits the 2FA wall ...
+// ... the agent fills the credentials, then hits the 2FA wall ...
 
-const result = await raiseHand(page, {
-  reason: "GitHub is asking for a 2FA code",
-})
-
-if (result.outcome === "resolved") {
-  // the human typed the code on their phone; the agent is signed in
-}
+const result = await raiseHand(page, { reason: "GitHub is asking for a 2FA code" })
+// outcome "resolved" → the human typed the code on their phone, the agent is signed in
 ```
 
-When `raiseHand` runs, a QR code appears in your terminal. Scan it and the
-live browser session is on your phone — video, taps, typing, scrolling.
+A QR code appears in the terminal. Scan it, and the live browser session is on
+your phone — video, taps, typing, scrolling. Tap *Hand back* and `raiseHand`
+returns. Set `SOLARI_API_KEY`; handraise uses it to create the relay sandbox.
 
-## How it works
+- **Same browser session.** Same cookies, same page, no restart — the agent
+  resumes exactly where it stopped.
+- **Works from any phone, nothing to install there.** The handoff link is a
+  URL; open it in the mobile browser that is already on the device.
+- **No server to host.** The handoff UI runs on a Solari sandbox that handraise
+  creates and destroys around the call.
 
-```mermaid
-flowchart LR
-  A["Agent process<br/>raiseHand(page)"] -- "CDP screencast frames →<br/>← taps & keystrokes" --> R["Relay<br/>(Solari sandbox,<br/>public preview URL)"]
-  R <--> P["Your phone<br/>(just a browser tab)"]
-```
+Runnable without writing any code: [`demo/try.ts`](demo/try.ts) raises a hand
+immediately so you can drive it; [`demo/github-2fa.ts`](demo/github-2fa.ts)
+does the real 2FA wall and keeps the session the handoff earned.
 
-The twist: **the handoff UI itself runs on Solari.** When the agent raises its
-hand, handraise boots a Solari sandbox (~3s), deploys a zero-dependency relay
-into it, and exposes it through Solari's port preview. Frames stream from the
-browser's CDP screencast through the relay to your phone; your taps and
-keystrokes stream back and are injected as trusted CDP input events. No tunnel
-tool, no self-hosted server, no second account — the same API key that runs
-your browser runs the escape hatch.
+## What this actually is
 
-Your phone needs nothing installed. The handoff link is a tokenized URL served
-from `*.preview.getsolari.com`; open it in any mobile browser.
-
-## Install
-
-```sh
-npm install handraise
-```
-
-## Getting notified
-
-Three ways, no vendor lock-in:
-
-- **QR code in the terminal** (default) — scan with the phone camera.
-- **`onUrl` callback** — do whatever you want with the link.
-- **`webhookUrl`** — handraise POSTs `{ url, reason, sessionId }` as JSON.
-  Point it at Slack, Discord, ntfy, a Telegram bot — anything that accepts a
-  POST.
-
-```ts
-await raiseHand(page, {
-  reason: "Captcha needs a human",
-  webhookUrl: process.env.SLACK_WEBHOOK_URL,
-  qr: false,
-})
-```
+handraise is a **resumable interrupt primitive for autonomous agents** — the
+live view is just the implementation. The product is *interrupt → human
+resolution → resume*. A live view shows you a browser; handraise gives the
+agent a typed outcome it can branch on, and a session that survives the detour.
 
 ## Give it to your LLM agent
 
-Your agent's loop already knows when it's stuck — it failed the same step
-three times, or it can't answer what the page is asking. Expose handraise as a
-tool and let the model decide when to call for a human. No extra dependencies;
-the spec is plain JSON Schema:
+Your agent's loop already knows when it's stuck. Expose handraise as a tool and
+let the model decide when to call for a human. No extra dependencies; the spec
+is plain JSON Schema:
 
 ```ts
 import { tool, jsonSchema } from "ai" // Vercel AI SDK
@@ -104,6 +70,50 @@ const tools = {
 The tool returns `{ outcome, summary, durationMs }`, where `summary` is a
 sentence the model can act on ("A human fixed the problem and handed the
 browser back. Re-read the page and continue.").
+
+[`demo/agent.ts`](demo/agent.ts) is a real agent loop where the model itself
+decides to call `needHuman` when it hits the 2FA wall — run it with
+`DEMO_SIM=1` for the scripted version.
+
+**Two classes of interrupt, one call.** A *capability gap* — 2FA, a captcha, an
+unfamiliar UI — is the agent admitting it cannot. An *authority boundary* —
+approval before an irreversible step — is the agent choosing not to. Both are
+the same call today with a different `reason`.
+
+## How it works
+
+```mermaid
+flowchart LR
+  A["Agent process<br/>raiseHand(page)"] -- "CDP screencast frames →<br/>← taps & keystrokes" --> R["Relay<br/>(Solari sandbox,<br/>public preview URL)"]
+  R <--> P["Your phone<br/>(just a browser tab)"]
+```
+
+The twist: **the handoff UI itself runs on Solari.** When the agent raises its
+hand, handraise boots a Solari sandbox (~3s), deploys a zero-dependency relay
+into it, and exposes it through Solari's port preview. Frames stream from the
+browser's CDP screencast through the relay to your phone; your taps and
+keystrokes stream back and are injected as trusted CDP input events. No tunnel
+tool, no self-hosted server, no second account — the same API key that runs
+your browser runs the escape hatch. The phone's end of it is a tokenized URL
+served from `*.preview.getsolari.com`, and nothing else.
+
+## Getting notified
+
+Three ways, no vendor lock-in:
+
+- **QR code in the terminal** (default) — scan with the phone camera.
+- **`onUrl` callback** — do whatever you want with the link.
+- **`webhookUrl`** — handraise POSTs `{ url, reason, sessionId }` as JSON.
+  Point it at Slack, Discord, ntfy, a Telegram bot — anything that accepts a
+  POST.
+
+```ts
+await raiseHand(page, {
+  reason: "Captcha needs a human",
+  webhookUrl: process.env.SLACK_WEBHOOK_URL,
+  qr: false,
+})
+```
 
 ## API
 
@@ -135,9 +145,17 @@ browser back. Re-read the page and continue.").
 This is the part we sweated, because a handoff tool that loses your session at
 the worst moment is worse than no tool.
 
-- **Human never shows up** → `outcome: "timeout"` after `timeoutMs`. The relay
-  sandbox is destroyed, the agent keeps its browser and decides what's next.
-- **Human hits Abort** → `outcome: "aborted"`, same cleanup.
+| Failure | Outcome |
+|---|---|
+| Human never shows | Clean `timeout`, relay destroyed |
+| Browser session dies mid-handoff | `disconnected`, not an exception |
+| Relay WebSocket drops | 20s heartbeats, reconnect, last frame replayed |
+| Agent process killed | Sandbox lifecycle kill, no orphaned URL |
+| Link holder tries the agent role | `401`, roles are separate credentials |
+
+- **Human never shows up** → `outcome: "timeout"` after `timeoutMs`; **Human
+  hits Abort** → `outcome: "aborted"`. Either way the relay sandbox is
+  destroyed and the agent keeps its browser and decides what's next.
 - **The browser session dies mid-handoff** → `outcome: "disconnected"`, not an
   exception. We measured Solari browser sessions dying ~10 minutes after
   creation regardless of activity (no keep-alive extends it, and the sessions
@@ -156,6 +174,25 @@ the worst moment is worse than no tool.
 - **After every outcome** — including errors — the relay sandbox is destroyed
   before `raiseHand` returns, with the deletion confirmed and retried on
   transient failure. One handoff, one sandbox.
+
+## How this compares
+
+Human-in-the-loop for cloud browsers isn't new — that's the point. The demand is
+proven, and handraise brings the same escape hatch to a runtime that doesn't have
+one yet.
+
+- **Browserbase Live View, Cloudflare Browser Run, Scrapfly, AuthLoop** are
+  platform features of their own clouds — a live-view panel or a session-takeover
+  flow baked into the service that runs your browser. They're hosted, mature, and
+  supported by the vendor. If you already run on one of those, use theirs.
+- **handraise** brings the same handoff to **Solari** browsers, which have no
+  native live view (Solari's VNC is desktop-only) — as a small, self-contained,
+  open-source library rather than a platform feature.
+
+The honest trade-off: the platform solutions are more polished and fully hosted;
+handraise is lightweight and portable, and it works where those don't. Its scope
+is deliberately narrow — the handoff muscle, not wall detection (see
+[`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
 
 ## Security
 
@@ -213,27 +250,6 @@ app ([`test-app/`](test-app/), deployed into a sandbox), hits the 2FA wall,
 raises its hand, a scripted "human" types the code through the real handoff
 UI, and the test asserts the signed-in page. Injected events arrive with
 `isTrusted: true`.
-
-## How this compares
-
-Human-in-the-loop for cloud browsers isn't new — that's the point. The demand is
-proven, and handraise brings the same escape hatch to a runtime that doesn't have
-one yet.
-
-- **Browserbase Live View, Cloudflare Browser Run, Scrapfly, AuthLoop** are
-  platform features of their own clouds — a live-view panel or a session-takeover
-  flow baked into the service that runs your browser. They're hosted, mature, and
-  supported by the vendor. If you already run on one of those, use theirs.
-- **handraise** brings the same handoff to **Solari** browsers, which don't have a
-  native live view (Solari's VNC is desktop-only). It's a small, self-contained,
-  open-source library rather than a platform feature: you `npm install` it, call
-  `raiseHand`, and the handoff UI itself runs on Solari — no extra service to host,
-  no second account.
-
-The honest trade-off: the platform solutions are more polished and fully hosted;
-handraise is lightweight and portable, and it works where those don't. Its scope
-is deliberately narrow — the handoff muscle, not wall detection (see
-[`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
 
 ## Limitations (v1)
 

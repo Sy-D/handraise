@@ -2,9 +2,10 @@
  * The demo the clip is made of: the agent does the boring part, you do the one
  * step a machine should not fake.
  *
- *   bun --env-file=.env demo/github-2fa.ts
+ *   bun --env-file=.env --env-file=demo/.env demo/github-2fa.ts
  *
- * Put a throwaway GitHub account in `.env` (gitignored, never committed):
+ * Put a throwaway GitHub account in `demo/.env` (gitignored, never
+ * committed — copy demo/.env.example):
  *
  *   GITHUB_USER=...
  *   GITHUB_PASSWORD=...

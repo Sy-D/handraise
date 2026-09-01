@@ -1,7 +1,7 @@
 /**
  * Try handraise yourself, no setup beyond the API key:
  *
- *   bun --env-file=.env demo/try.ts
+ *   bun --env-file=.env demo/try.ts   # braucht nur den Solari-Key
  *
  * A cloud browser opens the GitHub login page and immediately raises its
  * hand. Scan the QR code with your phone, and the live session appears in

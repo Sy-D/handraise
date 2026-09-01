@@ -4,3 +4,4 @@ node_modules/
 spikes/**/out/
 dist/
 demo/.session.json
+demo/.env
