@@ -340,7 +340,7 @@ test("abort sends abort and shows the aborted overlay", async () => {
   expect(await agent.next()).toEqual({ type: "abort" })
 
   await waitForOverlay(page)
-  expect(await page.locator("#overlay-title").textContent()).toBe("Aborted")
+  expect(await page.locator("#overlay-title").textContent()).toBe("Told the agent")
   expect(consoleErrors).toEqual([])
 })
 

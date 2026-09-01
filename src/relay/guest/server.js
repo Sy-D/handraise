@@ -560,7 +560,7 @@ const PAGE = `<!doctype html>
     <p class="hint">Typing goes straight to the browser</p>
     <div class="row">
       <button id="handback" class="primary">&#9995; Hand back to agent</button>
-      <button id="abort" class="ghost">Abort</button>
+      <button id="abort" class="ghost">Can't help</button>
     </div>
   </footer>
   <div id="overlay" hidden>
@@ -725,12 +725,12 @@ const PAGE = `<!doctype html>
   })
   document.getElementById("abort").addEventListener("click", function () {
     send({ type: "abort" })
-    finish("Aborted", "You can close this tab.")
+    finish("Told the agent", "It knows you couldn't help and will stop waiting. You can close this tab.")
   })
 
   var ENDINGS = {
     resolved: ["Handed back", "The agent is driving again."],
-    aborted: ["Aborted", "You can close this tab."],
+    aborted: ["Handoff ended", "The helper couldn't solve it. You can close this tab."],
     timeout: ["The agent stopped waiting", "Nobody picked this up in time."],
     disconnected: ["Session lost", "The browser session died. The agent knows."]
   }
