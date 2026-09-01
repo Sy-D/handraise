@@ -192,3 +192,22 @@ $20 plan allowance. Check first:
 bun --env-file=.env spikes/s1/cleanup.ts          # list
 bun --env-file=.env spikes/s1/cleanup.ts --kill   # list and kill strays
 ```
+
+## Live run transcript (2026-09-01, verified)
+
+Model: `openrouter:minimax/minimax-m3:free` (a FREE model — zero LLM cost),
+`DEMO_MAX_STEPS=18`, scripted human via DEMO_SIM=1. Seven steps:
+
+1. readPage → login form
+2-3. fill username/password, click submit → lands on /totp
+4. readPage → sees the TOTP prompt
+5. Model, unprompted: "I can't read authenticator apps, so I need a human."
+   → needHuman("Aurora Bank is asking for a 6-digit authenticator code…")
+   → ✋ hand raised, scripted human types the code, handoff RESOLVED in 6s
+6-7. readPage → "/account — Two-factor verified, Signed in as ada. Task complete."
+
+Result: account page reached, handoff resolved, sandboxes cleaned (0 running).
+Earlier attempts, for honesty: the same model with MAX_STEPS=12 burned its
+budget re-filling the form and never reached the decision point;
+nemotron-3-ultra:free died on a malformed free-tier response;
+inkling:free is gated to specific harnesses. MAX_STEPS is now env-tunable.

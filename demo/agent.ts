@@ -58,7 +58,7 @@ import { msUntilNextStep, totp } from "../test-app/totp"
 const ANTHROPIC_MODEL = "claude-opus-5"
 const OPENROUTER_MODEL = "anthropic/claude-opus-4.5"
 const OPENROUTER_URL = "https://openrouter.ai/api/v1"
-const MAX_STEPS = 12
+const MAX_STEPS = Number(process.env.DEMO_MAX_STEPS ?? 12)
 const HANDOFF_TIMEOUT_MS = 4 * 60_000
 const SNAPSHOT_CHARS = 2_000
 const VIEWPORT = { width: 1280, height: 800 }
