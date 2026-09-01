@@ -74,6 +74,32 @@ await raiseHand(page, {
 })
 ```
 
+## Give it to your LLM agent
+
+Your agent's loop already knows when it's stuck — it failed the same step
+three times, or it can't answer what the page is asking. Expose handraise as a
+tool and let the model decide when to call for a human. No extra dependencies;
+the spec is plain JSON Schema:
+
+```ts
+import { tool, jsonSchema } from "ai" // Vercel AI SDK
+import { createNeedHumanTool, needHumanToolSpec } from "handraise"
+
+const needHuman = createNeedHumanTool(page)
+
+const tools = {
+  needHuman: tool({
+    description: needHumanToolSpec.description,
+    inputSchema: jsonSchema(needHumanToolSpec.inputSchema),
+    execute: needHuman,
+  }),
+}
+```
+
+The tool returns `{ outcome, summary, durationMs }`, where `summary` is a
+sentence the model can act on ("A human fixed the problem and handed the
+browser back. Re-read the page and continue.").
+
 ## API
 
 ### `raiseHand(page, options): Promise<HandoffResult>`

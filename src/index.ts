@@ -13,6 +13,13 @@
  * Solari sandbox that handraise creates and destroys around the call.
  */
 export { raiseHand } from "./core/raise-hand"
+export {
+  createNeedHumanTool,
+  type NeedHumanDefaults,
+  type NeedHumanInput,
+  type NeedHumanOutput,
+  needHumanToolSpec,
+} from "./tool"
 export type {
   HandoffOutcome,
   HandoffResult,
