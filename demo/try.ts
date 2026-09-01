@@ -28,8 +28,16 @@ try {
   const result = await raiseHand(page, {
     reason: "Try it: drive this login page from your phone, then hand back.",
     timeoutMs: 4 * 60_000,
+    // handraise itself is quiet: it writes nothing to stdout unless you ask.
+    // `onEvent` is that ask — one wide event per handoff. Printed compactly
+    // here; pass `logger: consoleLogger` instead for full JSON log lines.
     onEvent: (event) =>
-      console.log("\nwide event:", JSON.stringify(event, null, 2)),
+      console.log(
+        `\nhandoff ${event.outcome} in ${event.durationMs}ms — relay up in ${event.relayColdStartMs}ms, ` +
+          `first frame ${event.firstFrameMs ?? "n/a"}ms, ${event.framesSent} frames / ` +
+          `${Math.round(event.bytesSent / 1024)} KB, ${event.inputsApplied} inputs, ` +
+          `${event.reconnects} reconnects`,
+      ),
   })
 
   console.log(
