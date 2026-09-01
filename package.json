@@ -29,15 +29,17 @@
   "dependencies": {
     "@solarisdk/browser": "^0.1.2",
     "@solarisdk/sdk": "^0.1.2",
-    "playwright-core": "^1.62.1"
+    "playwright-core": "^1.62.1",
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",
     "@oxlint/plugins": "1.80.0",
+    "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.5.13",
     "bun-types": "^1.4.0",
     "oxlint": "1.80.0",
-    "typescript": "^5.7.2",
-    "ws": "^8.18.0"
+    "typescript": "^5.7.2"
   }
 }

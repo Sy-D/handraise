@@ -1,4 +1,4 @@
-import type { Page } from "playwright-core"
+import type { BrowserContext, Page } from "playwright-core"
 
 /** Why the agent is raising its hand — shown to the human on the handoff page. */
 export interface RaiseHandOptions {
@@ -12,13 +12,20 @@ export interface RaiseHandOptions {
   webhookUrl?: string
   /** Called with the public handoff URL as soon as it exists. */
   onUrl?: (url: string) => void
-  /** How long to wait for the human before giving up. Default: 15 minutes. */
+  /**
+   * How long to wait for the human before giving up. Default: 5 minutes.
+   * Keep this short: Solari browser sessions have a hard lifetime of about
+   * 10 minutes from creation (measured; no keep-alive extends it), so a long
+   * wait is more likely to end in `disconnected` than in `resolved`.
+   */
   timeoutMs?: number
   /** Print a scannable QR code for the handoff URL to the terminal. Default: true. */
   qr?: boolean
 }
 
-export type HandoffOutcome = "resolved" | "aborted" | "timeout"
+export type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>
+
+export type HandoffOutcome = "resolved" | "aborted" | "timeout" | "disconnected"
 
 export interface HandoffResult {
   outcome: HandoffOutcome
@@ -26,15 +33,24 @@ export interface HandoffResult {
   durationMs: number
   /** The handoff URL that was (or would have been) used. */
   url: string
+  /**
+   * Cookies + localStorage captured right after a successful handback, so the
+   * caller can persist them (e.g. to a Solari profile) and relaunch if the
+   * session dies later. Absent when the session was already gone.
+   */
+  storageState?: StorageState
 }
 
 /**
  * Pause the agent and hand the live browser session to a human.
  *
  * Resolves when the human clicks "hand back" (outcome: "resolved"), the human
- * aborts (outcome: "aborted"), or `timeoutMs` elapses (outcome: "timeout").
- * The session is kept alive for the whole wait; all relay infrastructure is
- * destroyed before this promise settles, on every path including errors.
+ * aborts (outcome: "aborted"), `timeoutMs` elapses (outcome: "timeout"), or
+ * the browser session dies mid-handoff (outcome: "disconnected" — Solari
+ * browser sessions have a hard ~10 minute lifetime and the sessions API keeps
+ * reporting "active" after death, so liveness comes from the connection, not
+ * the control plane). All relay infrastructure is destroyed before this
+ * promise settles, on every path including errors.
  */
 export type RaiseHand = (
   page: Page,

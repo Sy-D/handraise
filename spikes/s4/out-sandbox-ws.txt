@@ -18,3 +18,9 @@
 {"t":226.3,"iso":"2026-09-01T05:00:28.113Z","mode":"ws","event":"ws-poll","connected":false}
 {"t":241.3,"iso":"2026-09-01T05:00:43.114Z","mode":"ws","event":"ws-poll","connected":false}
 {"t":256.3,"iso":"2026-09-01T05:00:58.121Z","mode":"ws","event":"ws-poll","connected":false}
+{"t":271.3,"iso":"2026-09-01T05:01:13.124Z","mode":"ws","event":"ws-poll","connected":false}
+{"t":286.3,"iso":"2026-09-01T05:01:28.131Z","mode":"ws","event":"ws-poll","connected":false}
+{"t":301.3,"iso":"2026-09-01T05:01:43.134Z","mode":"ws","event":"ws-poll","connected":false}
+{"t":301.9,"iso":"2026-09-01T05:01:43.720Z","mode":"ws","event":"final-get-error","seconds":301.9,"name":"GatewayError","errName":"GatewayError","message":"Not found","status":404}
+{"t":304.1,"iso":"2026-09-01T05:01:45.956Z","mode":"ws","event":"final-exec-error","seconds":304.1,"name":"ConnectionError","errName":"ConnectionError","message":"WebSocket error: WebSocket connection to 'wss://api.getsolari.com/control/ZGVza3RvcC1wb29sLWktMGZkOWVkN2RjMDNhNzlkYjI6dm1fMDAwMzk3OmNtdGkzdThwbDAwMDhvMTAxZnk5YmRrams6MTc4ODIzODYwMjM0OQ.Iq3bUuKzK36dAQzlgp2z3tQTGX3tx4d-DuVwF1rZIUA' failed: Expected 101 status code"}
+{"t":304.3,"iso":"2026-09-01T05:01:46.140Z","mode":"ws","event":"done","seconds":304.3}

@@ -1,3 +1,9 @@
 {"t":0,"iso":"2026-09-01T05:00:44.929Z","mode":"resume","event":"creating","timeoutMs":60000,"durationSec":300}
 {"t":0.6,"iso":"2026-09-01T05:00:45.524Z","mode":"resume","event":"created","id":"ZGVza3RvcC1wb29sLWktMGZkOWVkN2RjMDNhNzlkYjI6dm1fMDAwNDA5OmNtdGkzdThwbDAwMDhvMTAxZnk5YmRrams6MTc4ODIzODg0NTQzOQ.MK7_WC0L9VTKwSaREabJlFvRgjp2K8qNiXND-VeNpMs","expiresAt":"2026-09-01T05:01:45.439Z"}
 {"t":0.6,"iso":"2026-09-01T05:00:45.524Z","mode":"resume","event":"sleeping-past-idle-window","waitMs":120000}
+{"t":120.8,"iso":"2026-09-01T05:02:45.713Z","mode":"resume","event":"view-after-window","state":"paused","expiresAt":"2026-09-01T05:01:45.439Z","seconds":120.8}
+{"t":123.6,"iso":"2026-09-01T05:02:48.533Z","mode":"resume","event":"resume-ok","ms":2819,"seconds":123.6}
+{"t":123.8,"iso":"2026-09-01T05:02:48.716Z","mode":"resume","event":"post-resume-exec","exitCode":0,"stdout":"resumed"}
+{"t":124,"iso":"2026-09-01T05:02:48.900Z","mode":"resume","event":"view-after-resume","state":"running","expiresAt":"2026-09-01T05:03:48.817Z"}
+{"t":124.2,"iso":"2026-09-01T05:02:49.087Z","mode":"resume","event":"done","seconds":124.2}
+{"t":124.3,"iso":"2026-09-01T05:02:49.273Z","mode":"resume","event":"done","seconds":124.3}

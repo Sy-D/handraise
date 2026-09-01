@@ -8,15 +8,17 @@
         "@solarisdk/browser": "^0.1.2",
         "@solarisdk/sdk": "^0.1.2",
         "playwright-core": "^1.62.1",
+        "qrcode-terminal": "^0.12.0",
+        "ws": "^8.21.3",
       },
       "devDependencies": {
         "@biomejs/biome": "^2.0.0",
         "@oxlint/plugins": "1.80.0",
+        "@types/qrcode-terminal": "^0.12.2",
         "@types/ws": "^8.5.13",
         "bun-types": "^1.4.0",
         "oxlint": "1.80.0",
         "typescript": "^5.7.2",
-        "ws": "^8.18.0",
       },
     },
   },
@@ -91,6 +93,8 @@
 
     "@types/node": ["@types/node@26.4.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-faiGnoIrLH/V8cibOMEAZ8pMw6oXqSukl29ra4mN8GdaB2ZewzeaLj+INpV5N+Z1eKWzY+IzaIZH2EIR6YZRNQ=="],
 
+    "@types/qrcode-terminal": ["@types/qrcode-terminal@0.12.2", "", {}, "sha512-v+RcIEJ+Uhd6ygSQ0u5YYY7ZM+la7GgPbs0V/7l/kFs2uO4S8BcIUEMoP7za4DNIqNnUD5npf0A/7kBhrCKG5Q=="],
+
     "@types/ws": ["@types/ws@8.18.1", "", { "dependencies": { "@types/node": "*" } }, "sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg=="],
 
     "bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
@@ -100,6 +104,8 @@
     "patchright-core": ["patchright-core@1.62.2", "", { "bin": { "patchright-core": "cli.js" } }, "sha512-XDl3HB/Kjm9ZBFn4ygD5mxdsqK4aIWNGXdea46XAGd0hvHuJJ84w1M83JqofpXIbD2aJfQ2Rtz4YcqPVrxjSzw=="],
 
     "playwright-core": ["playwright-core@1.62.1", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw=="],
+
+    "qrcode-terminal": ["qrcode-terminal@0.12.0", "", { "bin": { "qrcode-terminal": "./bin/qrcode-terminal.js" } }, "sha512-EXtzRZmC+YGmGlDFbXKxQiMZNwCLEO6BANKXG4iCtSIM0yqc/pappSx3RIKr4r0uh5JsBckOXeKrB3Iz7mdQpQ=="],
 
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
