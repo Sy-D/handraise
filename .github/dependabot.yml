@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    ignore:
+      # We stay on the TypeScript 5.x line deliberately. TypeScript 7 is the
+      # native (Go) rewrite and a separate migration, not a routine bump.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
