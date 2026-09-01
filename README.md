@@ -5,8 +5,7 @@ browser, let it ask a human — then continue from the exact same session.**
 
 ![CI](https://github.com/Sy-D/handraise/actions/workflows/ci.yml/badge.svg) ![npm](https://img.shields.io/npm/v/handraise) ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
-> 🎬[![Watch the demo](https://github.com/user-attachments/assets/76c64f8b-cdc1-4f13-bc6d-1839c0579f44)]
-
+https://github.com/user-attachments/assets/76c64f8b-cdc1-4f13-bc6d-1839c0579f44
 
 
 ```sh
