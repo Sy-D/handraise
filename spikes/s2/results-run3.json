@@ -1,0 +1,101 @@
+[
+  {
+    "scenario": "A typing (github login form) q60/800",
+    "cast": {
+      "format": "jpeg",
+      "quality": 60,
+      "maxWidth": 800,
+      "maxHeight": 1400,
+      "everyNthFrame": 1
+    },
+    "durationMs": 12990,
+    "frames": 85,
+    "fps": 6.54,
+    "kbPerSecond": 79.21,
+    "meanKb": 12.1,
+    "medianKb": 12.18,
+    "p95Kb": 12.5,
+    "maxKb": 12.51,
+    "minKb": 11.37,
+    "firstFrameMs": 203,
+    "maxGapMs": 350,
+    "medianGapMs": 92,
+    "lagMsMedian": 90,
+    "distinctSizes": 66,
+    "sampleMeta": {
+      "offsetTop": 0,
+      "pageScaleFactor": 1,
+      "deviceWidth": 1280,
+      "deviceHeight": 800,
+      "scrollOffsetX": 0,
+      "scrollOffsetY": 0,
+      "timestamp": 1788238044.124468
+    }
+  },
+  {
+    "scenario": "E idle (nothing happens) q60/800",
+    "cast": {
+      "format": "jpeg",
+      "quality": 60,
+      "maxWidth": 800,
+      "maxHeight": 1400,
+      "everyNthFrame": 1
+    },
+    "durationMs": 8052,
+    "frames": 15,
+    "fps": 1.86,
+    "kbPerSecond": 23.26,
+    "meanKb": 12.48,
+    "medianKb": 12.48,
+    "p95Kb": 12.49,
+    "maxKb": 12.49,
+    "minKb": 12.48,
+    "firstFrameMs": 217,
+    "maxGapMs": 668,
+    "medianGapMs": 599,
+    "lagMsMedian": 91,
+    "distinctSizes": 2,
+    "sampleMeta": {
+      "offsetTop": 0,
+      "pageScaleFactor": 1,
+      "deviceWidth": 1280,
+      "deviceHeight": 800,
+      "scrollOffsetX": 0,
+      "scrollOffsetY": 0,
+      "timestamp": 1788238057.697261
+    }
+  },
+  {
+    "scenario": "F motion everyNthFrame=2 q60/800",
+    "cast": {
+      "format": "jpeg",
+      "quality": 60,
+      "maxWidth": 800,
+      "maxHeight": 1400,
+      "everyNthFrame": 2
+    },
+    "durationMs": 10292,
+    "frames": 117,
+    "fps": 11.37,
+    "kbPerSecond": 635.66,
+    "meanKb": 55.92,
+    "medianKb": 56.27,
+    "p95Kb": 64.23,
+    "maxKb": 65.94,
+    "minKb": 41.89,
+    "firstFrameMs": 290,
+    "maxGapMs": 275,
+    "medianGapMs": 36,
+    "lagMsMedian": 97,
+    "distinctSizes": 117,
+    "sampleMeta": {
+      "offsetTop": 0,
+      "pageScaleFactor": 1,
+      "deviceWidth": 1280,
+      "deviceHeight": 800,
+      "scrollOffsetX": 0,
+      "scrollOffsetY": 0,
+      "timestamp": 1788238067.605238
+    }
+  }
+]

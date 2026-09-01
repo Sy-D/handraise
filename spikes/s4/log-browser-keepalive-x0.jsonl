@@ -1,0 +1,18 @@
+{"t":0,"iso":"2026-09-01T05:00:05.379Z","mode":"keepalive","event":"launching","durationSec":960}
+{"t":1.7,"iso":"2026-09-01T05:00:07.116Z","mode":"keepalive","event":"launched","id":"ip-10-0-10-166:ec9cdc4e-d132-4f61-a127-f9cae6067184:cmti3u8pl0008o101fy9bdkjk:1788238806234.PB46gBDzEU57lz1odHreMg","version":"151.0.7922.34","expiresAt":"2026-09-01T10:00:06.234Z"}
+{"t":2.6,"iso":"2026-09-01T05:00:07.962Z","mode":"keepalive","event":"loaded","title":"Example Domain"}
+{"t":3,"iso":"2026-09-01T05:00:08.361Z","mode":"keepalive","event":"control-plane","tag":"t0","path":"/sessions/ip-10-0-10-166:ec9cdc4e-d132-4f61-a127-f9cae6067184:cmti3u8pl0008o101fy9bdkjk:1788238806234.PB46gBDzEU57lz1odHreMg","status":200,"body":"{\"id\":\"ip-10-0-10-166:ec9cdc4e-d132-4f61-a127-f9cae6067184:cmti3u8pl0008o101fy9bdkjk:1788238806234.PB46gBDzEU57lz1odHreMg\",\"status\":\"active\",\"kind\":\"fast\",\"org\":\"cmti3u8pl0008o101fy9bdkjk\",\"createdAt\":\"2026-09-01T05:00:06.234Z\",\"expiresAt\":\"2026-09-01T10:00:06.234Z\",\"wsEndpoint\":\"wss://api.getsolari.com/ws/ip-10-0-10-166:ec9cdc4e-d132-4f61-a127-f9cae6067184:cmti3u8pl0008o101fy9bdkjk:1788238806234."}
+{"t":3.4,"iso":"2026-09-01T05:00:08.812Z","mode":"keepalive","event":"control-plane","tag":"t0","path":"/sessions","status":404,"body":"404 Not Found"}
+{"t":8.4,"iso":"2026-09-01T05:00:13.814Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":13.4,"iso":"2026-09-01T05:00:18.816Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":18.4,"iso":"2026-09-01T05:00:23.821Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":23.5,"iso":"2026-09-01T05:00:28.830Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":28.5,"iso":"2026-09-01T05:00:33.832Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":28.6,"iso":"2026-09-01T05:00:34.027Z","mode":"keepalive","event":"keepalive-ok","result":1,"ms":194}
+{"t":33.7,"iso":"2026-09-01T05:00:39.029Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":38.7,"iso":"2026-09-01T05:00:44.031Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":43.7,"iso":"2026-09-01T05:00:49.032Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":48.7,"iso":"2026-09-01T05:00:54.034Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":53.7,"iso":"2026-09-01T05:00:59.036Z","mode":"keepalive","event":"poll","connected":true,"closed":false}
+{"t":53.8,"iso":"2026-09-01T05:00:59.228Z","mode":"keepalive","event":"keepalive-ok","result":1,"ms":192}
+{"t":58.9,"iso":"2026-09-01T05:01:04.229Z","mode":"keepalive","event":"poll","connected":true,"closed":false}

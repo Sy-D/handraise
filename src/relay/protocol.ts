@@ -1,0 +1,48 @@
+/**
+ * Wire protocol between the agent process, the relay (in a Solari sandbox),
+ * and the human's phone. The relay is a dumb router: it forwards agent→human
+ * and human→agent messages verbatim and never inspects payloads.
+ *
+ * Both sides connect to `wss://<preview>/ws?role=agent|human`. Coordinates in
+ * human messages are frame pixels (the JPEG the phone displays); the agent
+ * side owns the conversion to page coordinates, because only it has the
+ * screencast metadata (see spikes/s2-report.md and spikes/s3-report.md:
+ * scale by deviceWidth / jpegWidth, never add scroll offsets).
+ */
+
+/** Screencast frame metadata, passed through from CDP unmodified. */
+export interface FrameMeta {
+  /** CSS viewport width of the remote page (unscaled, from CDP metadata). */
+  deviceWidth: number
+  deviceHeight: number
+  /** Actual pixel size of the JPEG (post maxWidth/maxHeight scaling). */
+  jpegWidth: number
+  jpegHeight: number
+  pageScaleFactor: number
+}
+
+export type AgentToHuman =
+  | { type: "frame"; data: string; meta: FrameMeta }
+  | { type: "state"; reason: string }
+  | { type: "ended"; outcome: "resolved" | "aborted" | "timeout" }
+
+export type HumanToAgent =
+  | { type: "tap"; fx: number; fy: number }
+  | { type: "char"; ch: string }
+  | { type: "key"; key: "Enter" | "Backspace" | "Tab" }
+  | { type: "scroll"; fdy: number }
+  | { type: "handback" }
+  | { type: "abort" }
+
+/**
+ * Either side may ping; the receiver answers pong. Required: the preview
+ * proxy kills WebSockets after exactly 60s of silence (close 1006, see
+ * spikes/s1-report.md). Send a ping at least every 25s; treat 1006 as
+ * "reconnect", not "failed".
+ */
+export type Heartbeat = { type: "ping" } | { type: "pong" }
+
+export type RelayMessage = AgentToHuman | HumanToAgent | Heartbeat
+
+export const HEARTBEAT_INTERVAL_MS = 20_000
+export const RELAY_PORT = 3000

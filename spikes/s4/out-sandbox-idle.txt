@@ -1,0 +1,5 @@
+{"t":0,"iso":"2026-09-01T04:46:23.464Z","mode":"idle","event":"creating","timeoutMs":60000,"durationSec":600}
+{"t":0.7,"iso":"2026-09-01T04:46:24.112Z","mode":"idle","event":"created","id":"ZGVza3RvcC1wb29sLWktMGZkOWVkN2RjMDNhNzlkYjI6dm1fMDAwMzg5OmNtdGkzdThwbDAwMDhvMTAxZnk5YmRrams6MTc4ODIzNzk4NDAyNA.am5JsxAOZKqG7etmyGtRAnKZw8RauxyflNzdYp_Jkqs","expiresAt":"2026-09-01T04:47:24.024Z"}
+{"t":601.3,"iso":"2026-09-01T04:56:24.771Z","mode":"idle","event":"final-view","state":"paused","expiresAt":"2026-09-01T04:47:24.024Z","seconds":601.3}
+{"t":603.4,"iso":"2026-09-01T04:56:26.869Z","mode":"idle","event":"final-exec-error","seconds":603.4,"name":"ConnectionError","errName":"ConnectionError","message":"WebSocket error: WebSocket connection to 'wss://api.getsolari.com/control/ZGVza3RvcC1wb29sLWktMGZkOWVkN2RjMDNhNzlkYjI6dm1fMDAwMzg5OmNtdGkzdThwbDAwMDhvMTAxZnk5YmRrams6MTc4ODIzNzk4NDAyNA.am5JsxAOZKqG7etmyGtRAnKZw8RauxyflNzdYp_Jkqs' failed: Expected 101 status code"}
+{"t":603.6,"iso":"2026-09-01T04:56:27.059Z","mode":"idle","event":"done","seconds":603.6}
