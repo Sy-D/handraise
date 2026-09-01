@@ -8,8 +8,8 @@
  * square in module space rather than stretched.
  */
 import { expect, test } from "bun:test"
-import { handoffQr } from "./qr"
 import { noopLogger } from "./logger"
+import { handoffQr } from "./qr"
 
 /** A realistic handoff URL: preview subdomain plus a token-sized tail. */
 const URL = `https://aabbccddeeff00112233-3000.preview.getsolari.com/?pt_token=${"x".repeat(240)}`
