@@ -24,7 +24,7 @@ function lines(code: string): string[] {
 test("renders a realistic handoff URL as half blocks only", () => {
   const code = handoffQr(URL, noopLogger)
   expect(code).not.toBeNull()
-  const glyphs = new Set([...(code ?? "").replace(/\n/g, "")])
+  const glyphs = new Set((code ?? "").replace(/\n/g, ""))
   for (const glyph of glyphs) expect(HALF_BLOCKS.has(glyph)).toBe(true)
 })
 
