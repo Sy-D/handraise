@@ -31,6 +31,15 @@ import { createServer } from "node:http"
 
 const PORT = Number(process.argv[2] || process.env.HANDRAISE_RELAY_PORT || 3000)
 
+/**
+ * Secret that a role=agent connection must present as \`?k=\`. \`startRelay()\`
+ * mints it and appends it to \`agentWsUrl\` only — never to the human's link —
+ * so possession of the handoff URL does not let a stranger claim the agent
+ * side and read the human's keystrokes. Empty (no argv) disables the check for
+ * local tests; the real deploy always sets one.
+ */
+const AGENT_KEY = process.argv[3] || process.env.HANDRAISE_AGENT_KEY || ""
+
 /** Must equal HEARTBEAT_INTERVAL_MS in src/relay/protocol.ts (asserted in relay.test.ts). */
 const HEARTBEAT_INTERVAL_MS = 20000
 
@@ -44,6 +53,9 @@ const OP_PONG = 0xa
 /** A screencast frame is ~12-65 KB of base64; anything past this is a bug or an attack. */
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
+/** Grace before a replaced/closed socket is force-destroyed if it hangs on. */
+const CLOSE_GRACE_MS = 1000
+
 const PONG = JSON.stringify({ type: "pong" })
 
 /** role -> peer. At most one connection per role; a new one replaces the old. */
@@ -52,6 +64,15 @@ const peers = new Map()
 /** Replay buffer for a human who joins (or rejoins) after the agent started. */
 let lastState = null
 let lastFrame = null
+/** The terminal \`ended\` message, once the agent has sent it. */
+let lastEnded = null
+/**
+ * A terminal human message (handback/abort) held for an agent that is not
+ * connected at the moment — typically mid-reconnect. Delivered to the next
+ * role=agent so the handoff resolves instead of falsely timing out with no
+ * storageState. Symmetric to the lastFrame replay for a late human.
+ */
+let pendingForAgent = null
 
 function encodeFrame(payload, opcode) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload)
@@ -81,6 +102,7 @@ function encodeFrame(payload, opcode) {
 function createReader(onMessage, onPing, onClose) {
   let buffered = Buffer.alloc(0)
   let fragments = []
+  let fragmentBytes = 0
   let fragmentOpcode = OP_TEXT
   return (chunk) => {
     buffered = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk])
@@ -126,14 +148,24 @@ function createReader(onMessage, onPing, onClose) {
 
       if (opcode === OP_CONTINUATION) {
         fragments.push(payload)
+        fragmentBytes += payload.length
       } else {
         fragments = [payload]
+        fragmentBytes = payload.length
         fragmentOpcode = opcode
+      }
+      // Per-frame length is capped above, but a stream of small continuation
+      // frames that never sets fin would grow \`fragments\` without bound (60 MB
+      // reassembled to 148 MB, verified). Cap the running sum too.
+      if (fragmentBytes > MAX_MESSAGE_BYTES) {
+        onClose()
+        return
       }
       if (!fin) continue
       const complete =
         fragments.length === 1 ? fragments[0] : Buffer.concat(fragments)
       fragments = []
+      fragmentBytes = 0
       onMessage(complete, fragmentOpcode)
     }
   }
@@ -141,7 +173,10 @@ function createReader(onMessage, onPing, onClose) {
 
 function write(peer, payload, opcode) {
   if (!peer?.open) return
-  peer.socket.write(encodeFrame(payload, opcode))
+  // A false return means the kernel send buffer is full. Track it so \`route\`
+  // can drop frames to a slow receiver instead of letting Node's write queue
+  // grow without bound in this sandbox's memory. Cleared on the drain event.
+  peer.backpressure = !peer.socket.write(encodeFrame(payload, opcode))
 }
 
 function sendText(peer, text) {
@@ -152,13 +187,28 @@ function closePeer(peer, reason) {
   if (!peer.open) return
   peer.open = false
   if (peers.get(peer.role) === peer) peers.delete(peer.role)
+  // Detach the reader so a replaced client that ignores the close frame can no
+  // longer feed route(); a lingering listener is how a peer keeps injecting.
+  if (peer.read) peer.socket.removeListener("data", peer.read)
   try {
     peer.socket.write(encodeFrame(Buffer.alloc(0), OP_CLOSE))
   } catch {
     // the socket is already gone; nothing left to say on it
   }
   peer.socket.end()
+  // Force the socket down if the client hangs on past the close frame.
+  const socket = peer.socket
+  setTimeout(() => socket.destroy(), CLOSE_GRACE_MS).unref?.()
   log("peer closed", { role: peer.role, reason })
+}
+
+/** The host of an Origin header, or null if it is missing or unparseable. */
+function originHost(origin) {
+  try {
+    return new URL(origin).host
+  } catch {
+    return null
+  }
 }
 
 /** \`{"type":"…"}\` or null. Never throws: the router must survive garbage. */
@@ -175,9 +225,13 @@ function messageType(payload) {
 }
 
 function route(peer, payload, opcode) {
+  // A peer that has been closed or replaced (its role now points at a newer
+  // socket) must not route anything, even if its reader fires one more time.
+  if (!peer.open || peers.get(peer.role) !== peer) return
   const other = peers.get(peer.role === "agent" ? "human" : "agent")
+  let type = null
   if (opcode === OP_TEXT) {
-    const type = messageType(payload)
+    type = messageType(payload)
     if (type === "ping") {
       sendText(peer, PONG)
       return
@@ -186,11 +240,24 @@ function route(peer, payload, opcode) {
       if (type === "frame") lastFrame = payload
       else if (type === "state") lastState = payload
       else if (type === "ended") {
+        // Terminal: keep the ending for a late human, drop everything that
+        // could show the logged-in page to whoever opens the link next.
+        lastEnded = payload
         lastFrame = null
         lastState = null
+        pendingForAgent = null
       }
+    } else if (type === "handback" || type === "abort") {
+      // The human is done. Buffer this for an agent that is mid-reconnect, and
+      // stop replaying the last (logged-in) frame to a late human.
+      pendingForAgent = payload
+      lastFrame = null
+      lastState = null
     }
   }
+  // Newest frame wins: drop a frame bound for a backpressured receiver rather
+  // than queue it in memory. Control and terminal messages are never dropped.
+  if (type === "frame" && other?.backpressure) return
   write(other, payload, opcode)
 }
 
@@ -245,6 +312,28 @@ server.on("upgrade", (req, socket, head) => {
     return
   }
 
+  // The role is a claim. The agent side reads the human's OTP and password
+  // keystrokes and can eject the real agent, so only a client holding the
+  // secret from \`agentWsUrl\` may take it. \`role=human\` needs no secret.
+  if (
+    role === "agent" &&
+    AGENT_KEY &&
+    url.searchParams.get("k") !== AGENT_KEY
+  ) {
+    socket.write("HTTP/1.1 401 Unauthorized\\r\\nConnection: close\\r\\n\\r\\n")
+    socket.destroy()
+    return
+  }
+  // A non-browser agent client sends no Origin; the phone's browser sends the
+  // sandbox's own origin. A present but foreign Origin is a cross-site page
+  // trying to ride the preview cookie — refuse it.
+  const origin = req.headers.origin
+  if (origin && originHost(origin) !== req.headers.host) {
+    socket.write("HTTP/1.1 403 Forbidden\\r\\nConnection: close\\r\\n\\r\\n")
+    socket.destroy()
+    return
+  }
+
   const accept = createHash("sha1")
     .update(key + WS_GUID)
     .digest("base64")
@@ -259,7 +348,7 @@ server.on("upgrade", (req, socket, head) => {
   const previous = peers.get(role)
   if (previous) closePeer(previous, "replaced")
 
-  const peer = { role, socket, open: true }
+  const peer = { role, socket, open: true, backpressure: false }
   peers.set(role, peer)
   log("peer connected", { role })
 
@@ -268,16 +357,30 @@ server.on("upgrade", (req, socket, head) => {
     (payload) => write(peer, payload, OP_PONG),
     () => closePeer(peer, "peer closed the socket"),
   )
+  peer.read = read
   if (head?.length) read(head)
   socket.on("data", read)
+  socket.on("drain", () => {
+    peer.backpressure = false
+  })
   socket.on("error", () => closePeer(peer, "socket error"))
   socket.on("close", () => closePeer(peer, "socket closed"))
 
-  // Late join: a human who opens the page mid-handoff must not stare at a blank
-  // canvas until the next repaint — an idle page can go seconds without one.
+  // A late human sees the ending if the handoff is over, otherwise the last
+  // state and frame so the canvas is not blank until the next repaint.
   if (role === "human") {
-    if (lastState) write(peer, lastState, OP_TEXT)
-    if (lastFrame) write(peer, lastFrame, OP_TEXT)
+    if (lastEnded) write(peer, lastEnded, OP_TEXT)
+    else {
+      if (lastState) write(peer, lastState, OP_TEXT)
+      if (lastFrame) write(peer, lastFrame, OP_TEXT)
+    }
+  }
+
+  // A reconnecting agent that missed the human's handback/abort while it was
+  // away gets it now, so the handoff resolves instead of falsely timing out.
+  if (role === "agent" && pendingForAgent) {
+    write(peer, pendingForAgent, OP_TEXT)
+    pendingForAgent = null
   }
 })
 
@@ -488,6 +591,10 @@ const PAGE = \`<!doctype html>
   var ws = null
   var retries = 0
   var finished = false
+  var reconnectTimer = null
+  // Every connect() bumps this; a displaced socket's stale callbacks compare
+  // against it and bow out, so an old onclose never nulls the live socket.
+  var generation = 0
 
   var img = new Image()
   var queued = null
@@ -649,36 +756,55 @@ const PAGE = \`<!doctype html>
     }
   }
 
+  // Close 1006 after 60s of silence is the preview proxy, not the human
+  // leaving. Reconnecting is the normal path. One timer only, so a backoff and
+  // a visibilitychange can never race into two overlapping sockets.
+  function scheduleReconnect() {
+    if (finished || reconnectTimer) return
+    var wait = Math.min(500 * Math.pow(2, retries++), 8000)
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null
+      connect()
+    }, wait + Math.random() * 250)
+  }
+
   function connect() {
     if (finished) return
+    // Refuse a second socket while one is already connecting or open — that is
+    // how the displaced-socket churn started.
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return
+    var mine = ++generation
     var scheme = location.protocol === "https:" ? "wss:" : "ws:"
     // Relative: the ?pt_token= on the page URL already earned a __pt_preview
     // cookie, which authenticates this upgrade without carrying the token again.
-    ws = new WebSocket(scheme + "//" + location.host + "/ws?role=human")
-    ws.onopen = function () {
+    var sock = new WebSocket(scheme + "//" + location.host + "/ws?role=human")
+    ws = sock
+    sock.onopen = function () {
+      if (mine !== generation) { sock.close(); return }
       retries = 0
       setStatus(true)
     }
-    ws.onmessage = function (e) { handle(e.data) }
-    ws.onclose = function () {
+    sock.onmessage = function (e) { if (mine === generation) handle(e.data) }
+    sock.onclose = function () {
+      // A stale socket (already superseded) must not touch shared state.
+      if (mine !== generation) return
       ws = null
       if (finished) return
       setStatus(false)
-      // Close 1006 after 60s of silence is the preview proxy, not the human
-      // leaving. Reconnecting is the normal path, not the error path.
-      var wait = Math.min(500 * Math.pow(2, retries++), 8000)
-      setTimeout(connect, wait + Math.random() * 250)
+      scheduleReconnect()
     }
-    ws.onerror = function () { if (ws) ws.close() }
+    sock.onerror = function () { if (mine === generation) sock.close() }
   }
 
   setInterval(function () { send({ type: "ping" }) }, 20000)
   window.addEventListener("resize", render)
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden && !ws && !finished) {
-      retries = 0
-      connect()
-    }
+    if (document.hidden || finished) return
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+    retries = 0
+    // connect() refuses if a socket is already live, so this is safe to call
+    // whether or not the current socket is still up.
+    connect()
   })
   connect()
 })()

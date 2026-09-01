@@ -8,7 +8,7 @@
  */
 import { expect, test } from "bun:test"
 
-import type { FrameMeta } from "../relay/protocol"
+import type { FrameMeta, HumanToAgent } from "../relay/protocol"
 import {
   type CdpChannel,
   createInputTarget,
@@ -214,6 +214,60 @@ test("handback and abort dispatch no input at all", async () => {
   await target.apply({ type: "handback" }, META)
   await target.apply({ type: "abort" }, META)
   expect(calls).toEqual([])
+})
+
+/**
+ * A message straight off the wire, before any narrowing. The relay forwards
+ * bytes verbatim, so a hostile phone can send JSON the type system forbids; the
+ * runtime guards under test are exactly what must reject it.
+ */
+function untrusted(json: string): HumanToAgent {
+  // SAFETY: this is the trust boundary — JSON.parse yields the raw shape and the
+  // module's own runtime checks decide whether to act on it.
+  return JSON.parse(json) as HumanToAgent
+}
+
+test("a key outside the table is dropped, never dispatched", async () => {
+  const { cdp, calls } = recorder()
+  const target = createInputTarget(cdp)
+  // "constructor" would otherwise index a prototype member of KEY_TABLE.
+  await target.apply(untrusted('{"type":"key","key":"constructor"}'), META)
+  await target.apply(untrusted('{"type":"key","key":"F1"}'), META)
+  expect(calls).toEqual([])
+})
+
+test("a char that is not exactly one code unit is dropped", async () => {
+  const { cdp, calls } = recorder()
+  const target = createInputTarget(cdp)
+  await target.apply({ type: "char", ch: "" }, META)
+  await target.apply({ type: "char", ch: "abc" }, META)
+  await target.apply({ type: "char", ch: "x".repeat(100_000) }, META)
+  expect(calls).toEqual([])
+  // A single character still gets through: keyDown + keyUp.
+  await target.apply({ type: "char", ch: "7" }, META)
+  expect(calls.length).toBe(2)
+})
+
+test("the input queue drops messages past its depth cap", async () => {
+  // Hold the first dispatch so the whole flood queues behind it synchronously.
+  const { cdp, calls } = recorder(50)
+  const target = createInputTarget(cdp)
+  const inflight: Promise<void>[] = []
+  for (let i = 0; i < 400; i++) {
+    inflight.push(target.apply({ type: "char", ch: "1" }, META))
+  }
+  await Promise.all(inflight)
+  // Exactly 256 admitted, each dispatched as keyDown + keyUp; 144 dropped.
+  expect(calls.length).toBe(256 * 2)
+})
+
+test("drain resolves only after queued input has been dispatched", async () => {
+  const { cdp, calls } = recorder(30)
+  const target = createInputTarget(cdp)
+  void target.apply({ type: "char", ch: "1" }, META)
+  void target.apply({ type: "char", ch: "2" }, META)
+  await target.drain()
+  expect(calls.length).toBe(4)
 })
 
 test("two keystrokes in flight at once stay in order", async () => {

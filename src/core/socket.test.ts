@@ -292,6 +292,29 @@ test("a socket dropped mid-handoff comes back", async () => {
   expect(connection.isOpen()).toBe(true)
 })
 
+test("sendFinal waits for a reconnect before giving up on the ending", async () => {
+  const fake = await startFakeRelay()
+  const connection = track(
+    connectRelay({
+      url: `ws://127.0.0.1:${fake.port}/ws?role=agent`,
+      onMessage: () => undefined,
+      heartbeatMs: 60_000,
+    }),
+  )
+  await until("the socket to open", () => connection.isOpen())
+
+  // Drop the socket and wait until it is observably down, then deliver the
+  // terminal message. A plain send would resolve without sending; sendFinal
+  // must wait for the reconnect and get the ending across on the new socket.
+  fake.sockets[0]?.terminate()
+  await until("the socket to drop", () => !connection.isOpen())
+  await connection.sendFinal({ type: "ended", outcome: "resolved" })
+
+  await until("the ending arrived after the reconnect", () =>
+    fake.received.some((message) => message.type === "ended"),
+  )
+})
+
 test("close() ends the handoff and stops reconnecting", async () => {
   const fake = await startFakeRelay()
   let opens = 0

@@ -190,12 +190,26 @@ export interface InputTarget {
   apply(message: HumanToAgent, meta: FrameMeta): Promise<void>
   /** Where a scroll will be aimed: the last tap, or the viewport centre. */
   anchor(meta: FrameMeta): PagePoint
+  /**
+   * Resolve once every input queued so far has been dispatched. Used before a
+   * handback commits, so no keystroke the human sent still runs against the
+   * page while it is being snapshotted and torn down.
+   */
+  drain(): Promise<void>
 }
+
+/**
+ * Cap on the number of unfinished input messages. A human types a handful per
+ * second; a flood past this is a client trying to grow the serialisation queue
+ * without bound, so drop the excess rather than buffer it.
+ */
+const MAX_QUEUE_DEPTH = 256
 
 /** Bind the input channel to one CDP session. */
 export function createInputTarget(cdp: CdpChannel): InputTarget {
   let lastTap: PagePoint | null = null
   let queue: Promise<void> = Promise.resolve()
+  let depth = 0
 
   const anchor = (meta: FrameMeta): PagePoint => lastTap ?? viewportCentre(meta)
 
@@ -211,9 +225,17 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
         return
       }
       case "char":
+        // The mobile UI sends exactly one character per message; a longer
+        // string is a malformed or hostile client trying to push an arbitrary
+        // payload into the page. Drop it rather than type it.
+        if (message.ch.length !== 1) return
         await typeCharacter(cdp, message.ch)
         return
       case "key":
+        // `key` is typed as SendableKey but arrives as untrusted JSON. Reject
+        // anything outside the table so a value like "constructor" or "F1"
+        // cannot index a prototype member or reach an unmapped key.
+        if (!Object.hasOwn(KEY_TABLE, message.key)) return
         await dispatchKey(cdp, message.key, KEY_TABLE[message.key])
         return
       case "scroll": {
@@ -239,9 +261,18 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
   return {
     anchor,
     apply(message, meta) {
+      if (depth >= MAX_QUEUE_DEPTH) return Promise.resolve()
+      depth += 1
       const next = queue.then(() => dispatch(message, meta))
-      queue = next.catch(() => undefined)
+      queue = next
+        .catch(() => undefined)
+        .finally(() => {
+          depth -= 1
+        })
       return next
+    },
+    drain() {
+      return queue.then(() => undefined)
     },
   }
 }

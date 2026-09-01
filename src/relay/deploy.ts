@@ -6,8 +6,11 @@
  * never touches the browser session, and it holds no state worth recovering —
  * if it dies, the handoff dies, and that is the correct behaviour.
  */
+import { randomUUID } from "node:crypto"
+
 import {
   ConcurrencyLimitError,
+  GatewayError,
   type Sandbox,
   SolariClient,
 } from "@solarisdk/sdk"
@@ -22,12 +25,27 @@ const GUEST_LOG = "/var/log/relay.log"
 /** Idle window for the sandbox. Comfortably longer than raiseHand's 15 min default. */
 const DEFAULT_TIMEOUT_MS = 20 * 60_000
 
+/**
+ * The preview `pt_token` lives one hour (spikes/s1-report.md §3). A sandbox
+ * that outlives its token would hand the phone and the agent an unannounced
+ * 401 mid-handoff, so cap the idle window below that. A cleaner fix is to
+ * re-mint the token via `previewUrl()`; for v1 the cap is enough.
+ */
+const MAX_TIMEOUT_MS = 55 * 60_000
+
 /** Cold start measured at ~2.9s (spikes/s1-report.md); 30s is a generous ceiling. */
 const READY_TIMEOUT_MS = 30_000
 const READY_POLL_MS = 250
 
 /** The test plan allows 2 concurrent sandboxes; a parallel agent run will collide. */
 const CREATE_ATTEMPTS = 6
+
+/**
+ * `kill()` destroys the sandbox and, with it, the public relay URL. A swallowed
+ * failure would leave that URL — and its last frame — reachable until the idle
+ * timeout, so a transient failure is retried before it is surfaced.
+ */
+const KILL_ATTEMPTS = 4
 
 export interface StartRelayOptions {
   apiKey: string
@@ -38,7 +56,10 @@ export interface StartRelayOptions {
 export interface RelayHandle {
   /** Public page for the human. Carries the `pt_token` that grants the cookie. */
   humanUrl: string
-  /** `wss://…/ws?role=agent&pt_token=…` — a non-browser client keeps no cookie. */
+  /**
+   * `wss://…/ws?role=agent&pt_token=…&k=…` — a non-browser client keeps no
+   * cookie, and `k` is the secret that proves this side is the agent.
+   */
   agentWsUrl: string
   /** Destroy the sandbox. Idempotent; safe to call from a `finally`. */
   kill(): Promise<void>
@@ -77,7 +98,14 @@ async function createSandbox(
 ): Promise<Sandbox> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await client.sandboxes.create({ template: "base", timeoutMs })
+      return await client.sandboxes.create({
+        template: "base",
+        timeoutMs,
+        // Idle-timeout must destroy the relay, not pause it. A paused sandbox
+        // keeps holding one of the plan's two slots (spikes/s4-report.md §4);
+        // the relay holds no recoverable state, so killing it is correct.
+        lifecycle: { onTimeout: "kill" },
+      })
     } catch (error) {
       const collided = error instanceof ConcurrencyLimitError
       if (!collided || attempt >= CREATE_ATTEMPTS) throw error
@@ -118,16 +146,44 @@ export async function startRelay(
   options: StartRelayOptions,
 ): Promise<RelayHandle> {
   const client = new SolariClient({ apiKey: options.apiKey })
-  const sandbox = await createSandbox(
-    client,
-    options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-  )
+  const requestedTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const timeoutMs = Math.min(requestedTimeoutMs, MAX_TIMEOUT_MS)
+  if (requestedTimeoutMs > MAX_TIMEOUT_MS) {
+    console.warn(
+      `handraise: timeoutMs ${requestedTimeoutMs}ms exceeds the ${MAX_TIMEOUT_MS}ms preview-token lifetime; capping to ${MAX_TIMEOUT_MS}ms to avoid an unannounced 401 mid-handoff.`,
+    )
+  }
+  // Only a client that holds this secret may claim role=agent. It is appended
+  // to `agentWsUrl` alone, never to the human's link, so possession of the
+  // handoff URL cannot be used to read the human's keystrokes.
+  const agentKey = randomUUID()
+  const sandbox = await createSandbox(client, timeoutMs)
 
   let killed = false
   const kill = async (): Promise<void> => {
     if (killed) return
-    killed = true
-    await sandbox.kill()
+    let lastError: unknown
+    for (let attempt = 1; attempt <= KILL_ATTEMPTS; attempt++) {
+      try {
+        await sandbox.kill()
+        killed = true
+        return
+      } catch (error) {
+        // A 404 means the sandbox is already gone — the goal, not a failure.
+        if (error instanceof GatewayError && error.status === 404) {
+          killed = true
+          return
+        }
+        lastError = error
+        if (attempt < KILL_ATTEMPTS) {
+          await sleep(Math.min(500 * 2 ** (attempt - 1), 4000))
+        }
+      }
+    }
+    // Surface it: the caller must not believe the relay is gone when it is not.
+    throw new Error(
+      `handraise: could not destroy the relay sandbox after ${KILL_ATTEMPTS} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
+    )
   }
 
   try {
@@ -140,7 +196,7 @@ export async function startRelay(
     await sandbox.commands.run("sh", {
       args: [
         "-c",
-        `nohup node ${GUEST_PATH} ${RELAY_PORT} >${GUEST_LOG} 2>&1 & sleep 0.2; echo started`,
+        `nohup node ${GUEST_PATH} ${RELAY_PORT} ${agentKey} >${GUEST_LOG} 2>&1 & sleep 0.2; echo started`,
       ],
     })
 
@@ -149,10 +205,11 @@ export async function startRelay(
     await waitForHealth(relayUrl(previewUrl, "/healthz"))
 
     // https and wss are both "special" URL schemes, so a textual swap is exact.
-    const agentUrl = relayUrl(previewUrl, "/ws", "agent")
+    const agentUrl = new URL(relayUrl(previewUrl, "/ws", "agent"))
+    agentUrl.searchParams.set("k", agentKey)
     return {
       humanUrl: relayUrl(previewUrl, "/"),
-      agentWsUrl: agentUrl.replace(/^https:/, "wss:"),
+      agentWsUrl: agentUrl.toString().replace(/^https:/, "wss:"),
       kill,
     }
   } catch (error) {

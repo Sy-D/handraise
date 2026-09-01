@@ -203,6 +203,35 @@ test("an unreadable frame falls back to the profile's scaling", async () => {
   await pump.stop()
 })
 
+test("a superseded frame is acked but never sent, so only the newest is shown", async () => {
+  const fake = fakeCdp()
+  let release = (): void => undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const seen: string[] = []
+  const pump = await startFramePump(fake.cdp, DEFAULT_PROFILE, async (data) => {
+    seen.push(data)
+    // Hold the first frame in flight so the next two queue behind it.
+    if (seen.length === 1) await gate
+  })
+
+  fake.emit(frameOf("AAAA")) // enters flight, blocks on the gate
+  await Bun.sleep(5)
+  fake.emit(frameOf("BBBB")) // becomes the pending frame
+  fake.emit(frameOf("CCCC")) // supersedes BBBB: acked, never sent
+  await Bun.sleep(5)
+  release()
+  await Bun.sleep(20)
+
+  // The stale middle frame was dropped; the phone jumps to the freshest one.
+  expect(seen).toEqual(["AAAA", "CCCC"])
+  // Every emitted frame is still acked, or Chromium would stop the cast.
+  const acks = fake.calls.filter((c) => c.method === "Page.screencastFrameAck")
+  expect(acks.length).toBe(3)
+  await pump.stop()
+})
+
 test("stopping detaches the listener and ignores frames still in flight", async () => {
   const fake = fakeCdp()
   let delivered = 0

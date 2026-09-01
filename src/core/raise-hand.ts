@@ -41,6 +41,38 @@ const DEFAULT_TIMEOUT_MS = 5 * 60_000
 const RELAY_SLACK_MS = 5 * 60_000
 
 /**
+ * Cap on the `storageState()` capture. It is a CDP round trip, and the Solari
+ * browser session may die in the very same instant the human hands back, which
+ * would leave the call hanging and `raiseHand` never returning — holding the
+ * relay's sandbox slot. Better to lose the cookies than the whole function.
+ */
+const STORAGE_STATE_TIMEOUT_MS = 5_000
+
+/** Resolve `promise`, or reject with `label` if it has not settled in `ms`. */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`handraise: ${label} timed out after ${ms}ms`)),
+      ms,
+    )
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
+}
+
+/**
  * Identifies one handoff. The preview hostname is unique per relay sandbox and
  * already appears in the relay's own logs, which makes it the cheapest useful
  * correlation key. It is deliberately not the Solari session id: `raiseHand`
@@ -99,15 +131,21 @@ async function runHandoff(
   // fire before the constructor has returned, because a socket opens async.
   let link: RelayConnection | null = null
 
+  let terminal = false
   const onHuman = (message: HumanToAgent): void => {
     if (message.type === "handback") {
+      terminal = true
       settle("resolved")
       return
     }
     if (message.type === "abort") {
+      terminal = true
       settle("aborted")
       return
     }
+    // Once a terminal message has arrived the page is being handed back or
+    // abandoned, so no further input may run against it.
+    if (terminal) return
     // Input can only be mapped once a frame has defined the coordinate space.
     const meta = pump?.lastMeta()
     if (!meta || !input) return
@@ -143,15 +181,32 @@ async function runHandoff(
 
   const outcome = await finished
 
+  // Handback is only "resolved-pending" until the page is proven still usable.
+  let finalOutcome = outcome
   let storageState: StorageState | undefined
   if (outcome === "resolved") {
+    // Barrier: let input the human queued before handback finish, so nothing
+    // runs against the page during the snapshot and teardown below.
+    if (input) await input.drain()
     try {
       // Best effort, and worth trying first: whatever the human just did
       // (a completed login, a solved captcha) lives in these cookies, and the
-      // session that holds them may be minutes from its hard lifetime.
-      storageState = await page.context().storageState()
+      // session that holds them may be minutes — or seconds — from its hard
+      // lifetime, so this call is raced against a timeout.
+      storageState = await withTimeout(
+        page.context().storageState(),
+        STORAGE_STATE_TIMEOUT_MS,
+        "storageState capture",
+      )
     } catch (error) {
       console.error("handraise: could not capture storageState", error)
+    }
+    // Handback can win the promise by milliseconds just as the session hits its
+    // ~10-min hard death (spikes/s4-report.md). If the page is gone the caller
+    // cannot continue, so report that truthfully instead of a dead "resolved".
+    if (browser && !browser.isConnected()) {
+      finalOutcome = "disconnected"
+      storageState = undefined
     }
   }
 
@@ -159,12 +214,14 @@ async function runHandoff(
   browser?.off("disconnected", onGone)
   page.off("close", onGone)
   await pump?.stop()
-  await connection.send(endedMessage(outcome))
+  // The ending must reach the phone, so wait briefly for a reconnect if the
+  // socket is momentarily down rather than dropping it like a stale frame.
+  await connection.sendFinal(endedMessage(finalOutcome))
   await connection.close()
   await cdp?.detach().catch(() => undefined)
 
-  if (storageState === undefined) return { outcome }
-  return { outcome, storageState }
+  if (storageState === undefined) return { outcome: finalOutcome }
+  return { outcome: finalOutcome, storageState }
 }
 
 /** See `RaiseHand` in ../types.ts for the contract. */

@@ -45,6 +45,13 @@ export interface RelayConnection {
    * sending while the socket is down — a stale frame is worth nothing.
    */
   send(message: AgentToHuman | Heartbeat): Promise<void>
+  /**
+   * Send a terminal message (the `ended` frame), waiting up to the close grace
+   * period for a reconnect to finish if the socket is momentarily down. The
+   * human's phone hangs on "Reconnecting…" forever if this is dropped, so it is
+   * worth the short wait that `send` deliberately refuses for stale frames.
+   */
+  sendFinal(message: AgentToHuman): Promise<void>
   isOpen(): boolean
   /** Stop reconnecting and close. Idempotent. */
   close(): Promise<void>
@@ -86,6 +93,30 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
         return
       }
       live.send(JSON.stringify(message), () => resolve())
+    })
+
+  const sendFinal = (message: AgentToHuman): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const trySend = (): boolean => {
+        const live = socket
+        if (!live || live.readyState !== WebSocket.OPEN) return false
+        live.send(JSON.stringify(message), () => resolve())
+        return true
+      }
+      if (trySend()) return
+      // The socket is down; the reconnect loop is already working. Poll for it
+      // to come back, and give up after the grace period so the caller's
+      // cleanup is never blocked.
+      const giveUp = setTimeout(() => {
+        clearInterval(poll)
+        resolve()
+      }, CLOSE_GRACE_MS)
+      const poll = setInterval(() => {
+        if (trySend()) {
+          clearInterval(poll)
+          clearTimeout(giveUp)
+        }
+      }, 25)
     })
 
   const handle = (message: RelayMessage): void => {
@@ -135,6 +166,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
 
   return {
     send,
+    sendFinal,
     isOpen: () => socket?.readyState === WebSocket.OPEN,
     close() {
       shuttingDown = true

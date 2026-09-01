@@ -154,7 +154,13 @@ export async function startFramePump(
   let meta: FrameMeta | null = null
   let frames = 0
   let stopped = false
-  let queue: Promise<void> = Promise.resolve()
+  // Newest-frame-wins: at most one frame waits behind the one in flight. A
+  // human that stops reading makes the relay drop frames downstream, but the
+  // ack still gates Chromium here, so without this a burst could still queue
+  // stale frames. A superseded frame is acked (so Chromium keeps flowing) but
+  // never sent, so the phone only ever gets the freshest image.
+  let inFlight = false
+  let pending: ScreencastFrame | null = null
 
   // The JPEG size only changes when the viewport does, so parse it once per
   // viewport instead of base64-decoding thirteen frames a second.
@@ -172,29 +178,52 @@ export async function startFramePump(
     return parsed
   }
 
+  const ack = (sessionId: number): Promise<void> =>
+    cdp
+      .send("Page.screencastFrameAck", { sessionId })
+      .then(() => undefined)
+      .catch(() => undefined)
+
+  const processFrame = async (frame: ScreencastFrame): Promise<void> => {
+    const size = sizeOf(frame)
+    const current: FrameMeta = {
+      deviceWidth: frame.metadata.deviceWidth,
+      deviceHeight: frame.metadata.deviceHeight,
+      jpegWidth: size.width,
+      jpegHeight: size.height,
+      pageScaleFactor: frame.metadata.pageScaleFactor,
+    }
+    meta = current
+    try {
+      await send(frame.data, current)
+      frames += 1
+    } catch {
+      // A frame the relay refused is worthless; the next one is 80 ms away.
+    }
+    // The ack is the throttle: sent only after the frame reached the relay, so
+    // Chromium paces itself to the downstream link. Never skip it — a missing
+    // ack stops the cast entirely.
+    await ack(frame.sessionId)
+  }
+
+  const drain = async (): Promise<void> => {
+    if (inFlight) return
+    inFlight = true
+    while (pending && !stopped) {
+      const frame = pending
+      pending = null
+      await processFrame(frame)
+    }
+    inFlight = false
+  }
+
   const onFrame = (frame: ScreencastFrame): void => {
     if (stopped) return
-    queue = queue.then(async () => {
-      if (stopped) return
-      const size = sizeOf(frame)
-      const current: FrameMeta = {
-        deviceWidth: frame.metadata.deviceWidth,
-        deviceHeight: frame.metadata.deviceHeight,
-        jpegWidth: size.width,
-        jpegHeight: size.height,
-        pageScaleFactor: frame.metadata.pageScaleFactor,
-      }
-      meta = current
-      try {
-        await send(frame.data, current)
-        frames += 1
-      } catch {
-        // A frame the relay refused is worthless; the next one is 80 ms away.
-      }
-      await cdp
-        .send("Page.screencastFrameAck", { sessionId: frame.sessionId })
-        .catch(() => undefined)
-    })
+    // A frame still waiting is now stale; ack it so Chromium keeps sending, and
+    // replace it with the newer one rather than growing a backlog.
+    if (pending) void ack(pending.sessionId)
+    pending = frame
+    void drain()
   }
 
   cdp.on("Page.screencastFrame", onFrame)
