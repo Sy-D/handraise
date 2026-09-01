@@ -14,12 +14,14 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      - name: install chromium for the UI e2e
+        run: bunx playwright-core install --with-deps chromium
       - name: typecheck
         run: bun run typecheck
       - name: lint (biome + oxlint + relay embed sync)
         run: bun run lint
       - name: unit + integration tests
-        run: bun test src/ test-app/
+        run: bun test src/ test-app/ e2e/ui.spec.ts
       - name: build
         run: bun run build
       # e2e (bun run test:e2e) is intentionally not run in CI: it needs a real
