@@ -39,6 +39,7 @@ import type {
 import { notifyWebhook } from "../webhook"
 import { NO_FOCUS, probeFocus } from "./focus"
 import { createInputTarget } from "./input"
+import { scanPageForLinks } from "./qr-scan"
 import { DEFAULT_PROFILE, type FramePump, startFramePump } from "./screencast"
 import { type ApprovalFrame, captureApprovalFrame } from "./snapshot"
 import { connectRelay, type RelayConnection } from "./socket"
@@ -60,6 +61,14 @@ const RELAY_SLACK_MS = 5 * 60_000
  * relay's sandbox slot. Better to lose the cookies than the whole function.
  */
 const STORAGE_STATE_TIMEOUT_MS = 5_000
+
+/**
+ * Floor between two QR scans. Two seconds is the shortest gap at which a
+ * second scan can say something new — the human has to move the page for it
+ * to — and it is long enough that a stuck button cannot turn a live cast into
+ * a screenshot loop.
+ */
+const QR_SCAN_INTERVAL_MS = 2_000
 
 /** Resolve `promise`, or reject with `label` if it has not settled in `ms`. */
 function withTimeout<T>(
@@ -376,6 +385,49 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       })
   }
 
+  // What the phone asked for and what came back, for the wide event.
+  let qrScans = 0
+  let qrHits = 0
+  // One scan at a time, and never two inside the interval. A scan costs a
+  // full-resolution screenshot of a page that is already casting to a phone,
+  // so a held button must not be able to turn into a screenshot loop. The
+  // phone enforces the same floor; this is the one that counts, because the
+  // socket behind the handoff URL is reachable from any HTTP client.
+  let scanning = false
+  let lastScanAt = 0
+
+  /**
+   * Read the QR codes on the page and send the human what they carry.
+   *
+   * Off the critical path, like the focus probe: nothing awaits it, and a scan
+   * still in flight when the handoff ends is dropped rather than delivered to
+   * a phone that has already been told it is over.
+   */
+  const scanQr = (): void => {
+    const now = Date.now()
+    if (scanning || over || now - lastScanAt < QR_SCAN_INTERVAL_MS) return
+    lastScanAt = now
+    scanning = true
+    qrScans += 1
+    void scanPageForLinks(page)
+      .then((links) => {
+        if (links.length > 0) qrHits += 1
+        if (over) return undefined
+        return link?.send({ type: "links", links, source: "qr" })
+      })
+      // A screenshot fails when the page is closing, which is a handoff that
+      // is about to end as `disconnected` — the phone gets that, and its own
+      // deadline releases the button. Answering with an empty list here would
+      // tell the human the page has no code on it, which is a different and
+      // untrue thing.
+      .catch((error) => {
+        logger.warn("qr_scan_failed", { error: String(error) })
+      })
+      .finally(() => {
+        scanning = false
+      })
+  }
+
   const onHuman = (message: HumanToAgent): void => {
     const ending = endingFor(mode, message.type)
     if (ending) {
@@ -386,6 +438,12 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     // abandoned, so no further input may run against it. An approval never
     // injects anything at all: the human is answering, not driving.
     if (terminal || mode === "approval") return
+    // The one message that asks the agent about the page instead of changing
+    // it, so it is answered before the input path and needs no frame metadata.
+    if (message.type === "scanqr") {
+      scanQr()
+      return
+    }
     // Input can only be mapped once a frame has defined the coordinate space.
     const meta = pump?.lastMeta()
     if (!meta || !input) return
@@ -565,6 +623,8 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     framesSent,
     bytesSent,
     inputsApplied: input?.applied() ?? 0,
+    qrScans,
+    qrHits,
     reconnects: connection.stats().reconnects,
     storageStateCaptured: storageState !== undefined,
   }

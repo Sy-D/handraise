@@ -356,6 +356,7 @@ const SAMPLES = {
   key: { type: "key", key: "Enter" },
   clear: { type: "clear" },
   scroll: { type: "scroll", fdy: 40 },
+  scanqr: { type: "scanqr" },
   handback: { type: "handback" },
   abort: { type: "abort" },
   approve: { type: "approve" },
@@ -364,7 +365,16 @@ const SAMPLES = {
 
 /** Which mode's relay routes which of them (`HUMAN_MESSAGES` in guest/server.js). */
 const ROUTED_BY = {
-  takeover: ["tap", "char", "key", "clear", "scroll", "handback", "abort"],
+  takeover: [
+    "tap",
+    "char",
+    "key",
+    "clear",
+    "scroll",
+    "scanqr",
+    "handback",
+    "abort",
+  ],
   approval: ["approve", "deny"],
 } satisfies Record<HandoffMode, HumanToAgent["type"][]>
 

@@ -17,6 +17,7 @@
  * scale by deviceWidth / jpegWidth, never add scroll offsets).
  */
 
+import type { ScannedLink } from "../core/qr-scan"
 import type { HandoffOutcome } from "../types"
 
 /**
@@ -79,6 +80,17 @@ export type AgentToHuman =
       label: string | null
       kind?: FocusKind
     }
+  /**
+   * The answer to a `scanqr`: what the QR codes on the page carry, or an empty
+   * list when there were none. Always sent, because a scan that found nothing
+   * is a result the phone has to show — silence reads as a broken button.
+   *
+   * `source` names where the links came from. There is one source today and
+   * the field is not load-bearing; it is here so a later reader of the wire
+   * does not have to guess, and so a second source can be added without the
+   * phone having to tell them apart by omission.
+   */
+  | { type: "links"; links: ScannedLink[]; source: "qr" }
   | { type: "ended"; outcome: HandoffOutcome }
 
 export type HumanToAgent =
@@ -93,6 +105,16 @@ export type HumanToAgent =
    */
   | { type: "clear" }
   | { type: "scroll"; fdy: number }
+  /**
+   * Read the QR codes on the page and send them back as `links`.
+   *
+   * The one human message that asks the agent for something rather than
+   * telling it what to do to the page, and it exists because a phone cannot
+   * scan its own screen: the code the site is asking the human to scan is on
+   * the screen they are holding. Rate-limited in the core, not here — a scan
+   * costs a full-resolution screenshot.
+   */
+  | { type: "scanqr" }
   | { type: "handback" }
   | { type: "abort" }
   /**

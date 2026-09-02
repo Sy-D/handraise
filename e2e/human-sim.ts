@@ -12,6 +12,7 @@
  */
 import WebSocket from "ws"
 
+import type { ScannedLink } from "../src/core/qr-scan"
 import {
   type AgentToHuman,
   type FrameMeta,
@@ -42,7 +43,11 @@ export interface SimulatedHuman {
   action(): string
   /** How the agent said the handoff ended, if it has. */
   ending(): HandoffOutcome | null
+  /** The links from the newest answered scan, or null before the first one. */
+  links(): ScannedLink[] | null
   waitForFrame(timeoutMs?: number): Promise<ReceivedFrame>
+  /** Ask the agent to read the QR codes on the page, and wait for its answer. */
+  scanqr(timeoutMs?: number): Promise<ScannedLink[]>
   tap(fx: number, fy: number): Promise<void>
   /** Type one character per message, the way the mobile UI does. */
   type(text: string, delayMs?: number): Promise<void>
@@ -101,6 +106,7 @@ export async function openHandoffPage(
   let reason = ""
   let action = ""
   let ending: HandoffOutcome | null = null
+  let links: ScannedLink[] | null = null
   const waiters: (() => void)[] = []
 
   socket.on("message", (data: Buffer) => {
@@ -117,6 +123,7 @@ export async function openHandoffPage(
       reason = message.reason
       action = message.action ?? ""
     }
+    if (message.type === "links") links = message.links
     if (message.type === "ended") ending = message.outcome
   })
 
@@ -146,6 +153,7 @@ export async function openHandoffPage(
     reason: () => reason,
     action: () => action,
     ending: () => ending,
+    links: () => links,
 
     async waitForFrame(timeoutMs = 30_000) {
       const deadline = Date.now() + timeoutMs
@@ -165,6 +173,19 @@ export async function openHandoffPage(
     },
 
     tap: (fx, fy) => send({ type: "tap", fx, fy }),
+
+    async scanqr(timeoutMs = 30_000) {
+      links = null
+      await send({ type: "scanqr" })
+      const deadline = Date.now() + timeoutMs
+      while (links === null) {
+        if (Date.now() > deadline) {
+          throw new Error(`no links answer within ${timeoutMs}ms`)
+        }
+        await Bun.sleep(100)
+      }
+      return links
+    },
 
     async type(text, delayMs = 60) {
       for (const ch of text) {

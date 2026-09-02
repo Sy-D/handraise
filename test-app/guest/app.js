@@ -26,12 +26,24 @@
  *   GET  /totp     one input for the 6-digit code
  *   POST /totp     RFC 6238 check (SHA-1, 30s step, +/-1 step) -> 303 /account
  *   GET  /account  "Signed in as <user>" + <h1 data-testid="signed-in">
+ *   GET  /qr       behind the session: a QR code for the /verified link
+ *   GET  /verified token-gated: the page a scanned code leads to
  *   GET  /transfer one amount + payee form, behind the session
  *   POST /transfer validates, records the transfer -> 303 /account
  *   POST /logout   clears the session -> 303 /
  *   GET  /healthz  200 "ok"
+ *
+ * The QR pair is what the QR-passthrough e2e drives: a site that asks for a
+ * device change, exactly the shape reCAPTCHA's scan-to-verify has. The image
+ * cannot be generated here - this file has no dependencies and no encoder - so
+ * deploy.ts renders it once the preview URL exists (only then is there an
+ * absolute link to encode) and writes it beside this file as qr.json.
+ *
+ * Env (QR):
+ *   QR_FILE      where that JSON lives   (default: qr.json next to this file)
  */
 import crypto from "node:crypto"
+import fs from "node:fs"
 import http from "node:http"
 
 const PORT = Number(process.env.PORT || 4000)
@@ -49,6 +61,8 @@ const TRANSFER_COOKIE = "hr_transfer"
 const PENDING_TTL_MS = 5 * 60_000
 const SESSION_TTL_MS = 30 * 60_000
 const MAX_BODY_BYTES = 8 * 1024
+const QR_FILE =
+  process.env.QR_FILE || new URL("./qr.json", import.meta.url).pathname
 
 // ---------------------------------------------------------------- TOTP -----
 
@@ -194,6 +208,7 @@ const STYLES = `
     border: 1px solid #e4e7eb; border-radius: 12px;
     box-shadow: 0 1px 2px rgba(16,24,40,.04), 0 10px 28px rgba(16,24,40,.06);
   }
+  .card.wide { width: min(560px, calc(100vw - 32px)) }
   .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: -.01em; margin-bottom: 22px }
   .brand span { width: 10px; height: 10px; border-radius: 50%; background: #2f6df6 }
   h1 { font-size: 19px; margin: 0 0 4px; letter-spacing: -.015em }
@@ -224,7 +239,7 @@ const STYLES = `
   .link:hover { background: none; color: #12151a }
 `
 
-function page(title, inner) {
+function page(title, inner, variant) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -234,7 +249,7 @@ function page(title, inner) {
 <style>${STYLES}</style>
 </head>
 <body>
-<main class="card">
+<main class="card${variant ? ` ${variant}` : ""}">
 <div class="brand"><span></span>${BRAND}</div>
 ${inner}
 <p class="foot">Demo target for handraise. Not a real bank.</p>
@@ -341,6 +356,42 @@ function transferProblem(amount, payee) {
   }
   if (payee.length === 0 || payee.length > 64) return "Enter a payee name."
   return null
+}
+
+/**
+ * The device-change step. Read fresh on every request and never cached:
+ * deploy.ts writes this file after the app is already listening, because the
+ * link inside the code is only knowable once the sandbox has a preview URL.
+ */
+function readQr() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(QR_FILE, "utf8"))
+    const token = String(parsed?.token ?? "")
+    const png = String(parsed?.png ?? "")
+    if (token === "" || png === "") return null
+    return { token, png }
+  } catch {
+    return null
+  }
+}
+
+function qrPage(png) {
+  return page(
+    "Confirm on another device",
+    `<h1>Confirm on another device</h1>
+<p class="sub">Scan this code with the phone you registered. This page will not
+continue until you do.</p>
+<img data-testid="qr-code" alt="Device confirmation code" width="420" height="420" src="${escapeHtml(png)}">`,
+    "wide",
+  )
+}
+
+function verifiedPage() {
+  return page(
+    "Device confirmed",
+    `<p class="ok" data-testid="verified">Device confirmed</p>
+<p class="sub">You can go back to the other screen.</p>`,
+  )
 }
 
 function notFoundPage() {
@@ -460,6 +511,44 @@ async function routeTransfer(req, res, method, event) {
   return redirect(res, "/account", { "set-cookie": cookie })
 }
 
+/** The device-change step, behind the session the agent earned with the code. */
+function qrRoute(req, res, event) {
+  const session = unsign(readCookie(req, SESSION_COOKIE))
+  event.signed_in = Boolean(session)
+  if (!session) return redirect(res, "/")
+  const qr = readQr()
+  event.qr_ready = Boolean(qr)
+  if (!qr) {
+    return send(res, 503, "text/plain; charset=utf-8", "no code deployed yet")
+  }
+  return send(res, 200, "text/html; charset=utf-8", qrPage(qr.png))
+}
+
+/**
+ * Where a scanned code leads. Deliberately not behind the session: a real
+ * device-change link is opened on a phone that has never seen this site, and
+ * the token in it is the whole credential. That is what makes such a link
+ * worth passing through a handoff at all.
+ */
+function verifiedRoute(res, url, event) {
+  const qr = readQr()
+  const given = url.searchParams.get("token") || ""
+  const ok = Boolean(qr) && equalSecret(given, qr.token)
+  event.token_ok = ok
+  if (!ok) {
+    return send(
+      res,
+      403,
+      "text/html; charset=utf-8",
+      page(
+        "Not confirmed",
+        `<p class="error" data-testid="not-verified" role="alert">That confirmation link is not valid.</p>`,
+      ),
+    )
+  }
+  return send(res, 200, "text/html; charset=utf-8", verifiedPage())
+}
+
 async function route(req, res, url, event) {
   const method = req.method || "GET"
 
@@ -522,6 +611,14 @@ async function route(req, res, url, event) {
     if (!session) return redirect(res, "/")
     event.user = session.user
     return routeTransfer(req, res, method, event)
+  }
+
+  if (url.pathname === "/qr" && method === "GET") {
+    return qrRoute(req, res, event)
+  }
+
+  if (url.pathname === "/verified" && method === "GET") {
+    return verifiedRoute(res, url, event)
   }
 
   if (url.pathname === "/logout" && method === "POST") {

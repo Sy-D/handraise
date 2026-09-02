@@ -28,6 +28,12 @@ export type {
   HandoffChannel,
   TakeoverChannelHandoff,
 } from "./channels"
+export {
+  type LinkKind,
+  OPENABLE_SCHEMES,
+  type ScannedLink,
+  scanQrLinks,
+} from "./core/qr-scan"
 export { raiseHand } from "./core/raise-hand"
 export {
   HandraiseError,

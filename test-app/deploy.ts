@@ -15,7 +15,10 @@
  * Always kill in a `finally`: the test plan allows two concurrent sandboxes and
  * a leaked one blocks the next run for its whole idle timeout.
  */
+
+import { randomBytes } from "node:crypto"
 import { SolariClient } from "@solarisdk/sdk"
+import QRCode from "qrcode"
 import { GUEST_APP_JS } from "./guest-source"
 import { generateTotpSecret } from "./totp"
 
@@ -30,6 +33,12 @@ const CREATE_ATTEMPTS = 6
 export interface TestAppHandle {
   /** Public preview URL, including the `?pt_token=` the first request needs. */
   url: string
+  /**
+   * The link inside the QR code on `/qr`, which `/verified` accepts and
+   * nothing else does. The QR-passthrough e2e asserts that the human's phone
+   * was handed exactly this string.
+   */
+  verifyUrl: string
   /** Base32 TOTP secret the app was booted with. Feed it to totp() from ./totp.ts. */
   totpSecret: string
   user: string
@@ -63,6 +72,17 @@ function sleep(ms: number): Promise<void> {
 export function previewPath(previewUrl: string, pathname: string): string {
   const url = new URL(previewUrl)
   url.pathname = pathname
+  return url.toString()
+}
+
+/**
+ * The link a scanned code leads to: the app's own `/verified`, carrying both
+ * the preview token the proxy needs and the one-time token the app checks.
+ */
+function verifyLink(previewUrl: string, token: string): string {
+  const url = new URL(previewUrl)
+  url.pathname = "/verified"
+  url.searchParams.set("token", token)
   return url.toString()
 }
 
@@ -152,8 +172,24 @@ export async function startTestApp(
     const { url } = await sandbox.previewUrl(TEST_APP_PORT)
     await waitForHealthz(url, READY_TIMEOUT_MS)
 
+    // Only now is there an absolute link to put in a QR code, so the code is
+    // rendered here and written beside the app rather than being baked into
+    // it: the app has no dependencies and no encoder of its own.
+    const verifyToken = randomBytes(9).toString("base64url")
+    const verifyUrl = verifyLink(url, verifyToken)
+    await sandbox.files.write(
+      `${APP_DIR}/qr.json`,
+      JSON.stringify({
+        token: verifyToken,
+        // The default margin, which is the specification's four-module quiet
+        // zone. A narrower one is the first thing a decoder loses.
+        png: await QRCode.toDataURL(verifyUrl, { scale: 6 }),
+      }),
+    )
+
     return {
       url,
+      verifyUrl,
       totpSecret,
       user,
       pass,

@@ -52,9 +52,11 @@ const MSG = {
   FRAME: "frame",
   STATE: "state",
   FOCUS: "focus",
+  LINKS: "links",
   ENDED: "ended",
   // human -> agent
   TAP: "tap",
+  SCANQR: "scanqr",
   CHAR: "char",
   KEY: "key",
   CLEAR: "clear",
@@ -70,6 +72,18 @@ const MSG = {
 
 /** The two things a handoff can ask of a human. */
 const MODE = { TAKEOVER: "takeover", APPROVAL: "approval" }
+
+/**
+ * The URL schemes the page may offer an "Open" button for, from a QR code the
+ * agent read off whatever site it got stuck on.
+ *
+ * The agent classifies each link before it sends it, and the page checks the
+ * scheme again against this list. Both locks are needed: the human's link is a
+ * bearer URL and the socket behind it is reachable from any HTTP client, so
+ * `kind: "url"` is a hint the page must not have to trust. Asserted equal to
+ * `OPENABLE_SCHEMES` in src/core/qr-scan.ts by relay.test.ts.
+ */
+const OPENABLE_SCHEMES = ["http:", "https:", "tel:", "mailto:", "otpauth:"]
 
 /**
  * What this handoff asks of the human: `takeover` (drive the page) or
@@ -91,6 +105,7 @@ const HUMAN_MESSAGES = new Set(
         MSG.KEY,
         MSG.CLEAR,
         MSG.SCROLL,
+        MSG.SCANQR,
         MSG.HANDBACK,
         MSG.ABORT,
       ],
@@ -422,7 +437,7 @@ function log(event, detail) {
 function renderPage() {
   return PAGE.replace("__HANDRAISE_MODE__", HANDOFF_MODE).replace(
     "__HANDRAISE_VOCAB__",
-    JSON.stringify({ msg: MSG, mode: MODE }),
+    JSON.stringify({ msg: MSG, mode: MODE, schemes: OPENABLE_SCHEMES }),
   )
 }
 
@@ -832,14 +847,18 @@ const PAGE = `<!doctype html>
      or one step and sit together in typing order; clear destroys the whole
      field with no undo, so it is a word rather than a glyph a stranger has to
      guess at, and it sits behind a gutter the thumb has to reach for. A missed
-     backspace can no longer empty the field. */
-  #key-clear {
+     backspace can no longer empty the field.
+
+     Scan QR is past the gutter with it — not because it is destructive, but
+     because it is not a key. It asks the agent a question about the page
+     instead of typing into it, and the three glyphs keep their own group. */
+  #key-clear, #key-qr {
     flex: 0 0 auto;
     min-width: 44px;
-    margin-left: 18px;
     padding: 0 8px;
     font-size: 13px;
   }
+  #key-clear { margin-left: 18px; }
   .key:active:not(:disabled) {
     color: var(--text);
     border-color: oklch(0.44 0 0);
@@ -947,6 +966,81 @@ const PAGE = `<!doctype html>
   #overlay[hidden] { display: none; }
   #overlay h1 { margin: 0; font-size: 20px; letter-spacing: -0.02em; }
   #overlay p { margin: 0; color: var(--muted); font-size: 14px; }
+  /* What the QR code said.
+     A sheet and not a second overlay: the overlay ends the session, this one is
+     an answer the human reads and dismisses, and the frame stays behind it
+     because the next thing they do is usually on the page. It rises from the
+     bottom edge, where the thumb already is. */
+  #sheet {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    display: flex;
+    align-items: flex-end;
+    background: oklch(0.11 0 0 / 0.72);
+  }
+  #sheet[hidden] { display: none; }
+  #sheet-card {
+    width: 100%;
+    max-height: 80%;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+    border-top: 1px solid var(--line);
+    border-radius: var(--radius) var(--radius) 0 0;
+    background: var(--surface);
+    transform: translateY(0);
+    transition: transform 220ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+  @starting-style {
+    #sheet-card { transform: translateY(100%); }
+  }
+  #sheet-title { margin: 0; font-size: 17px; letter-spacing: -0.02em; }
+  #sheet-links { display: flex; flex-direction: column; gap: 12px; }
+  .link {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg);
+  }
+  /* The link is the thing being decided on, so it is shown in full and it
+     wraps. anywhere, because a token has no spaces to break at — a truncated
+     URL is exactly how somebody is talked into opening the wrong one. */
+  .link-text {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.35;
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+  .link-note { margin: 0; font-size: 12px; color: var(--muted); }
+  .link-actions { display: flex; gap: 8px; }
+  /* Same box for the anchor and the button, so the row does not shift by a
+     pixel between a link that can be opened and one that can only be copied. */
+  .link-action {
+    flex: 1 1 0;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 12px;
+    border: 1px solid var(--field);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    text-decoration: none;
+  }
+  .link-action:active { background: oklch(0.26 0 0 / 0.4); }
+  #sheet-close { min-height: 44px; }
+  .empty { margin: 0; color: var(--muted); font-size: 14px; }
   /* One page, two jobs. The relay bakes the mode into the body, and the
      controls belonging to the other job are gone rather than disabled: the
      relay refuses to route what they would have sent anyway. */
@@ -983,6 +1077,10 @@ const PAGE = `<!doctype html>
     .ghost::before { display: none; }
     .ghost[data-holding] { background: oklch(0.65 0.2 25 / 0.14); }
     #approve[data-holding] { background: oklch(0.985 0 0 / 0.12); }
+    #sheet-card { transition: none; }
+    @starting-style {
+      #sheet-card { transform: none; }
+    }
     #overlay { transition: opacity 150ms linear; }
     @starting-style {
       #overlay { opacity: 0; transform: none; }
@@ -1016,6 +1114,7 @@ const PAGE = `<!doctype html>
         <button id="key-tab" class="key" type="button" aria-label="Next field">&#8677;</button>
         <button id="key-enter" class="key" type="button" aria-label="Enter">&#9166;</button>
         <button id="key-clear" class="key" type="button" aria-label="Clear the field" disabled>Clear</button>
+        <button id="key-qr" class="key" type="button" aria-label="Read the QR codes on the page">Scan QR</button>
       </div>
     </div>
     <p class="ask approval-only">
@@ -1036,6 +1135,13 @@ const PAGE = `<!doctype html>
     <h1 id="overlay-title"></h1>
     <p id="overlay-note"></p>
   </div>
+  <div id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <div id="sheet-card">
+      <h2 id="sheet-title"></h2>
+      <div id="sheet-links"></div>
+      <button id="sheet-close" class="primary" type="button">Done</button>
+    </div>
+  </div>
 <script>
 (function () {
   var dot = document.getElementById("dot")
@@ -1053,6 +1159,9 @@ const PAGE = `<!doctype html>
   var overlayTitle = document.getElementById("overlay-title")
   var overlayNote = document.getElementById("overlay-note")
   var actionEl = document.getElementById("action")
+  var sheet = document.getElementById("sheet")
+  var sheetTitle = document.getElementById("sheet-title")
+  var sheetLinks = document.getElementById("sheet-links")
 
   /**
    * The wire vocabulary, injected by the relay that served this page from the
@@ -1063,6 +1172,8 @@ const PAGE = `<!doctype html>
   var VOCAB = __HANDRAISE_VOCAB__
   var MSG = VOCAB.msg
   var MODE = VOCAB.mode
+  /** The schemes this page may build an "Open" link for. See server.js. */
+  var OPENABLE = VOCAB.schemes
 
   /**
    * Takeover or approval, decided by the relay that served this page. In
@@ -1080,6 +1191,7 @@ const PAGE = `<!doctype html>
         MSG.KEY,
         MSG.CLEAR,
         MSG.SCROLL,
+        MSG.SCANQR,
         MSG.HANDBACK,
         MSG.ABORT,
         MSG.PING
@@ -1817,6 +1929,153 @@ const PAGE = `<!doctype html>
     clearKey.disabled = !(focus && focus.rect)
   }
 
+  // ------------------------------------------------------------ QR codes ---
+  //
+  // The site wants a phone to scan the code it is showing, and the phone is
+  // the thing showing it. So the agent reads it off its own screenshot and
+  // sends back what it said; this half is the button that asks and the sheet
+  // that answers.
+
+  /** Long enough for a screenshot plus a decode across a continent. */
+  var SCAN_TIMEOUT_MS = 12000
+  /** The floor the agent enforces too, kept here so the button rarely hits it. */
+  var SCAN_INTERVAL_MS = 2000
+  var SCAN_HINT = "Reading the page…"
+  var SCAN_FAILED_HINT = "The agent didn't answer — try again"
+  var SCAN_SOON_HINT = "One scan at a time — try again in a moment"
+  var scanning = false
+  var scanTimer = null
+  var lastScanAt = 0
+
+  /**
+   * A link is openable only if this page says so.
+   *
+   * The agent already classified it, but that classification arrives over a
+   * socket anybody holding the handoff URL can write to, and the payload came
+   * off a page the agent did not choose. So the scheme is checked again here,
+   * against the allowlist the relay injected: "javascript:", "data:" and
+   * everything else nobody thought of get a Copy button and no anchor.
+   */
+  function openable(link) {
+    if (!link || link.kind !== "url" || typeof link.text !== "string") return false
+    try {
+      return OPENABLE.indexOf(new URL(link.text).protocol) !== -1
+    } catch (err) {
+      return false
+    }
+  }
+
+  function actionButton(label, run) {
+    var button = document.createElement("button")
+    button.type = "button"
+    button.className = "link-action"
+    button.textContent = label
+    button.addEventListener("click", run)
+    return button
+  }
+
+  /**
+   * Copy, with the one thing that can go wrong said out loud. The clipboard
+   * API needs a secure context and a user gesture; this has both, but a phone
+   * browser may still refuse, and a Copy button that silently does nothing is
+   * worse than one that admits it.
+   */
+  function copyButton(text) {
+    return actionButton("Copy", function () {
+      var clipboard = navigator.clipboard
+      if (!clipboard) { flashHint("This browser won't let the page copy"); return }
+      clipboard.writeText(text).then(
+        function () { flashHint("Copied") },
+        function () { flashHint("This browser won't let the page copy") }
+      )
+    })
+  }
+
+  /** One card per code. textContent only: this string came off a hostile page. */
+  function linkCard(link) {
+    var card = document.createElement("div")
+    card.className = "link"
+    var text = document.createElement("p")
+    text.className = "link-text"
+    text.textContent = link.text
+    card.appendChild(text)
+    var actions = document.createElement("div")
+    actions.className = "link-actions"
+    if (openable(link)) {
+      var open = document.createElement("a")
+      open.className = "link-action"
+      open.href = link.text
+      open.target = "_blank"
+      // noopener: the opened page must not get a handle on this one, which is
+      // the tab holding a live handoff. noreferrer keeps the handoff URL — a
+      // bearer credential — out of the other site's logs.
+      open.rel = "noopener noreferrer"
+      open.textContent = "Open in new tab"
+      actions.appendChild(open)
+    } else {
+      var note = document.createElement("p")
+      note.className = "link-note"
+      note.textContent = "Not a link this page will open. Copy it instead."
+      card.appendChild(note)
+    }
+    actions.appendChild(copyButton(link.text))
+    card.appendChild(actions)
+    return card
+  }
+
+  function showLinks(links) {
+    sheetLinks.textContent = ""
+    if (links.length === 0) {
+      sheetTitle.textContent = "No QR code found"
+      var empty = document.createElement("p")
+      empty.className = "empty"
+      empty.textContent =
+        "Nothing on this screen decoded as a QR code. Scroll the page to bring it into view, then scan again."
+      sheetLinks.appendChild(empty)
+    } else {
+      sheetTitle.textContent =
+        links.length > 1 ? links.length + " codes on the page" : "On the page"
+      for (var i = 0; i < links.length; i++) {
+        sheetLinks.appendChild(linkCard(links[i]))
+      }
+    }
+    sheet.hidden = false
+  }
+
+  /** Let the button go again, whatever ended the scan. */
+  function endScan() {
+    if (scanTimer) { clearTimeout(scanTimer); scanTimer = null }
+    scanning = false
+    qrKey.disabled = finished
+    if (hint.textContent === SCAN_HINT) setHint()
+  }
+
+  var qrKey = keyButton("key-qr", function () {
+    if (scanning) return
+    // The agent drops a scan that comes too soon, and a dropped scan is an
+    // answer that never arrives. Say so here instead of spending the wait.
+    if (Date.now() - lastScanAt < SCAN_INTERVAL_MS) {
+      flashHint(SCAN_SOON_HINT)
+      return
+    }
+    lastScanAt = Date.now()
+    scanning = true
+    qrKey.disabled = true
+    hint.textContent = SCAN_HINT
+    send({ type: MSG.SCANQR })
+    // The answer may never come: the agent may have gone, or dropped this one.
+    // Without a deadline the button would stay dead for the rest of the session.
+    scanTimer = setTimeout(function () {
+      scanTimer = null
+      endScan()
+      flashHint(SCAN_FAILED_HINT)
+    }, SCAN_TIMEOUT_MS)
+  })
+
+  document.getElementById("sheet-close").addEventListener("click", function () {
+    sheet.hidden = true
+  })
+
   function finish(title, note) {
     finished = true
     overlayTitle.textContent = title
@@ -1828,6 +2087,9 @@ const PAGE = `<!doctype html>
     placeRing()
     setHint()
     setClearEnabled()
+    // A scan can no longer be answered: there is no agent left to ask. The
+    // sheet stays if it is open — the link is still worth reading.
+    endScan()
     applyKind("text")
     kbd.blur()
     // A queued answer now has a deadline: keep reconnecting to flush it, but
@@ -1950,6 +2212,10 @@ const PAGE = `<!doctype html>
       zoomToFocus()
       setHint()
       setClearEnabled()
+    }
+    else if (message.type === MSG.LINKS) {
+      endScan()
+      showLinks(Array.isArray(message.links) ? message.links : [])
     }
     else if (message.type === MSG.ENDED) {
       var ending = ENDINGS[message.outcome] || ["Session ended", "You can close this tab."]

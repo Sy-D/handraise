@@ -14,6 +14,7 @@ import { connect as netConnect, type Socket } from "node:net"
 import type { Readable } from "node:stream"
 import { fileURLToPath } from "node:url"
 import WebSocket from "ws"
+import { OPENABLE_SCHEMES } from "../core/qr-scan"
 import type { HandoffMode } from "../types"
 import { GUEST_SERVER_JS } from "./guest-source"
 import {
@@ -403,12 +404,14 @@ const WIRE_NAMES = {
   frame: "FRAME",
   state: "STATE",
   focus: "FOCUS",
+  links: "LINKS",
   ended: "ENDED",
   tap: "TAP",
   char: "CHAR",
   key: "KEY",
   clear: "CLEAR",
   scroll: "SCROLL",
+  scanqr: "SCANQR",
   handback: "HANDBACK",
   abort: "ABORT",
   approve: "APPROVE",
@@ -445,6 +448,18 @@ test("neither the relay nor the page it serves spells a message type by hand", (
     expect(GUEST_SERVER_JS).not.toContain(`type: "${type}"`)
     expect(GUEST_SERVER_JS).not.toContain(`type === "${type}"`)
   }
+})
+
+test("the relay's openable schemes are the core's list, not a second one", () => {
+  const block = /const OPENABLE_SCHEMES = \[([^\]]*)\]/.exec(
+    GUEST_SERVER_JS,
+  )?.[1]
+  if (!block) throw new Error("guest/server.js no longer defines the schemes")
+  const schemes = [...block.matchAll(/"([^"]+)"/g)].map((match) => match[1])
+  // The phone re-checks a link's scheme before it builds an anchor for it, and
+  // the check is only worth anything if it is checking the same list the agent
+  // classified against.
+  expect(schemes.sort()).toEqual([...OPENABLE_SCHEMES].sort())
 })
 
 test("the served page carries the relay's own vocabulary, not a copy", async () => {
@@ -593,6 +608,7 @@ test("approval mode drops every takeover message the human sends", async () => {
   human.send({ type: "key", key: "Enter" })
   human.send({ type: "clear" })
   human.send({ type: "scroll", fdy: 40 })
+  human.send({ type: "scanqr" })
   human.send({ type: "handback" })
   human.send({ type: "abort" })
   // Only this one is in the approval vocabulary, and it arrives after all of

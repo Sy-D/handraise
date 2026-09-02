@@ -618,7 +618,7 @@ test("the clear key is offered only while a remote field is focused", async () =
   expect(consoleErrors).toEqual([])
 })
 
-const KEY_IDS = ["#key-back", "#key-tab", "#key-enter", "#key-clear"]
+const KEY_IDS = ["#key-back", "#key-tab", "#key-enter", "#key-clear", "#key-qr"]
 
 /** Every key button's box, in the order the ids are given. */
 async function keyBoxes(): Promise<Box[]> {
@@ -1387,3 +1387,216 @@ test("the reconnect loop gives up flushing once its deadline passes", async () =
   )
   expect(unexpected).toEqual([])
 }, 20000)
+
+// --- QR passthrough: the button, the sheet, and what it refuses to open ----
+
+const QR_LINK = "https://verify.example.com/device?token=abc123"
+
+/** Wait for the result sheet to be on screen (or gone). */
+async function waitForSheet(visible: boolean): Promise<void> {
+  await page.waitForFunction((want: boolean) => {
+    const sheet = document.getElementById("sheet")
+    return sheet ? !sheet.hidden === want : false
+  }, visible)
+}
+
+/** The text of every link card in the sheet, in order. */
+function sheetTexts(): Promise<string[]> {
+  return page
+    .locator("#sheet-links .link-text")
+    .allTextContents()
+    .then((texts) => texts.map((text) => text.trim()))
+}
+
+test("the scan button is offered in a takeover and not in an approval", async () => {
+  await showFrame()
+  expect(await page.locator("#key-qr").isVisible()).toBe(true)
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
+
+  // The whole input bar is gone in an approval: the human is answering a
+  // question about one screenshot, and there is no live page to scan.
+  await reopenFixture("approval")
+  agent.send({ type: "frame", data: frameData, meta: META })
+  await page.waitForTimeout(150)
+  expect(await page.locator("#key-qr").isVisible()).toBe(false)
+
+  // The page will not even put it on the wire: `scanqr` is not in an approval's
+  // vocabulary. (The relay refuses it too — relay.test.ts "approval mode drops
+  // every takeover message the human sends" — because a hidden control is not
+  // a restriction.)
+  await page.evaluate(() => {
+    document.getElementById("key-qr")?.click()
+  })
+  await page.waitForTimeout(200)
+  expect(agent.received.some((message) => message.type === "scanqr")).toBe(
+    false,
+  )
+  expect(consoleErrors).toEqual([])
+})
+
+test("pressing scan asks the agent once and waits for the answer", async () => {
+  await showFrame()
+
+  await page.locator("#key-qr").click()
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && button.disabled
+  })
+  const scans = agent.received.filter((message) => message.type === "scanqr")
+  expect(scans).toHaveLength(1)
+  expect(await page.locator("#hint").textContent()).toBe("Reading the page…")
+
+  // A second press while the first is in flight must not reach the agent: the
+  // core would drop it anyway, and a dropped scan is an answer that never comes.
+  await page.locator("#key-qr").click({ force: true })
+  await page.waitForTimeout(100)
+  expect(
+    agent.received.filter((message) => message.type === "scanqr"),
+  ).toHaveLength(1)
+
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})
+
+test("the sheet shows the link and opens it in a new tab, never in this one", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([QR_LINK])
+  const open = page.locator("#sheet-links a.link-action")
+  expect(await open.isVisible()).toBe(true)
+  expect(await open.getAttribute("href")).toBe(QR_LINK)
+  // This tab is holding a live handoff. The opened site must not get a handle
+  // on it, and must not be told the handoff URL it came from.
+  expect(await open.getAttribute("target")).toBe("_blank")
+  expect(await open.getAttribute("rel")).toBe("noopener noreferrer")
+
+  // Copy is offered whatever the link is, and the sheet is dismissible.
+  expect(
+    await page.locator("#sheet-links button.link-action").textContent(),
+  ).toBe("Copy")
+  await page.locator("#sheet-close").click()
+  await waitForSheet(false)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a scan that found nothing says so rather than showing an empty sheet", async () => {
+  await showFrame()
+  await page.locator("#key-qr").click()
+  agent.send({ type: "links", links: [], source: "qr" })
+  await waitForSheet(true)
+
+  expect(await page.locator("#sheet-title").textContent()).toBe(
+    "No QR code found",
+  )
+  expect(await sheetTexts()).toEqual([])
+  expect(await page.locator("#sheet-links .empty").textContent()).toContain(
+    "Nothing on this screen decoded",
+  )
+  // And the button is usable again, or the human cannot try after scrolling.
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a scheme the page may not open gets no anchor, whatever the agent called it", async () => {
+  await showFrame()
+  // Every one of these arrives labelled `kind: "url"`, which is the lie the
+  // page has to survive: the handoff URL is a bearer credential and the socket
+  // behind it is reachable from any HTTP client, so this side re-checks the
+  // scheme itself instead of trusting the label.
+  const hostile = [
+    "javascript:alert(document.cookie)",
+    "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+    "file:///etc/passwd",
+    "intent://scan/#Intent;scheme=zxing;end",
+  ]
+  agent.send({
+    type: "links",
+    links: hostile.map((text) => ({ text, kind: "url" as const })),
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual(hostile)
+  // No anchor at all — not a disabled one, and not one with a neutered href.
+  expect(await page.locator("#sheet-links a").count()).toBe(0)
+  expect(await page.locator("#sheet-links button.link-action").count()).toBe(
+    hostile.length,
+  )
+  expect(
+    await page.locator("#sheet-links .link-note").first().textContent(),
+  ).toContain("Not a link this page will open")
+  expect(consoleErrors).toEqual([])
+})
+
+test("a QR payload reaches the sheet as text, never as markup", async () => {
+  await showFrame()
+  const payload = '<img src=x onerror="window.__handraisePwned = 1">'
+  agent.send({
+    type: "links",
+    links: [{ text: payload, kind: "text" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([payload])
+  expect(await page.locator("#sheet-links img").count()).toBe(0)
+  expect(consoleErrors).toEqual([])
+})
+
+test("two codes are both listed, and the sheet says there are two", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [
+      { text: QR_LINK, kind: "url" },
+      { text: "WIFI:S:GuestNet;T:WPA;P:hunter2;;", kind: "text" },
+    ],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await page.locator("#sheet-title").textContent()).toBe(
+    "2 codes on the page",
+  )
+  expect(await sheetTexts()).toEqual([
+    QR_LINK,
+    "WIFI:S:GuestNet;T:WPA;P:hunter2;;",
+  ])
+  expect(await page.locator("#sheet-links a").count()).toBe(1)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a scan the agent never answers releases the button and says why", async () => {
+  await reopenFixture("takeover", false, true)
+  await showFrame()
+  await page.locator("#key-qr").click()
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && button.disabled
+  })
+
+  // The agent drops a scan that came too soon, or has gone away entirely.
+  // Without a deadline the button would stay dead for the rest of the session.
+  await page.clock.fastForward(12_000)
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && !button.disabled
+  })
+  expect(await page.locator("#hint").textContent()).toBe(
+    "The agent didn't answer — try again",
+  )
+  expect(await page.locator("#sheet").isHidden()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})
