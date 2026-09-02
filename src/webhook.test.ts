@@ -3,8 +3,9 @@
  * the JSON body a Slack/Discord/Telegram endpoint would see, so the test reads
  * it off the wire rather than off a mock.
  */
-import { createServer, type IncomingMessage, type Server } from "node:http"
 import { afterEach, expect, test } from "bun:test"
+import { createServer, type IncomingMessage, type Server } from "node:http"
+import type { AddressInfo } from "node:net"
 import type { LogFields, Logger } from "./logger"
 import { notifyWebhook, type WebhookPayload } from "./webhook"
 
@@ -43,10 +44,11 @@ async function listen(status: number): Promise<Endpoint> {
     response.end()
   })
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
-  const address = server.address()
-  if (!address || typeof address === "string") throw new Error("no port")
+  // SAFETY: a TCP listener's address() is an AddressInfo; the string form
+  // exists only for pipe and Unix-socket servers, which this is not.
+  const { port } = server.address() as AddressInfo
   const endpoint: Endpoint = {
-    url: `http://127.0.0.1:${address.port}/hook`,
+    url: `http://127.0.0.1:${port}/hook`,
     received,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   }
@@ -59,20 +61,18 @@ afterEach(async () => {
 })
 
 /** A logger that keeps what it was told, so a test can assert on it. */
-function recordingLogger(): { logger: Logger; warnings: string[] } {
+function recordingLogger() {
   const warnings: string[] = []
   const nothing = (_event: string, _fields?: LogFields): void => {}
-  return {
-    warnings,
-    logger: {
-      debug: nothing,
-      info: nothing,
-      warn: (event: string) => {
-        warnings.push(event)
-      },
-      error: nothing,
+  const logger: Logger = {
+    debug: nothing,
+    info: nothing,
+    warn: (event: string) => {
+      warnings.push(event)
     },
+    error: nothing,
   }
+  return { logger, warnings }
 }
 
 const APPROVAL: WebhookPayload = {
