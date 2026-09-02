@@ -13,29 +13,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Everything `raiseHand` throws now carries a `code` you can branch on —
   `missing_api_key`, `invalid_mode`, `empty_action`, `browser_unusable`,
   `relay_start_failed`, `concurrency_limit`, `relay_not_ready` — plus the
-  original SDK, CDP or network error as `cause`. `concurrency_limit` is the
+  SDK, CDP or network error as `cause`, with any credential in it redacted. `concurrency_limit` is the
   one worth retrying: it means your Solari account is at its concurrent
   session cap, not that anything is broken. When to expect each code, and what
   to do about it, is in the README's [Errors](README.md#errors) table. The
   messages were never a contract; they can still be reworded in any release.
   Outcomes are unchanged and still values: a human who never came, a session
   that died mid-handoff and a webhook that 500s are not exceptions.
-- **A logger that throws can no longer end a handoff.** `logger` is your
-  object — a pino instance over a closed transport throws — and handraise
-  calls it from `catch` blocks and promise callbacks. One of those was the
-  webhook notification, which `raiseHand` fires and only awaits minutes later:
-  a throw there was an unhandled rejection (node ends the process for that)
-  and then an uncoded `Error` out of `raiseHand`, long after the URL existed.
-  Log calls are now wrapped where the logger enters handraise. A broken logger
-  costs a log line.
+- **A broken logger can no longer end a handoff.** `logger` is your object,
+  and handraise calls it from `catch` blocks and promise callbacks. Three ways
+  it breaks are contained where the logger enters handraise: a method that
+  throws (a pino instance over a closed transport), a method that is a getter
+  and throws on the property read, and a method that is `async` and rejects —
+  TypeScript accepts one where `Logger` declares `void`, and the rejection then
+  belongs to a promise nobody holds, which ends the process. One of the call
+  sites is the webhook notification, which `raiseHand` fires and only awaits
+  minutes later, long after the handoff URL exists. A broken logger costs a log
+  line.
 - **The relay health poll enforces its deadline.** Each attempt carries
   `AbortSignal.timeout`, so a preview URL that accepts the connection and never
   answers ends as `relay_not_ready` at the deadline instead of blocking
-  `raiseHand` for minutes with a live sandbox burning its idle window.
-- **No preview token can reach an error message.** Anything a gateway or proxy
-  says is redacted before it is quoted — `pt_token=…` in any case or
-  separator, percent-encoded inside a `?next=` parameter, or the bare
-  credential in prose.
+  `raiseHand` for minutes with a live sandbox burning its idle window. The
+  "Last answer" in that message is now the URL's own — a 401 from the preview
+  proxy, a refused connection — instead of the abort of a final request that
+  had no time left to make.
+- **The preview token is redacted out of error messages and out of `cause`.**
+  It is a live bearer credential for the relay, and a proxy that echoes the
+  request URI in its 401 body would otherwise put it in an exception message.
+  Where the exact value is known — the health poll, the teardown failure and
+  the wrapped start failure all hold the URL that carries it — that value is
+  removed by comparison in each of the forms an escaping proxy produces: bare,
+  percent-encoded, and with its dots written `%2E`, `%2e` or `&#46;`. Three
+  patterns are the net for foreign text where the value is not known:
+  `pt_token=…` in any case or separator, a `pt_`-prefixed value, and the JWT
+  shape the preview token actually has (three base64url segments, separator
+  literal or escaped — see `docs/measurements/01-preview-transport.md` §3). The
+  SDK error attached as `cause` goes through the same redaction, because every
+  error serialiser prints the whole chain. A proxy that invents an encoding
+  none of those cover — folding the value across lines, say — is still a leak;
+  this is a net, not a proof.
+
 ### Changed
 
 - **A page that is already dead is now refused instead of handed off.**
@@ -51,9 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrapped in a `HandraiseError`, with the SDK's error kept as `error.cause`.
   Branch on `error.code === "concurrency_limit"`; if you must have the class,
   it is `error.cause`, and `error.cause.status === 429` is the check that
-  survives a second copy of `@solarisdk/core` in your tree. Apart from the
-  page check above, nothing throws that did not throw before, and no outcome
-  became an exception.
+  survives a second copy of `@solarisdk/core` in your tree. `cause` is the SDK's
+  error with credentials redacted: a copy carrying the same prototype and the
+  same property descriptors — so `name`, `status`, `code`, the non-enumerable
+  `message` and `stack`, and the `cause` chain hanging off it all survive, and
+  `JSON.stringify(cause)` still produces what it did — with `message`, `stack`,
+  the parsed `body` and every nested `cause` rewritten. An error that cannot be
+  copied without running its own code (a throwing getter, a body that
+  references itself) becomes a plain redacted `Error` rather than an exception.
+  Apart from the page check above, nothing throws that did not throw before,
+  and no outcome became an exception.
 
 ## [0.5.1] - 2026-09-02
 

@@ -688,6 +688,34 @@ test("a page whose state cannot be read at all is refused too", async () => {
   })
 })
 
+test("a browser whose liveness accessor throws is refused too", async () => {
+  // The last unguarded read in the pre-flight check: a browser proxy — a
+  // remote-CDP wrapper, a pooled session object, a page handed over between
+  // processes — whose `isConnected()` throws instead of answering. Outside the
+  // `try` that would leave `raiseHand` rejecting with a plain `Error`, which
+  // is exactly what typed codes exist to stop.
+  const browserPartial: Partial<Browser> = {
+    isConnected: () => {
+      throw new Error("Browser has been closed")
+    },
+  }
+  const contextPartial: Partial<BrowserContext> = {
+    // SAFETY: the guard reads only `browser()` off the context.
+    browser: () => browserPartial as Browser,
+  }
+  const pagePartial: Partial<Page> = {
+    isClosed: () => false,
+    // SAFETY: the guard reads only `context().browser()` on the page.
+    context: () => contextPartial as BrowserContext,
+  }
+
+  // SAFETY: the guard touches `isClosed` and `context` and nothing else.
+  await expect(askOn(pagePartial as Page)).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "browser_unusable",
+  })
+})
+
 test("an open page whose browser has disconnected is refused too", async () => {
   // The Solari session hit its ~10-minute hard lifetime while the agent was
   // still working. The page is not closed and `context()` answers — only the
@@ -1519,4 +1547,74 @@ test("a logger that throws does not break the handoff", async () => {
   // The wide event still reaches the caller: `logger.info` throwing must not
   // take `onEvent` with it.
   expect(events).toHaveLength(1)
+})
+
+test("a logger whose methods reject does not break the handoff either", async () => {
+  // The same option, one shape further out: `debug(event, fields): void`
+  // accepts an `async` implementation, so the failure arrives as a rejected
+  // promise nobody holds rather than as a throw. Unhandled, that ends the
+  // agent's process mid-handoff — before the relay sandbox is released, which
+  // leaves a public URL and its last frame reachable until the idle timeout.
+  //
+  // The gate here is the runner: `bun test` fails a test that leaves an
+  // unhandled rejection behind, which is how this was watched failing against
+  // the unfixed wrapper. The listener below is NOT that gate — bun claims the
+  // rejection first and never calls it, so `unhandled` stays empty either way.
+  // It is kept because it costs nothing and states the invariant for a runner
+  // that only warns; do not read it as the thing that catches a regression.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const unhandled: string[] = []
+  const record = (cause: unknown): void => {
+    unhandled.push(String(cause))
+  }
+  process.on("unhandledRejection", record)
+  try {
+    let calls = 0
+    const down = async (): Promise<never> => {
+      calls += 1
+      throw new Error("log shipper is gone (async)")
+    }
+    const rejecting: Logger = {
+      debug: down,
+      info: down,
+      warn: down,
+      error: down,
+    }
+    const events: HandoffEvent[] = []
+
+    const handoff = runHandoff({
+      page: fakePage(cdp.cdp),
+      agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+      options: {
+        reason: "the logger ships its lines over a socket that went away",
+        logger: rejecting,
+        onEvent: (event) => events.push(event),
+      },
+      timeoutMs: 5000,
+      url: "https://relay.example/?pt_token=x",
+      handoffId: "async-rejecting-logger",
+      relayColdStartMs: 5,
+      logger: rejecting,
+    })
+
+    await until("the phone to connect", () => human.inbox.length >= 0)
+    human.send({ type: "handback" })
+
+    const end = await handoff
+    expect(end.outcome).toBe("resolved")
+    // The wide event still reaches the caller, and the logger was really
+    // called — a containment that stopped logging would pass vacuously.
+    expect(events).toHaveLength(1)
+    expect(calls).toBeGreaterThan(0)
+
+    // Long enough for the loop turn on which an unhandled rejection is
+    // reported, after the handoff has fully torn down. Inert under bun — see
+    // the note above the listener.
+    await Bun.sleep(50)
+    expect(unhandled).toEqual([])
+  } finally {
+    process.off("unhandledRejection", record)
+  }
 })
