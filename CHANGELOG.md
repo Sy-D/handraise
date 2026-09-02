@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-09-02
+
+Republish of 0.5.0 with no code change. 0.5.0 was published to npm and
+unpublished again within two minutes, and npm does not let a removed version
+number be reused, so the same release ships as 0.5.1. Everything below under
+0.5.0 applies.
+
 ## [0.5.0] - 2026-09-02
 
 Channels. 0.4.0 made an approval small enough to fit in a chat message — one
@@ -306,6 +313,7 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
 - TypeScript/Node only.
 
 [Unreleased]: https://github.com/Sy-D/handraise/compare/v0.3.0...HEAD
+[0.5.1]: https://github.com/Sy-D/handraise/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Sy-D/handraise/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Sy-D/handraise/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Sy-D/handraise/releases/tag/v0.3.0
