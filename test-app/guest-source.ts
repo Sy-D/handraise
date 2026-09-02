@@ -30,6 +30,8 @@ export const GUEST_APP_JS = `/**
  *   GET  /totp     one input for the 6-digit code
  *   POST /totp     RFC 6238 check (SHA-1, 30s step, +/-1 step) -> 303 /account
  *   GET  /account  "Signed in as <user>" + <h1 data-testid="signed-in">
+ *   GET  /transfer one amount + payee form, behind the session
+ *   POST /transfer validates, records the transfer -> 303 /account
  *   POST /logout   clears the session -> 303 /
  *   GET  /healthz  200 "ok"
  */
@@ -46,6 +48,8 @@ const BRAND = "Aurora Bank"
 const COOKIE_KEY = crypto.randomBytes(32)
 const PENDING_COOKIE = "hr_pending"
 const SESSION_COOKIE = "hr_session"
+/** Carries the last transfer, so /account can show it without server state. */
+const TRANSFER_COOKIE = "hr_transfer"
 const PENDING_TTL_MS = 5 * 60_000
 const SESSION_TTL_MS = 30 * 60_000
 const MAX_BODY_BYTES = 8 * 1024
@@ -289,16 +293,58 @@ function totpPage(error) {
   )
 }
 
-function accountPage(username) {
+function accountPage(username, transfer) {
+  const sent = transfer
+    ? \`<p class="ok" data-testid="transfer-done">Sent EUR \${escapeHtml(
+        transfer.amount,
+      )} to \${escapeHtml(transfer.payee)}</p>\`
+    : ""
   return page(
     "Account",
     \`<p class="ok" data-testid="verified">Two-factor verified</p>
+\${sent}
 <h1 data-testid="signed-in">Signed in as \${escapeHtml(username)}</h1>
 <p class="sub">Your session is active. Nothing here moves real money.</p>
+<p><a class="link" href="/transfer" data-testid="transfer-link">Send a transfer</a></p>
 <form method="post" action="/logout">
   <button type="submit" class="link" data-testid="logout">Sign out</button>
 </form>\`,
   )
+}
+
+/**
+ * The step an agent is not supposed to take alone: it fills the form, and a
+ * human says yes or no before it presses the button.
+ */
+function transferPage(error, amount, payee) {
+  return page(
+    "Transfer",
+    \`<h1>Send a transfer</h1>
+<p class="sub">The money leaves the account the moment you submit.</p>
+\${errorBox(error)}
+<form method="post" action="/transfer" data-testid="transfer-form">
+  <div class="field">
+    <label for="amount">Amount (EUR)</label>
+    <input id="amount" name="amount" type="text" inputmode="decimal" placeholder="12430.00"
+           value="\${escapeHtml(amount || "")}" data-testid="transfer-amount" required>
+  </div>
+  <div class="field">
+    <label for="payee">Payee</label>
+    <input id="payee" name="payee" type="text" autocomplete="off" spellcheck="false"
+           value="\${escapeHtml(payee || "")}" data-testid="transfer-payee" required>
+  </div>
+  <button type="submit" data-testid="transfer-submit">Send transfer</button>
+</form>\`,
+  )
+}
+
+/** What is wrong with this transfer, or null if nothing is. */
+function transferProblem(amount, payee) {
+  if (!/^[0-9]{1,9}(\\.[0-9]{1,2})?$/.test(amount) || Number(amount) <= 0) {
+    return "Enter an amount like 12430.00."
+  }
+  if (payee.length === 0 || payee.length > 64) return "Enter a payee name."
+  return null
 }
 
 function notFoundPage() {
@@ -355,6 +401,69 @@ function redirect(res, location, extraHeaders) {
   )
 }
 
+/** The 2FA step: the pending cookie gets in, the right code gets a session. */
+async function routeTotp(req, res, method, event) {
+  const pending = unsign(readCookie(req, PENDING_COOKIE))
+  event.pending = Boolean(pending)
+  if (!pending) return redirect(res, "/")
+  if (method === "GET") {
+    return send(res, 200, "text/html; charset=utf-8", totpPage(null))
+  }
+  if (method === "POST") {
+    const form = new URLSearchParams(await readBody(req))
+    const code = (form.get("code") || "").trim()
+    const ok = verifyTotp(TOTP_SECRET, code)
+    event.user = pending.user
+    event.code_ok = ok
+    if (!ok) {
+      return send(
+        res,
+        401,
+        "text/html; charset=utf-8",
+        totpPage("That code is not valid. Try again."),
+      )
+    }
+    const session = cookieHeader(
+      req,
+      SESSION_COOKIE,
+      sign({ user: pending.user, exp: Date.now() + SESSION_TTL_MS }),
+      SESSION_TTL_MS / 1000,
+    )
+    const clearPending = \`\${PENDING_COOKIE}=; Path=/; HttpOnly; Max-Age=0\`
+    return redirect(res, "/account", {
+      "set-cookie": [session, clearPending],
+    })
+  }
+  return send(res, 404, "text/html; charset=utf-8", notFoundPage())
+}
+
+/** GET shows the form; POST validates it and records it in a signed cookie. */
+async function routeTransfer(req, res, method, event) {
+  if (method === "GET") {
+    const html = transferPage(null, null, null)
+    return send(res, 200, "text/html; charset=utf-8", html)
+  }
+  if (method !== "POST") {
+    return send(res, 404, "text/html; charset=utf-8", notFoundPage())
+  }
+  const form = new URLSearchParams(await readBody(req))
+  const amount = (form.get("amount") || "").trim()
+  const payee = (form.get("payee") || "").trim()
+  const problem = transferProblem(amount, payee)
+  event.transfer_ok = problem === null
+  if (problem) {
+    const html = transferPage(problem, amount, payee)
+    return send(res, 400, "text/html; charset=utf-8", html)
+  }
+  const cookie = cookieHeader(
+    req,
+    TRANSFER_COOKIE,
+    sign({ amount, payee, exp: Date.now() + SESSION_TTL_MS }),
+    SESSION_TTL_MS / 1000,
+  )
+  return redirect(res, "/account", { "set-cookie": cookie })
+}
+
 async function route(req, res, url, event) {
   const method = req.method || "GET"
 
@@ -394,37 +503,7 @@ async function route(req, res, url, event) {
   }
 
   if (url.pathname === "/totp") {
-    const pending = unsign(readCookie(req, PENDING_COOKIE))
-    event.pending = Boolean(pending)
-    if (!pending) return redirect(res, "/")
-    if (method === "GET") {
-      return send(res, 200, "text/html; charset=utf-8", totpPage(null))
-    }
-    if (method === "POST") {
-      const form = new URLSearchParams(await readBody(req))
-      const code = (form.get("code") || "").trim()
-      const ok = verifyTotp(TOTP_SECRET, code)
-      event.user = pending.user
-      event.code_ok = ok
-      if (!ok) {
-        return send(
-          res,
-          401,
-          "text/html; charset=utf-8",
-          totpPage("That code is not valid. Try again."),
-        )
-      }
-      const session = cookieHeader(
-        req,
-        SESSION_COOKIE,
-        sign({ user: pending.user, exp: Date.now() + SESSION_TTL_MS }),
-        SESSION_TTL_MS / 1000,
-      )
-      const clearPending = \`\${PENDING_COOKIE}=; Path=/; HttpOnly; Max-Age=0\`
-      return redirect(res, "/account", {
-        "set-cookie": [session, clearPending],
-      })
-    }
+    return routeTotp(req, res, method, event)
   }
 
   if (url.pathname === "/account" && method === "GET") {
@@ -432,12 +511,29 @@ async function route(req, res, url, event) {
     event.signed_in = Boolean(session)
     if (!session) return redirect(res, "/")
     event.user = session.user
-    return send(res, 200, "text/html; charset=utf-8", accountPage(session.user))
+    const transfer = unsign(readCookie(req, TRANSFER_COOKIE))
+    return send(
+      res,
+      200,
+      "text/html; charset=utf-8",
+      accountPage(session.user, transfer),
+    )
+  }
+
+  if (url.pathname === "/transfer") {
+    const session = unsign(readCookie(req, SESSION_COOKIE))
+    event.signed_in = Boolean(session)
+    if (!session) return redirect(res, "/")
+    event.user = session.user
+    return routeTransfer(req, res, method, event)
   }
 
   if (url.pathname === "/logout" && method === "POST") {
     return redirect(res, "/", {
-      "set-cookie": \`\${SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0\`,
+      "set-cookie": [
+        \`\${SESSION_COOKIE}=; Path=/; HttpOnly; Max-Age=0\`,
+        \`\${TRANSFER_COOKIE}=; Path=/; HttpOnly; Max-Age=0\`,
+      ],
     })
   }
 
