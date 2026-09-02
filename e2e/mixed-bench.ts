@@ -394,7 +394,10 @@ async function withHandoff(
     record.error = record.error ?? error.message
     return null
   })
-  record.relaySandboxSeconds = (Date.now() - raisedAt) / 1000
+  // Only when a relay actually came up: a handoff that never got one (the plan
+  // was full) burned wall clock, but it did not burn a sandbox.
+  record.relaySandboxSeconds =
+    record.event === null ? null : (Date.now() - raisedAt) / 1000
   record.outcome = result?.outcome ?? "throw"
   record.framesAtHuman = human?.frameCount() ?? null
   await human?.close().catch(() => undefined)
