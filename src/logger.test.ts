@@ -13,6 +13,7 @@ import {
   type Logger,
   noopLogger,
   quietLogger,
+  safeLogger,
 } from "./logger"
 
 /** The console methods, captured so a test can restore them. */
@@ -116,4 +117,94 @@ test("quietLogger drops debug/info but forwards warn/error — the library defau
   expect(err).toHaveLength(2)
   expect(err[0]?.parsed.event).toBe("w")
   expect(err[1]?.parsed.event).toBe("e")
+})
+
+// --- safeLogger ----------------------------------------------------------
+//
+// `Logger` is the caller's object, and the two ways it breaks that a plain
+// `try` does not cover are a method that is `async` — TypeScript accepts one
+// where the interface declares `void` — and a property that is a getter.
+
+test("safeLogger contains a logger whose methods reject", async () => {
+  // The gap a `try` cannot see: `debug(event, fields): void` accepts an
+  // `async` implementation, so the throw happens after `safeLogger` has
+  // already returned. The rejection then belongs to a promise nobody holds,
+  // and the runtime ends the process for that — mid-handoff, before the relay
+  // sandbox is released. `bun test` fails a test that leaves one behind, so
+  // the red signal here is this test failing with "log shipper is gone".
+  //
+  // Deliberately not inside `expect(...).not.toThrow()`: that wrapper marks
+  // rejections raised during the call as handled, which would hide exactly
+  // what is under test.
+  let calls = 0
+  const down = async (): Promise<never> => {
+    calls += 1
+    throw new Error("log shipper is gone (async)")
+  }
+  const rejecting: Logger = {
+    debug: down,
+    info: down,
+    warn: down,
+    error: down,
+  }
+  const safe = safeLogger(rejecting)
+
+  safe.debug("d", { a: 1 })
+  safe.info("i")
+  safe.warn("w")
+  safe.error("e")
+
+  // Long enough for the microtask queue to settle and for the loop turn on
+  // which an unhandled rejection is reported.
+  await Bun.sleep(50)
+  // The wrapper still calls the logger — containment is not silence.
+  expect(calls).toBe(4)
+})
+
+test("safeLogger survives a logger whose method is a throwing getter", () => {
+  // A proxy over a closed transport, or a class that builds its methods
+  // lazily: the throw happens on the property read, before any call.
+  const exploding = (): never => {
+    throw new Error("the sink was torn down")
+  }
+  const brokenGetters: Logger = {
+    get debug(): never {
+      return exploding()
+    },
+    get info(): never {
+      return exploding()
+    },
+    get warn(): never {
+      return exploding()
+    },
+    get error(): never {
+      return exploding()
+    },
+  }
+  const safe = safeLogger(brokenGetters)
+
+  expect(() => {
+    safe.debug("d")
+    safe.info("i")
+    safe.warn("w")
+    safe.error("e")
+  }).not.toThrow()
+})
+
+test("safeLogger still forwards to a working logger", () => {
+  // The containment above may not turn the wrapper into a second noopLogger.
+  const seen: string[] = []
+  const inner: Logger = {
+    debug: (event) => seen.push(`debug:${event}`),
+    info: (event) => seen.push(`info:${event}`),
+    warn: (event) => seen.push(`warn:${event}`),
+    error: (event) => seen.push(`error:${event}`),
+  }
+  const safe = safeLogger(inner)
+  safe.debug("d")
+  safe.info("i")
+  safe.warn("w")
+  safe.error("e")
+
+  expect(seen).toEqual(["debug:d", "info:i", "warn:w", "error:e"])
 })

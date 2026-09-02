@@ -632,17 +632,26 @@ function checkedMode(options: RaiseHandOptions): HandoffMode {
  * connected? `context()` is a field read and throws nothing in Playwright, so
  * it is `isClosed()` that catches a closed page; the try/catch is for the page
  * object that is not a working Playwright page at all.
+ *
+ * Every read is inside the `try` and every branch after it. A browser proxy —
+ * a remote-CDP wrapper, a pooled session, a page handed between processes —
+ * can throw from its liveness accessor too, and a plain `Error` out of the
+ * guard whose whole job is to produce `browser_unusable` would be the last
+ * uncoded rejection on this path.
  */
 function checkedPage(page: Page): void {
   let closed: boolean
-  let browser: Browser | null
+  let connected: boolean
   try {
     closed = page.isClosed()
-    browser = page.context().browser()
+    const browser: Browser | null = page.context().browser()
+    // A context with no browser is a persistent context: there is no session
+    // object to ask, and `isClosed()` above has already spoken for the page.
+    connected = browser?.isConnected() ?? true
   } catch (cause) {
     throw new HandraiseError(
       "browser_unusable",
-      `handraise: this page cannot be handed to a human — reading its state (page.isClosed(), page.context()) threw. A dead CDP connection does that, and so does a page-like object that is not a Playwright page. ${String(cause)}`,
+      `handraise: this page cannot be handed to a human — reading its state (page.isClosed(), page.context().browser().isConnected()) threw. A dead CDP connection does that, and so does a page-like object that is not a Playwright page. ${String(cause)}`,
       { cause },
     )
   }
@@ -652,7 +661,7 @@ function checkedPage(page: Page): void {
       "handraise: this page is already closed, so there is nothing for a human to take over. Open a new page (its `storageState` from an earlier handoff, if you kept it, restores the human's work) and retry.",
     )
   }
-  if (browser && !browser.isConnected()) {
+  if (!connected) {
     throw new HandraiseError(
       "browser_unusable",
       "handraise: the browser session behind this page is already disconnected, so there is nothing for a human to take over. Relaunch the session (its `storageState` from an earlier handoff, if you kept it, restores the human's work) and retry.",

@@ -86,10 +86,11 @@ export const quietLogger: Logger = {
 }
 
 /**
- * Wrap a logger so a throw from it can never end a handoff.
+ * Wrap a logger so a failure in it can never end a handoff.
  *
  * `Logger` is the caller's object: a pino instance over a closed transport, a
- * socket that went away, a sink that decided a field was unserialisable. Most
+ * socket that went away, a sink that decided a field was unserialisable, a
+ * shipper whose methods are `async` and reject. Most
  * of handraise's log calls sit inside a `catch` or a promise callback on the
  * failure path, where a throw would either escape `raiseHand` after a human
  * has already been shown the URL or reject a promise nobody is awaiting — and
@@ -103,7 +104,17 @@ export const quietLogger: Logger = {
 export function safeLogger(inner: Logger): Logger {
   const swallow = (write: () => void): void => {
     try {
-      write()
+      // Two throws to contain, not one. `write()` covers the synchronous
+      // throw *and* the throwing property getter, because the method is read
+      // inside this call. The declared return type is `void`, but TypeScript
+      // accepts an `async` method there, so what actually comes back may be a
+      // promise — one nobody holds, whose rejection ends the process. The
+      // handler below is attached in the same tick it is created, so the
+      // rejection is already spoken for before the runtime looks.
+      const result = write()
+      // `Promise.resolve` adopts a promise and wraps anything else, so a
+      // logger that returns `undefined` costs one resolved microtask.
+      Promise.resolve(result).catch(() => undefined)
     } catch {
       // Nothing to report this with — the reporter is what broke.
     }

@@ -111,12 +111,28 @@ function withToken(previewUrl: string, token: string | undefined): string {
 const TOKEN_PARAM = /pt_token\s*[=:]\s*[^&;\s"'<>]+/gi
 
 /**
- * The credential itself, wherever it appears — bare in prose ("invalid preview
- * token pt_…"), or behind a `%3D` that the parameter rule above cannot see.
+ * A `pt_`-prefixed value, wherever it appears. Kept for the identifiers that
+ * do carry that prefix; it is *not* the preview credential's shape.
  * Deliberately without `\b`: a percent-encoded `=` ends in a word character,
  * so a word boundary would not match there.
  */
 const TOKEN_VALUE = /pt_[A-Za-z0-9._~-]{16,}/g
+
+/**
+ * The credential's real grammar: three base64url segments separated by dots.
+ * The preview token is a ~362-character JWT
+ * (docs/measurements/01-preview-transport.md §3), so this is the rule that
+ * catches it bare in prose — "invalid preview token eyJhbGci…" — or behind a
+ * `%3D` neither rule above can see.
+ */
+const TOKEN_JWT = /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/g
+
+/**
+ * Short enough to be an accident rather than a credential. Blanking every
+ * occurrence of a two-character `token` would shred the message instead of
+ * redacting it, and an empty one would match everywhere.
+ */
+const MIN_TOKEN_LENGTH = 16
 
 /**
  * Take the preview token out of anything that becomes an error message.
@@ -125,14 +141,92 @@ const TOKEN_VALUE = /pt_[A-Za-z0-9._~-]{16,}/g
  * for the relay. A gateway or proxy that echoes the request URI in its error
  * body — a common default on 401 and 404, and common percent-encoded inside a
  * `?next=` parameter — would otherwise put that token into an exception
- * message, and exception messages end up in log aggregators. Two rules,
- * because the syntax around the credential varies and the credential does
- * not. Exported for `deploy.test.ts`.
+ * message, and exception messages end up in log aggregators.
+ *
+ * Pass `token` wherever the exact credential is known (it is, everywhere the
+ * URL is at hand): that value and its percent-encoded form are removed by
+ * comparison, which no proxy can outrun by inventing another way to quote it.
+ * The three patterns are the net for the text where it is not known — the
+ * credential's shape guessed from the outside, which is exactly the guess that
+ * once let a real token through. Exported for `deploy.test.ts`.
  */
-export function redactPreviewToken(text: string): string {
-  return text
+export function redactPreviewToken(text: string, token?: string): string {
+  let redacted = text
+  if (token !== undefined && token.length >= MIN_TOKEN_LENGTH) {
+    // A Set because a token made only of unreserved characters — a JWT is —
+    // encodes to itself, and replacing it twice would be busywork.
+    for (const form of new Set([token, encodeURIComponent(token)]))
+      redacted = redacted.replaceAll(form, "[redacted]")
+  }
+  return redacted
     .replace(TOKEN_PARAM, "pt_token=[redacted]")
     .replace(TOKEN_VALUE, "pt_[redacted]")
+    .replace(TOKEN_JWT, "[redacted]")
+}
+
+/**
+ * The credential this URL carries, so it can be redacted by value instead of
+ * by grammar. Returns nothing for a string that is not a URL: there is simply
+ * no known token then, and the patterns above still apply.
+ */
+function previewTokenOf(url: string): string | undefined {
+  try {
+    return new URL(url).searchParams.get("pt_token") ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The gateway's parsed error body. Named through the class that carries it
+ * because the SDK does not export the type on its own.
+ */
+type GatewayErrorBody = NonNullable<GatewayError["body"]>
+
+/** A `GatewayError` seen through the one field made of the gateway's own words. */
+interface WithBody {
+  body?: GatewayErrorBody
+}
+
+/**
+ * The same body with every string in it redacted, shape unchanged.
+ *
+ * Through JSON rather than field by field: `code`, `error` and `message` are
+ * what the type declares today, and the field a future gateway release puts
+ * the request URI in is the one worth covering in advance.
+ */
+function redactedBody(body: GatewayErrorBody): GatewayErrorBody {
+  // SAFETY: this re-parses text serialised one call earlier; redaction only
+  // ever replaces a run of characters inside a JSON string value, so the
+  // document is still the same shape.
+  return JSON.parse(
+    redactPreviewToken(JSON.stringify(body)),
+  ) as GatewayErrorBody
+}
+
+/**
+ * A copy of an SDK error with the credential out of everything the gateway
+ * wrote.
+ *
+ * `cause` exists so a caller keeps the original — `cause instanceof
+ * ConcurrencyLimitError`, `cause.status === 429` — so the copy keeps the
+ * prototype and every own field, and rewrites only the two made of foreign
+ * text: `message` and the parsed `body`. Without this, a clean outer message
+ * buys nothing: `console.error(error)`, pino's error serialiser and every
+ * crash reporter print the whole chain.
+ */
+function redactedCause(error: Error): Error {
+  // SAFETY: `Object.create` returns a new object with `error`'s own prototype,
+  // so it is an instance of the same class; its own fields are copied below.
+  const clone = Object.create(Object.getPrototypeOf(error)) as Error & WithBody
+  // Own enumerable fields — `name`, and on a `GatewayError` `status`, `code`
+  // and `body`. `message` and `stack` are own but not enumerable, which is why
+  // they are the two lines after it.
+  Object.assign(clone, error)
+  clone.message = redactPreviewToken(error.message)
+  if (error.stack !== undefined) clone.stack = redactPreviewToken(error.stack)
+  if (clone.body !== undefined) clone.body = redactedBody(clone.body)
+  return clone
 }
 
 /**
@@ -150,7 +244,7 @@ function relayStartError(cause: unknown): HandraiseError {
       redactPreviewToken(
         `handraise: your Solari account is at its concurrent session limit, so the relay sandbox that gives the handoff its public URL could not be created. Free a session and retry. (${cause.message})`,
       ),
-      { cause },
+      { cause: redactedCause(cause) },
     )
   }
   return new HandraiseError(
@@ -158,7 +252,7 @@ function relayStartError(cause: unknown): HandraiseError {
     redactPreviewToken(
       `handraise: the relay sandbox could not be started, so the handoff has no public URL and nobody has been asked for anything yet. ${String(cause)}`,
     ),
-    { cause },
+    { cause: cause instanceof Error ? redactedCause(cause) : cause },
   )
 }
 
@@ -226,7 +320,11 @@ export async function killSandbox(
     redactPreviewToken(
       `handraise: could not destroy the relay sandbox after ${budget} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
     ),
-    { cause: lastError },
+    // The SDK's error, with the gateway's own words redacted — `cause` is
+    // printed by every error serialiser that exists.
+    {
+      cause: lastError instanceof Error ? redactedCause(lastError) : lastError,
+    },
   )
 }
 
@@ -240,12 +338,24 @@ export async function waitForHealth(
   timeoutMs: number = READY_TIMEOUT_MS,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
+  // The one place the credential is known exactly: it is in the URL being
+  // polled. Everything foreign that reaches `lastAnswer` is redacted against
+  // that value, so the redaction does not depend on guessing the token's
+  // shape — the guess that let a real one through.
+  const token = previewTokenOf(healthUrl)
   // A deadline has no single cause, so what the URL last said is carried in
   // the message: "connection refused" and "502 from the preview proxy" are
-  // different problems with the same code. The loop always writes it before it
-  // checks the deadline; the initial value only satisfies definite assignment.
+  // different problems with the same code. The first attempt always writes it
+  // and only a failure leaves the loop, so the throw at the end always has a
+  // real one; the initial value below satisfies definite assignment.
   let lastAnswer = ""
-  for (;;) {
+  for (let attempt = 1; ; attempt++) {
+    const remaining = deadline - Date.now()
+    // The first attempt always runs: "did not answer" about a URL nobody asked
+    // would be a lie. Every attempt after it needs budget left, because a
+    // request that can only abort would replace the proxy's own answer — the
+    // one useful thing in the message — with "The operation timed out".
+    if (remaining <= 0 && attempt > 1) break
     try {
       const response = await fetch(healthUrl, {
         cache: "no-store",
@@ -255,7 +365,7 @@ export async function waitForHealth(
         // hold the loop open for minutes with a live sandbox burning its idle
         // window. The abort lands in the catch below and the deadline check
         // ends the loop.
-        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+        signal: AbortSignal.timeout(Math.max(1, remaining)),
       })
       const body = await response.text()
       if (response.ok && body === "ok") return
@@ -263,19 +373,19 @@ export async function waitForHealth(
       // the request URI would otherwise quote the live `pt_token` back at us.
       // Redacted before it is cut, so no slice can leave a partial credential
       // without its prefix.
-      lastAnswer = `HTTP ${response.status} ${redactPreviewToken(body).slice(0, 80)}`
+      lastAnswer = `HTTP ${response.status} ${redactPreviewToken(body, token).slice(0, 80)}`
     } catch (error) {
       // The port is not routable yet; the retry below is the whole mechanism.
-      lastAnswer = redactPreviewToken(String(error))
+      lastAnswer = redactPreviewToken(String(error), token)
     }
-    if (Date.now() >= deadline) {
-      throw new HandraiseError(
-        "relay_not_ready",
-        `handraise: the relay sandbox started but its public URL did not answer within ${timeoutMs}ms, so the handoff page would not have loaded on the phone. Last answer: ${lastAnswer}`,
-      )
-    }
+    if (Date.now() >= deadline) break
     await sleep(READY_POLL_MS)
   }
+  // The only way out of the loop: success returns from inside it.
+  throw new HandraiseError(
+    "relay_not_ready",
+    `handraise: the relay sandbox started but its public URL did not answer within ${timeoutMs}ms, so the handoff page would not have loaded on the phone. Last answer: ${lastAnswer}`,
+  )
 }
 
 /**

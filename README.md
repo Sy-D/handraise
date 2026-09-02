@@ -296,7 +296,10 @@ asked for anything yet. Everything after that is an `outcome`, never an
 exception. What it throws is a `HandraiseError` with a `code`: the code is the
 contract, the message is for whoever reads the log and may be reworded in any
 release. `isHandraiseError` narrows a `catch` binding, and `cause` keeps the
-original SDK, CDP or network error whenever there was one.
+original SDK, CDP or network error whenever there was one — the same class,
+`name`, `status` and `code`, with credentials redacted out of its `message` and
+its response body. Every error serialiser prints the whole chain, so a clean
+outer message on its own would not be worth much.
 
 The first thing `raiseHand` does is look at your page, before it creates
 anything: a page you have closed, or a browser you have disconnected, is
@@ -323,7 +326,7 @@ try {
 | `invalid_mode` | `mode` is neither `"takeover"` nor `"approval"`. | Fix the call. TypeScript already refuses it; this is for JavaScript callers. |
 | `empty_action` | `mode: "approval"` without a non-empty `action`. | Name the step the human says yes or no to. |
 | `browser_unusable` | The page is closed, or its browser has disconnected — checked before anything is created. | Open a new page or relaunch the session (restore `storageState` if you kept it) and retry. |
-| `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error. Retry. Nothing is left behind unless you also see `relay_release_failed` (below). |
+| `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error, redacted. Retry. Nothing is left behind unless you also see `relay_release_failed` (below). |
 | `concurrency_limit` | Your Solari account is at its concurrent session cap (429). | Free a session, or wait and retry. The one relay failure that is purely temporary. |
 | `relay_not_ready` | The sandbox started but its public URL never answered. | Retry. Persisting means the preview proxy or the region is unhealthy. |
 
