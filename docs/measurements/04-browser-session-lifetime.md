@@ -282,3 +282,29 @@ documented anywhere in the SDK, so it may be a plan-tier limit rather than a
 product-wide one. Before publishing any number in the README, confirm the cap
 with Solari — "we measured ~10 min on our plan" is defensible, "Solari browsers
 die after 10 min" is not.
+
+---
+
+## Addendum 2026-09-02 — re-measured after Solari's status fix
+
+Solari's changelog of Sep 1 ("Session status is accurate again") and Sep 2
+("`GET /sessions/:id` now reports `released` once a session is closed or
+deleted") postdate the runs above. The documented status set is
+`active | released | expired | unknown`; a session ended server-side should
+read `released`. Re-run at 11:20 UTC with
+[`scripts/measure-session-lifetime.ts`](../../scripts/measure-session-lifetime.ts),
+which adds a second status read at death + 5 min — past the documented
+~3.5 min orphan grace the first measurement did not wait for.
+
+| t | event | `GET /sessions/:id` |
+|---|---|---|
+| 1.9 s | launched, `expiresAt = createdAt + 5 h` | `200 {"status":"active"}` |
+| 608.4 s | `disconnected`, `isConnected() === false` | |
+| 609.3 s | read at death | `200 {"status":"active"}` |
+| 910.1 s | read at death + 5 min | `200 {"status":"active"}` |
+
+20 of 20 pings answered until the drop. Every status response was identical:
+`active`, same `wsEndpoint`/`cdpEndpoint`, same `expiresAt`. Both findings
+stand: the ~600 s lifetime is unchanged, and the fix for closed/deleted
+sessions does not cover a session the pool ends on its own. Tracked in
+[solari-cookbook#25](https://github.com/solari-sdk/solari-cookbook/issues/25).
