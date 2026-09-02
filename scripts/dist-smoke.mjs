@@ -8,6 +8,7 @@ const expected = [
   "raiseHand",
   "handoffQr",
   "scanQrLinks",
+  "createQrScanner",
   "OPENABLE_SCHEMES",
   "consoleLogger",
   "quietLogger",
@@ -60,6 +61,19 @@ if (links.length !== 1 || links[0].kind !== "url") {
   process.exit(1)
 }
 
+// The worker is a second build entry loaded by URL at runtime, so it is the
+// one part of this package that a bundler can drop without anything failing to
+// import. Under node, against dist/qr-worker.js, on a real screenshot.
+const scanner = m.createQrScanner()
+const offThread = await scanner.scan(shot)
+await scanner.close()
+if (offThread.length !== 1 || offThread[0].text !== links[0].text) {
+  console.error(
+    "dist smoke: the QR worker did not decode the fixture under node",
+  )
+  process.exit(1)
+}
+
 console.log(
-  `dist smoke ok — ${expected.length} exports, QR ${qr.split("\n").length} rows, decoded ${links[0].text.length} chars`,
+  `dist smoke ok — ${expected.length} exports, QR ${qr.split("\n").length} rows, decoded ${links[0].text.length} chars on the main thread and on the worker`,
 )

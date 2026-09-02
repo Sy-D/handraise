@@ -20,10 +20,11 @@
  *   - It classifies, it never opens. The agent process fetches nothing; the
  *     phone offers an "Open" button, and only for the schemes below.
  */
+import { Worker } from "node:worker_threads"
 import jsQR, { type QRCode } from "jsqr"
 import type { Page } from "playwright-core"
-
 import { decodePng, type RgbaImage } from "./png"
+import type { QrWorkerResult } from "./qr-worker"
 
 /**
  * Whether the phone may offer to open this, or only to copy it.
@@ -45,9 +46,17 @@ export interface ScannedLink {
  *
  * An allowlist and not a blocklist, because the interesting half of this list
  * is the half nobody thinks of: `javascript:` and `data:` are the two everyone
- * remembers, and `intent:`, `file:`, `content:` and whatever a phone browser
- * ships next year are the ones that would have got through a blocklist. The
- * four here are the ones a device-change QR actually uses.
+ * remembers, and `intent:`, `file:`, `content:`, `blob:` and whatever a phone
+ * browser ships next year are the ones a blocklist would have let through.
+ *
+ * Three, not five. `tel:` and `otpauth:` were on this list and are not any
+ * more: opening one hands a dialer a string that can be a USSD control
+ * sequence, and opening the other enrols an attacker-chosen secret in the
+ * human's authenticator. Both are one tap, both are hard to take back, and
+ * both come from a page nobody vetted. They are still decoded, still shown in
+ * full and still copyable — with a label that says what they are — and the
+ * human types or pastes them into the app that should have them. See
+ * docs/adr/0008-qr-passthrough.md.
  *
  * The phone checks this again before it builds the anchor. Two locks on one
  * door on purpose: the agent's `kind` travels over a socket the human's link
@@ -56,9 +65,7 @@ export interface ScannedLink {
 export const OPENABLE_SCHEMES: ReadonlySet<string> = new Set([
   "http:",
   "https:",
-  "tel:",
   "mailto:",
-  "otpauth:",
 ])
 
 /**
@@ -80,17 +87,24 @@ export const MAX_CODES = 2
 const SCREENSHOT_TIMEOUT_MS = 5_000
 
 /**
- * Whitespace, and everything below and around it in the code space.
+ * Characters that make a link read as something it is not.
  *
- * A link never needs any of it, and a payload that carries it is one trying to
- * look like something else: the URL parser silently drops a tab or a newline,
- * so what it validated and what the phone would show are two different
- * strings.
+ * Two families, one rule. Whitespace and the C0/C1 controls, because the URL
+ * parser silently deletes a tab or a newline and what it validated is then a
+ * different string from what a human reads. And the Unicode formatting
+ * controls, because they are invisible by design: a right-to-left override
+ * reverses the visible tail of a path, and a zero-width space hides inside a
+ * hostname. A link never needs any of them.
  */
 function hasUnsafeCharacter(text: string): boolean {
   for (const character of text) {
     const code = character.codePointAt(0) ?? 0
-    if (code <= 0x20 || code === 0x7f) return true
+    if (code <= 0x20 || (code >= 0x7f && code <= 0x9f)) return true
+    // Zero-width and bidi formatting: U+200B-U+200F, U+202A-U+202E,
+    // U+2066-U+2069.
+    if (code >= 0x200b && code <= 0x200f) return true
+    if (code >= 0x202a && code <= 0x202e) return true
+    if (code >= 0x2066 && code <= 0x2069) return true
   }
   return false
 }
@@ -169,6 +183,18 @@ function readRepeatedly(image: RgbaImage): string[] {
  * pixels for nothing (both decode the fixture; measured in docs/measurements/05-qr.md).
  */
 const MAGNIFY = 2
+
+/**
+ * The most pixels one retry pass may allocate.
+ *
+ * The 2x look costs four times the source, at four bytes a pixel — so a 4K
+ * screenshot (8.3 MP) becomes 33 MP and 133 MB of transient typed array. That
+ * is the largest thing worth spending on a retry: past it the pass is refused
+ * and the ladder moves on rather than the process taking a 500 MB step for a
+ * code it probably cannot read anyway. The plain first pass is not bounded by
+ * this — it is bounded by `MAX_PIXELS` in png.ts, at the decode.
+ */
+const MAX_SCAN_PIXELS = 40_000_000
 
 /**
  * Look again, twice the size.
@@ -263,8 +289,10 @@ function readTiles(image: RgbaImage): string[] {
 export function scanImage(image: RgbaImage): string[] {
   const whole = readRepeatedly(image)
   if (whole.length > 0) return whole
-  const bigger = readRepeatedly(magnify(image, MAGNIFY))
-  if (bigger.length > 0) return bigger
+  if (image.width * image.height * MAGNIFY * MAGNIFY <= MAX_SCAN_PIXELS) {
+    const bigger = readRepeatedly(magnify(image, MAGNIFY))
+    if (bigger.length > 0) return bigger
+  }
   return readTiles(image)
 }
 
@@ -278,13 +306,132 @@ export function scanQrLinks(screenshot: Buffer): ScannedLink[] {
  *
  * A new screenshot rather than the newest cast frame: the cast is scaled to
  * 800px wide and encoded at JPEG quality 60, a profile chosen for reading a
- * login form and one that destroys a dense symbol's modules. PNG rather than JPEG for
- * the same reason — the decoder wants edges, not a small file.
+ * login form and one that destroys a dense symbol's modules. PNG rather than
+ * JPEG for the same reason — the decoder wants edges, not a small file.
+ *
+ * The decode itself goes to `scanner`, which owns a worker thread: the
+ * screenshot is a CDP round trip and yields, but the decode is pure CPU and
+ * would otherwise stall the agent's loop for as long as it takes.
  */
-export async function scanPageForLinks(page: Page): Promise<ScannedLink[]> {
+export async function scanPageForLinks(
+  page: Page,
+  scanner: QrScanner,
+): Promise<ScannedLink[]> {
   const shot = await page.screenshot({
     type: "png",
     timeout: SCREENSHOT_TIMEOUT_MS,
   })
-  return scanQrLinks(shot)
+  return scanner.scan(shot)
+}
+
+/**
+ * A decoder on a thread of its own, for one handoff.
+ *
+ * The worker starts on the first scan and not before — most handoffs never
+ * scan anything, and a thread nobody uses still costs a megabyte and a
+ * startup. It is reused for every later scan of the same handoff, and
+ * `close()` at settle is what keeps it from outliving one.
+ */
+export interface QrScanner {
+  /** Decode one PNG. Rejects on a refusal, a worker failure, or the deadline. */
+  scan(png: Buffer): Promise<ScannedLink[]>
+  /** Stop the worker. Idempotent, never throws, safe from a `finally`. */
+  close(): Promise<void>
+}
+
+/**
+ * How long one decode may take before the worker is assumed lost.
+ *
+ * The measured worst case is well under a second (docs/measurements/05-qr.md).
+ * Three seconds is the point past which something is wrong rather than slow,
+ * and terminating is the only lever there is over a worker that has stopped
+ * answering — which is exactly why the work is over there.
+ */
+const DECODE_TIMEOUT_MS = 3_000
+
+/**
+ * Where the worker's code is, in a source tree and in a published package.
+ *
+ * `import.meta.url` is this file under bun and `dist/index.js` in the bundle,
+ * and the worker sits beside each of them under its own extension. A consumer
+ * who re-bundles handraise has to keep `qr-worker.js` next to the entry it is
+ * resolved from; that is the cost of a worker being a file rather than a
+ * function.
+ */
+function workerUrl(): URL {
+  const here = import.meta.url
+  const file = here.endsWith(".ts") ? "./qr-worker.ts" : "./qr-worker.js"
+  return new URL(file, here)
+}
+
+/** Start a decoder for one handoff. The worker itself is lazy. */
+export function createQrScanner(): QrScanner {
+  let worker: Worker | null = null
+  let closed = false
+
+  const start = (): Worker => {
+    const started = new Worker(workerUrl())
+    // A pool of one, and nothing else in the process waits on it: an idle
+    // worker must not be the reason a script does not exit.
+    started.unref()
+    return started
+  }
+
+  return {
+    scan(png) {
+      if (closed) return Promise.reject(new Error("handraise: scanner closed"))
+      if (!worker) worker = start()
+      const live = worker
+      return new Promise<ScannedLink[]>((resolve, reject) => {
+        const detach = (): void => {
+          clearTimeout(timer)
+          live.off("message", onMessage)
+          live.off("error", onError)
+          live.off("exit", onExit)
+        }
+        const onMessage = (result: QrWorkerResult): void => {
+          detach()
+          if (result.error) reject(new Error(result.error))
+          else resolve(result.links ?? [])
+        }
+        const onError = (error: Error): void => {
+          detach()
+          reject(error)
+        }
+        const onExit = (code: number): void => {
+          detach()
+          // A worker that exited took this answer with it, and it will not be
+          // there for the next scan either.
+          worker = null
+          reject(new Error(`handraise: the QR worker exited with ${code}`))
+        }
+        const timer = setTimeout(() => {
+          detach()
+          worker = null
+          void live.terminate()
+          reject(
+            new Error(
+              `handraise: the QR decode took over ${DECODE_TIMEOUT_MS}ms`,
+            ),
+          )
+        }, DECODE_TIMEOUT_MS)
+        timer.unref?.()
+        live.on("message", onMessage)
+        live.on("error", onError)
+        live.on("exit", onExit)
+        // Transferred, not copied: a screenshot is megabytes, and this is the
+        // one place the whole of it crosses a thread boundary.
+        const bytes = new Uint8Array(png)
+        live.postMessage(bytes, [bytes.buffer])
+      })
+    },
+
+    async close() {
+      closed = true
+      const live = worker
+      worker = null
+      if (!live) return
+      await live.terminate().catch(() => undefined)
+    },
+  }
 }

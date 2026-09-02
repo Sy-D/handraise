@@ -149,25 +149,31 @@ test("the same code is not reported twice", async () => {
 
 // --- what the phone may open ----------------------------------------------
 
-test("the openable schemes are the ones a device-change code uses", () => {
-  expect([...OPENABLE_SCHEMES].sort()).toEqual([
-    "http:",
-    "https:",
-    "mailto:",
-    "otpauth:",
-    "tel:",
-  ])
+test("only the three web schemes are openable", () => {
+  expect([...OPENABLE_SCHEMES].sort()).toEqual(["http:", "https:", "mailto:"])
 })
 
 test("a link in an openable scheme is a url", () => {
   for (const text of [
     "https://example.com/verify?token=abc",
     "http://192.168.0.4:8080/pair",
-    "tel:+4915112345678",
     "mailto:help@example.com",
-    "otpauth://totp/Example:ada?secret=JBSWY3DPEHPK3PXP&issuer=Example",
   ]) {
     expect(classifyLink(text)).toEqual({ text, kind: "url" })
+  }
+})
+
+test("a dialer string and an authenticator secret are shown, never opened", () => {
+  // Both are one tap, both are hard to take back, and both came off a page
+  // nobody vetted: `tel:` can carry a USSD control sequence and `otpauth:`
+  // enrols a secret in the human's authenticator. They stay decoded and
+  // copyable; the phone labels them and the human types them where they go.
+  for (const text of [
+    "tel:+4915112345678",
+    "tel:*21*1234567890%23",
+    "otpauth://totp/Example:ada?secret=JBSWY3DPEHPK3PXP&issuer=Example",
+  ]) {
+    expect(classifyLink(text)).toEqual({ text, kind: "text" })
   }
 })
 

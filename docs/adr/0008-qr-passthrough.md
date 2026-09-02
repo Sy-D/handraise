@@ -72,6 +72,24 @@ a live handoff, and is not told the handoff URL it came from.
 the human's, in their own browser. An agent process that followed a URL out of
 a hostile page would be an SSRF primitive with the agent's own network position.
 
+**And it never blocks on the decode.** The PNG decode plus up to three `jsQR`
+passes is pure synchronous CPU: on a 3840x2160 screenshot it held the event
+loop for **2132 ms, during which a 5 ms heartbeat did not tick once**
+(measured, §6). That loop is the frame pump, the human's handback, the timeout
+and the browser's disconnect. So the work runs in a worker thread —
+`dist/qr-worker.js`, started at the first scan of a handoff, terminated when it
+settles — and the same decode costs the loop one millisecond. The worker also
+buys the only lever there is over a decode that will not finish: a three-second
+deadline and `terminate()`.
+
+**Every size is bounded before anything is allocated.** A PNG's header is the
+only part of it that is cheap to believe, and everything downstream is sized
+from it, so it is checked first: 8192 pixels a side, 33 megapixels in total, 32
+MB of compressed image data, and the exact inflated length the header implies
+passed to `inflateSync` as `maxOutputLength` and then required to match. The 2x
+retry allocates four times the source, so it is refused above 40 megapixels
+rather than taking a half-gigabyte step for a code it probably cannot read.
+
 Takeover only. An approval is one screenshot of a moment, not a live page —
 there is nothing to scan and nothing a scan could change.
 
@@ -146,26 +164,40 @@ real cloud-browser screenshot.
   payload. Copy takes the same string. Nothing is truncated, so the argument
   above still holds; it just stopped being false.
 
-- **Two of the five schemes deserve naming.** `tel:` accepts USSD
-  (`tel:*21*1234567890%23` classifies as openable), and while current Android
-  dialers make the human press call for those, this is the one entry whose
-  worst case is a device setting rather than a page. `otpauth:` enrols an
-  attacker-chosen TOTP secret in the human's authenticator — which is the
-  feature working exactly as designed, and exactly what a phisher wants from
-  it. Both stay on the list because a device-change flow genuinely uses them,
-  and both are on it knowingly.
+- **`tel:` and `otpauth:` are not openable, and that is a reversal.** They were
+  on the allowlist because a device-change flow genuinely uses them. They are
+  off it because both are *actions* rather than pages, and both are one tap:
+  `tel:*21*1234567890%23` is a call-forwarding sequence handed to a dialler,
+  and an `otpauth:` URI enrols an attacker-chosen TOTP secret in the human's
+  authenticator — the feature working exactly as designed, and exactly what a
+  phisher wants from it. Neither is worth a tap taken from a page nobody
+  vetted. They are still decoded, still shown in full and still copyable, under
+  a label that says what they are ("Phone number", "Authenticator secret") so
+  the human hands them to the right app deliberately. Only `http`, `https` and
+  `mailto` keep an Open button.
 
-- **The decode blocks the event loop.** `scanImage` is synchronous, up to three
-  passes, about 320 ms of CPU on the path that finds nothing — and the frame
-  pump shares that loop, so the cast to the phone stalls for exactly that long
-  once per scan. Acceptable because a scan is a deliberate, rate-limited act by
-  a human who is looking at a still page; if scanning ever becomes automatic it
-  has to move off the loop first.
+- **The decode no longer blocks the event loop, and `scanQrLinks` still does.**
+  The exported function is synchronous by design — a caller's own thread is
+  their business — and the handoff path uses `createQrScanner()`, which is the
+  same decode on a worker. Both are exported; the ADR's argument only covers
+  the second.
+- **A worker is a file, not a function.** `dist/qr-worker.js` is resolved at
+  runtime with `new URL("./qr-worker.js", import.meta.url)`, so a consumer who
+  re-bundles handraise has to keep it next to the entry it resolves from. The
+  dist smoke runs the worker under node against the shipped artifact, because
+  this is the one part of the package a bundler can silently drop.
 
-- **`jsqr` is a bet, not just a dependency.** 1.4.0 is the last release
-  (January 2021) and `cozmo/jsQR` is archived. It is taken knowingly: zero
-  transitive dependencies, Apache-2.0, pure JavaScript with no `eval`, so a bad
-  decode is a crash or a stall and never an execution primitive. The alternative
-  QR decoders in the ecosystem are WASM or native, which trades an archived
-  dependency for a build step on every platform an agent runs on. If it has to
-  be replaced, `scanImage` is the only seam.
+- **`jsqr` is a bet, not just a dependency**, and it is pinned to exactly
+  `1.4.0` rather than a range. That release is from January 2021 and
+  `cozmo/jsQR` is archived. The bet is taken knowingly: zero transitive
+  dependencies, Apache-2.0, pure JavaScript with no `eval`, so a bad decode is
+  a crash or a stall and never an execution primitive — and it now runs in a
+  worker, where a stall is a terminated thread. The alternatives in the
+  ecosystem are WASM or native, which trades an archived dependency for a build
+  step on every platform an agent runs on.
+
+  **What would trigger a fork or a replacement:** a decode that is wrong rather
+  than absent (a payload that is not what the symbol encodes), a crash that the
+  worker deadline cannot contain, or a CVE. The committed fixtures and the dist
+  smoke are the corpus a fork would have to keep passing, and `scanImage` is
+  the only seam it would have to fit.

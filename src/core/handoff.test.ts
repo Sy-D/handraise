@@ -1823,6 +1823,46 @@ test("a second scan inside the rate limit is dropped, not queued", async () => {
   expect(screenshots).toBe(1)
 })
 
+test("a scan that lands after the handoff ended is not counted or sent", async () => {
+  // A screenshot is a CDP round trip and the human can hand back while it is
+  // in flight. What comes back cannot be delivered — the phone has already
+  // been told it is over — so it is not a scan that happened, and the wide
+  // event must not claim one. The event is built after the scan task is
+  // awaited, so the counters it reads are final.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 400, 0, QR_PAGE_PNG),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "The site wants this code scanned with a phone",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "qr-settle-race",
+    relayColdStartMs: 12,
+    logger: noopLogger,
+  })
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+
+  human.send({ type: "scanqr" })
+  // Inside the 400 ms the fake page holds the screenshot for.
+  await Bun.sleep(120)
+  human.send({ type: "handback" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  expect(linksSeen(human.inbox)).toHaveLength(0)
+  expect(events[0]?.qrScans).toBe(0)
+  expect(events[0]?.qrHits).toBe(0)
+})
+
 test("an approval never scans, whatever the phone sends", async () => {
   const port = await startRelayProcess("approval")
   const human = await connectHuman(port)

@@ -77,13 +77,18 @@ const MODE = { TAKEOVER: "takeover", APPROVAL: "approval" }
  * The URL schemes the page may offer an "Open" button for, from a QR code the
  * agent read off whatever site it got stuck on.
  *
+ * Three. `tel:` and `otpauth:` are deliberately not here: opening one hands a
+ * dialler a string that can be a control sequence, and opening the other
+ * enrols an attacker-chosen secret in an authenticator. Both are shown and
+ * copyable with a label that says what they are.
+ *
  * The agent classifies each link before it sends it, and the page checks the
  * scheme again against this list. Both locks are needed: the human's link is a
  * bearer URL and the socket behind it is reachable from any HTTP client, so
  * `kind: "url"` is a hint the page must not have to trust. Asserted equal to
  * `OPENABLE_SCHEMES` in src/core/qr-scan.ts by relay.test.ts.
  */
-const OPENABLE_SCHEMES = ["http:", "https:", "tel:", "mailto:", "otpauth:"]
+const OPENABLE_SCHEMES = ["http:", "https:", "mailto:"]
 
 /**
  * What this handoff asks of the human: `takeover` (drive the page) or
@@ -130,6 +135,29 @@ const OP_PONG = 0xa
 /** A screencast frame is ~12-65 KB of base64; anything past this is a bug or an attack. */
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
+/**
+ * The ceiling for a message from the human, which is a different number
+ * entirely.
+ *
+ * Every message this side may send is a handful of fields — a tap is two
+ * integers, the longest is one character of text — so four kilobytes is
+ * already a thousandfold of what any of them needs. The agent's frames are the
+ * reason the cap above is megabytes; a bearer-link holder padding an accepted
+ * `scanqr` to eight of them is the reason this one is not. Enforced in the
+ * reader, before anything is parsed.
+ */
+const MAX_HUMAN_MESSAGE_BYTES = 4 * 1024
+
+/**
+ * The relay's own floor between two scans, in milliseconds.
+ *
+ * The core enforces this too and its copy is the one that protects the
+ * browser. This one protects the relay and the agent's socket: a burst of
+ * accepted `scanqr` objects still costs a forward, a parse on the other side
+ * and a wake-up each, and none of that is the core's to refuse.
+ */
+const SCAN_INTERVAL_MS = 2000
+
 /** Grace before a replaced/closed socket is force-destroyed if it hangs on. */
 const CLOSE_GRACE_MS = 1000
 
@@ -169,6 +197,9 @@ let pendingForAgent = null
  */
 let humanEnded = false
 
+/** When the relay last forwarded a `scanqr`. See SCAN_INTERVAL_MS. */
+let lastScanAt = 0
+
 /**
  * Forget everything that shows the remote page. Not the ending, which a late
  * human still has to be told, and not a human answer still waiting for its
@@ -205,7 +236,7 @@ function encodeFrame(payload, opcode) {
  * frames and fragmentation (browsers do not fragment, but proxies may).
  * `onMessage(payload, opcode)` fires once per complete application message.
  */
-function createReader(onMessage, onPing, onClose) {
+function createReader(onMessage, onPing, onClose, maxBytes) {
   let buffered = Buffer.alloc(0)
   let fragments = []
   let fragmentBytes = 0
@@ -229,7 +260,7 @@ function createReader(onMessage, onPing, onClose) {
         length = Number(buffered.readBigUInt64BE(2))
         offset = 10
       }
-      if (length > MAX_MESSAGE_BYTES) {
+      if (length > maxBytes) {
         onClose()
         return
       }
@@ -263,7 +294,7 @@ function createReader(onMessage, onPing, onClose) {
       // Per-frame length is capped above, but a stream of small continuation
       // frames that never sets fin would grow `fragments` without bound (60 MB
       // reassembled to 148 MB, verified). Cap the running sum too.
-      if (fragmentBytes > MAX_MESSAGE_BYTES) {
+      if (fragmentBytes > maxBytes) {
         onClose()
         return
       }
@@ -299,7 +330,13 @@ function closePeer(peer, reason) {
   // up on it after two seconds), so the scrub cannot wait for it. A handoff
   // that is still running restores this by itself: every agent reconnect
   // re-sends its state, and in approval mode its screenshot.
-  if (peer.role === "agent") forgetPage()
+  if (peer.role === "agent") {
+    forgetPage()
+    // An agent that is gone will never drain, so its backpressure must not be
+    // what keeps the human muted: the handback they are about to send has to
+    // be read, held, and given to whichever agent connects next.
+    resumeHuman()
+  }
   // Detach the reader so a replaced client that ignores the close frame can no
   // longer feed route(); a lingering listener is how a peer keeps injecting.
   if (peer.read) peer.socket.removeListener("data", peer.read)
@@ -381,6 +418,19 @@ function acceptFromHuman(type, payload) {
     logDrop(type)
     return false
   }
+  // The scan floor, enforced here as well as in the core. The core's copy is
+  // what protects the browser from a screenshot loop; this one keeps a burst of
+  // accepted scans from costing a forward, a wake-up and a JSON parse on the
+  // agent's side for each one. Dropped, never queued: a scan is only worth
+  // anything against the page as it is now.
+  if (type === MSG.SCANQR) {
+    const now = Date.now()
+    if (now - lastScanAt < SCAN_INTERVAL_MS) {
+      logDrop(type)
+      return false
+    }
+    lastScanAt = now
+  }
   if (TERMINAL_HUMAN.has(type)) {
     // The human is done, for good. Buffer this for an agent that is
     // mid-reconnect, and stop replaying the last (logged-in) frame.
@@ -414,6 +464,35 @@ function route(peer, payload, opcode) {
   // than queue it in memory. Control and terminal messages are never dropped.
   if (type === MSG.FRAME && other?.backpressure) return
   write(other, payload, opcode)
+  // The human is producing faster than the agent's socket can take it. Stop
+  // reading that socket rather than growing this process's write queue with
+  // input nobody has asked for yet: TCP holds it, and the agent's `drain`
+  // starts it again. The message just written is not held back, so a handback
+  // or an abort is delivered and the pause happens behind it.
+  if (peer.role === "human" && other?.backpressure) holdHuman(peer)
+}
+
+/**
+ * Stop reading a human socket until the agent's has drained.
+ *
+ * Not a drop. Everything already read has been routed, and everything still in
+ * flight is where TCP is best at holding it. `resumeHuman` runs on the agent's
+ * `drain` and again when the agent goes away entirely, so a human is never
+ * left muted by a peer that is not coming back.
+ */
+function holdHuman(peer) {
+  if (peer.paused) return
+  peer.paused = true
+  peer.socket.pause()
+  log("human paused", { reason: "agent backpressure" })
+}
+
+function resumeHuman() {
+  const human = peers.get("human")
+  if (!human?.paused) return
+  human.paused = false
+  human.socket.resume()
+  log("human resumed", {})
 }
 
 function log(event, detail) {
@@ -525,7 +604,14 @@ server.on("upgrade", (req, socket, head) => {
   const previous = peers.get(role)
   if (previous) closePeer(previous, "replaced")
 
-  const peer = { role, socket, open: true, backpressure: false }
+  const peer = {
+    role,
+    socket,
+    open: true,
+    backpressure: false,
+    // Human only: set while its socket is held for a backpressured agent.
+    paused: false,
+  }
   peers.set(role, peer)
   log("peer connected", { role })
 
@@ -533,12 +619,15 @@ server.on("upgrade", (req, socket, head) => {
     (payload, opcode) => route(peer, payload, opcode),
     (payload) => write(peer, payload, OP_PONG),
     () => closePeer(peer, "peer closed the socket"),
+    role === "human" ? MAX_HUMAN_MESSAGE_BYTES : MAX_MESSAGE_BYTES,
   )
   peer.read = read
   if (head?.length) read(head)
   socket.on("data", read)
   socket.on("drain", () => {
     peer.backpressure = false
+    // The agent can take input again, so the human may speak again.
+    if (peer.role === "agent") resumeHuman()
   })
   socket.on("error", () => closePeer(peer, "socket error"))
   socket.on("close", () => closePeer(peer, "socket closed"))
@@ -1030,6 +1119,10 @@ const PAGE = `<!doctype html>
     color: var(--text);
     overflow-wrap: anywhere;
   }
+  /* The host is the one word that answers "whose site is this". The rest of a
+     URL is a token nobody reads, so it stays muted and the host does not. */
+  .link-host { color: var(--text); font-weight: 600; }
+  .link-text > span:not(.link-host) { color: var(--muted); }
   .link-note { margin: 0; font-size: 12px; color: var(--muted); }
   .link-actions { display: flex; gap: 8px; }
   /* Same box for the anchor and the button, so the row does not shift by a
@@ -1978,7 +2071,13 @@ const PAGE = `<!doctype html>
   function hasUnsafeCharacter(value) {
     for (var i = 0; i < value.length; i++) {
       var code = value.charCodeAt(i)
-      if (code <= 0x20 || code === 0x7f) return true
+      if (code <= 0x20 || (code >= 0x7f && code <= 0x9f)) return true
+      // Invisible by design: zero-width joiners and the bidi overrides and
+      // isolates. A right-to-left override reverses the visible tail of a
+      // path, and nothing on the screen says it happened.
+      if (code >= 0x200b && code <= 0x200f) return true
+      if (code >= 0x202a && code <= 0x202e) return true
+      if (code >= 0x2066 && code <= 0x2069) return true
     }
     return false
   }
@@ -2017,9 +2116,35 @@ const PAGE = `<!doctype html>
    * Nothing is truncated; the whole link is still on the screen.
    */
   function resolveLink(link) {
-    if (!openable(link)) return { shown: link.text, changed: false }
-    var href = new URL(link.text).href
-    return { shown: href, changed: href !== link.text }
+    if (!openable(link)) return { shown: link.text, changed: false, host: "" }
+    var url = new URL(link.text)
+    return {
+      shown: url.href,
+      changed: url.href !== link.text,
+      // The ASCII host, which is the one the browser will connect to and the
+      // one word on the card worth reading before tapping Open.
+      host: url.host
+    }
+  }
+
+  /**
+   * What a payload is, when it is not something this page will open.
+   *
+   * Two of them are actions rather than pages and are named as such, because
+   * "not a link" says nothing useful about a phone number or an authenticator
+   * secret — and because both are things a human should hand to an app
+   * deliberately rather than in one tap from a page nobody vetted.
+   */
+  function describePayload(text) {
+    var scheme = ""
+    try { scheme = new URL(text).protocol } catch (err) { scheme = "" }
+    if (scheme === "tel:") {
+      return "Phone number. Copy it and dial it yourself — a code like this can carry dialler commands."
+    }
+    if (scheme === "otpauth:") {
+      return "Authenticator secret. Add it by hand, and never from a page you did not expect to see it on."
+    }
+    return "Not a link this page will open. Copy it instead."
   }
 
   function actionButton(label, run) {
@@ -2062,7 +2187,24 @@ const PAGE = `<!doctype html>
     var resolved = resolveLink(link)
     var text = document.createElement("p")
     text.className = "link-text"
-    text.textContent = resolved.shown
+    // The host, drawn as the loud part. Everything else in a URL is noise to
+    // the one question a human is answering — whose site is this — and on a
+    // 390px screen the host is otherwise a few characters lost in a token.
+    var split = resolved.host ? resolved.shown.indexOf(resolved.host) : -1
+    if (split === -1) {
+      text.textContent = resolved.shown
+    } else {
+      var before = document.createElement("span")
+      before.textContent = resolved.shown.slice(0, split)
+      var host = document.createElement("span")
+      host.className = "link-host"
+      host.textContent = resolved.host
+      var after = document.createElement("span")
+      after.textContent = resolved.shown.slice(split + resolved.host.length)
+      text.appendChild(before)
+      text.appendChild(host)
+      text.appendChild(after)
+    }
     card.appendChild(text)
     var actions = document.createElement("div")
     actions.className = "link-actions"
@@ -2084,7 +2226,7 @@ const PAGE = `<!doctype html>
       open.textContent = "Open in new tab"
       actions.appendChild(open)
     } else {
-      linkNote(card, "Not a link this page will open. Copy it instead.")
+      linkNote(card, describePayload(link.text))
     }
     // Copy takes what is on the card, so what a human pastes elsewhere is the
     // address they read here and not the one the code smuggled.

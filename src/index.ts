@@ -29,8 +29,10 @@ export type {
   TakeoverChannelHandoff,
 } from "./channels"
 export {
+  createQrScanner,
   type LinkKind,
   OPENABLE_SCHEMES,
+  type QrScanner,
   type ScannedLink,
   scanQrLinks,
 } from "./core/qr-scan"

@@ -28,17 +28,31 @@ returning `disconnected`. Both are under **Changed**.
   `{ type: "links", links: ScannedLink[], source: "qr" }` — always sent, with
   an empty list when nothing decoded, because silence reads as a broken button.
   The relay routes `scanqr` in takeover mode only.
-- **`scanQrLinks(png)` and `OPENABLE_SCHEMES` are exported.** The decoder is
-  usable without a human: hand it a PNG screenshot, get back up to two
-  `{ text, kind }`. `kind` is `"url"` only for `http:`, `https:`, `tel:`,
-  `mailto:` and `otpauth:` with no control characters and no credentials in the
-  authority; everything else is `"text"` with a Copy button and no anchor. The
-  phone applies that whole rule again itself rather than trusting a label that
+- **`scanQrLinks(png)`, `createQrScanner()` and `OPENABLE_SCHEMES` are
+  exported.** The decoder is usable without a human: hand it a PNG screenshot,
+  get back up to two `{ text, kind }`. `scanQrLinks` is synchronous;
+  `createQrScanner()` is the same decode on a worker thread, which is what a
+  handoff uses — measured, a 4K screenshot held the event loop for 2132 ms and
+  now holds it for 1 ms.
+- **`kind` is `"url"` only for `http:`, `https:` and `mailto:`**, with no
+  control or bidi characters and no credentials in the authority. `tel:` and
+  `otpauth:` were openable in earlier drafts of this release and are not: a
+  dialler control sequence and an authenticator enrolment are actions rather
+  than pages, and neither is worth one tap from a page nobody vetted. They are
+  still decoded, shown in full and copyable, under a label that names them.
+- **The phone applies that whole rule again** rather than trusting a label that
   crossed a socket a stranger holding the link can write to, and an openable
-  link is displayed, anchored and copied as the address it resolves to — so a
-  homograph host or a right-to-left override cannot show one address and open
-  another. The PNG decoder bounds its own inflate by the size the header
-  promised, so a crafted image cannot allocate a gigabyte.
+  link is displayed, anchored and copied as the address it resolves to, with
+  the host as the loud part — so a homograph host cannot show one address and
+  open another.
+- **The PNG decoder refuses what it cannot have produced.** Dimensions,
+  compressed size and the exact inflated length are all bounded by the header
+  before a byte is decompressed, chunk boundaries are walked, and IEND is
+  required. CRCs are deliberately not checked, and the ADR says why.
+- **The relay bounds its own ingress**: 4 KiB per human message enforced before
+  the parse, the scan floor enforced there as well as in the core, and the
+  human socket held while the agent's is backpressured — with terminal answers
+  delivered first, never dropped.
 - **`HandoffEvent.qrScans` and `HandoffEvent.qrHits`.** Two new **required**
   number fields on the wide event — additive for callers, who receive the
   event rather than construct it, but a TypeScript consumer that builds a

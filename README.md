@@ -232,21 +232,24 @@ or zoom the remote page and scan again.
 
 The code came off a page nobody vetted, so:
 
-- Only `http`, `https`, `tel:`, `mailto:` and `otpauth:` are openable. Anything
-  else — including `javascript:` and `data:` — is shown as text with a Copy
-  button and no link. The agent classifies it and the phone checks it again,
-  because the handoff URL is a bearer credential and the socket behind it takes
-  messages from anyone holding it.
-- An openable link is shown **as the address it opens**, not as the payload:
-  punycode host, percent-encoded overrides, and a note when the two differ.
-  `https://аpple.com` with a Cyrillic а reads as apple.com and goes somewhere
-  else, and a human deciding whether to tap Open has to be looking at the real
-  one.
-- The agent process never fetches any of it. Opening is the human's act, in
-  their own browser.
-- `tel:` can carry a USSD code and `otpauth:` enrols a TOTP secret. Both are on
-  the list because device-change flows use them, and both are worth knowing
-  about before you tap.
+- Only `http`, `https` and `mailto:` get an **Open** button. Everything else —
+  `javascript:`, `data:`, `blob:`, `content:`, and anything carrying an
+  invisible character — is shown as text with a Copy button and no link. The
+  agent classifies it and the phone applies the same rule again, because the
+  handoff URL is a bearer credential and the socket behind it takes messages
+  from anyone holding it.
+- **`tel:` and `otpauth:` are shown and copyable, never opened.** A `tel:` code
+  can carry a dialler control sequence, and an `otpauth:` code enrols a TOTP
+  secret in your authenticator. Both are one tap and hard to take back, so the
+  sheet names them ("Phone number", "Authenticator secret") and you hand them
+  to the right app yourself.
+- An openable link is shown **as the address it opens**, with the host as the
+  loud part of it. `https://аpple.com` with a Cyrillic а reads as apple.com and
+  goes to `xn--pple-43d.com`; the sheet shows the second one and says the code
+  wrote it differently.
+- The agent process never fetches any of it, and never decodes on its own event
+  loop: the decode runs on a worker thread, so a handoff stays answerable while
+  it happens.
 
 Measured: [`docs/measurements/05-qr.md`](docs/measurements/05-qr.md); the
 decisions are in [ADR 0008](docs/adr/0008-qr-passthrough.md).

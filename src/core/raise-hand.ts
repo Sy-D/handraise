@@ -39,7 +39,7 @@ import type {
 import { notifyWebhook } from "../webhook"
 import { NO_FOCUS, probeFocus } from "./focus"
 import { createInputTarget } from "./input"
-import { scanPageForLinks } from "./qr-scan"
+import { createQrScanner, scanPageForLinks } from "./qr-scan"
 import { DEFAULT_PROFILE, type FramePump, startFramePump } from "./screencast"
 import { type ApprovalFrame, captureApprovalFrame } from "./snapshot"
 import { connectRelay, type RelayConnection } from "./socket"
@@ -385,35 +385,48 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       })
   }
 
-  // What the phone asked for and what came back, for the wide event.
+  /**
+   * Scans the human asked for and answers they were actually sent.
+   *
+   * Both count delivered results, not attempts: a scan whose answer is thrown
+   * away because the handoff settled while it was in flight is not something
+   * anybody was told, and the event is built after the counters are frozen so
+   * it cannot report a number that changed afterwards.
+   */
   let qrScans = 0
   let qrHits = 0
   // One scan at a time, and never two inside the interval. A scan costs a
   // full-resolution screenshot of a page that is already casting to a phone,
   // so a held button must not be able to turn into a screenshot loop. The
-  // phone enforces the same floor; this is the one that counts, because the
-  // socket behind the handoff URL is reachable from any HTTP client.
+  // phone and the relay enforce the same floor; this is the one that counts,
+  // because the socket behind the handoff URL is reachable from any HTTP client.
   let scanning = false
   let lastScanAt = 0
+  // The decode runs on a worker thread. The scanner object is free — it starts
+  // no thread until the first scan — so it is made here and closed at
+  // teardown unconditionally. `scanTask` is the handle teardown waits on, so a
+  // decode is never still running against a page the caller has moved on from.
+  const scanner = createQrScanner()
+  let scanTask: Promise<void> = Promise.resolve()
 
   /**
    * Read the QR codes on the page and send the human what they carry.
    *
-   * Off the critical path, like the focus probe: nothing awaits it, and a scan
-   * still in flight when the handoff ends is dropped rather than delivered to
-   * a phone that has already been told it is over.
+   * Off the critical path, like the focus probe — nothing on the handoff's own
+   * path awaits it — but retained, so teardown can.
    */
   const scanQr = (): void => {
     const now = Date.now()
     if (scanning || over || now - lastScanAt < QR_SCAN_INTERVAL_MS) return
     lastScanAt = now
     scanning = true
-    qrScans += 1
-    void scanPageForLinks(page)
+    scanTask = scanPageForLinks(page, scanner)
       .then((links) => {
-        // After the `over` check, not before it: a scan whose answer is thrown
-        // away because the handoff ended is not a hit anybody was told about.
+        // Checked here, between the screenshot and the answer: the handoff can
+        // settle while a CDP round trip is in flight, and an answer nobody can
+        // be sent is not a scan that happened.
         if (over) return undefined
+        qrScans += 1
         if (links.length > 0) qrHits += 1
         return link?.send({ type: "links", links, source: "qr" })
       })
@@ -604,6 +617,12 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   clearTimeout(timer)
   browser?.off("disconnected", onGone)
   page.off("close", onGone)
+  // Let a scan that was in flight when the handoff settled finish reporting
+  // itself, then stop its worker. Awaited before the wide event is built, so
+  // `qrScans` and `qrHits` are frozen by the time it reads them; the decode
+  // has its own three-second deadline, so this cannot wait on a hung thread.
+  await scanTask
+  await scanner.close()
   await pump?.stop()
   // The ending must reach the phone, so wait briefly for a reconnect if the
   // socket is momentarily down rather than dropping it like a stale frame.

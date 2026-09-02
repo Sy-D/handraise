@@ -743,3 +743,88 @@ test("the replay buffer is dropped when the agent disconnects, and restored when
     reason: "Aurora Bank is asking for a code",
   })
 })
+
+// --- what the human side may cost this process -----------------------------
+
+test("a human message past 4 KiB closes the socket instead of being routed", async () => {
+  const agent = await connect(relay.port, "agent")
+  const human = await connect(relay.port, "human")
+
+  // Every message this side can send is a handful of small fields. The agent's
+  // frames are why the general cap is megabytes; a bearer-link holder padding
+  // an accepted message to eight of them is why this one is four kilobytes,
+  // and why it is enforced in the reader before anything is parsed.
+  human.socket.send(
+    JSON.stringify({ type: "char", ch: "7", pad: "x".repeat(8 * 1024) }),
+  )
+  expect(await human.closed).toBeGreaterThan(0)
+  await expect(agent.next()).rejects.toThrow(/no message/)
+
+  // An ordinary message on a fresh socket is untouched by the cap.
+  const second = await connect(relay.port, "human")
+  second.send({ type: "char", ch: "7" })
+  expect(await agent.next()).toEqual({ type: "char", ch: "7" })
+})
+
+test("the relay drops a second scan inside its own floor", async () => {
+  const agent = await connect(relay.port, "agent")
+  const human = await connect(relay.port, "human")
+
+  // The core enforces this too, and its copy is the one that protects the
+  // browser. This one is what stops a burst costing the agent a wake-up and a
+  // JSON parse per message — which the core cannot refuse, because by then it
+  // has already paid for both.
+  human.send({ type: "scanqr" })
+  human.send({ type: "scanqr" })
+  human.send({ type: "scanqr" })
+  // A message the relay always routes, sent last: receiving it proves the two
+  // extra scans were dropped rather than merely slow.
+  human.send({ type: "char", ch: "7" })
+
+  expect(await agent.next()).toEqual({ type: "scanqr" })
+  expect(await agent.next()).toEqual({ type: "char", ch: "7" })
+})
+
+test("a terminal answer is delivered even while the agent is backpressured", async () => {
+  // A human faster than the agent's socket can take: the relay stops reading
+  // that socket rather than growing its own write queue. What it must never do
+  // is hold back a message it has already accepted — the handback is the one
+  // the agent is waiting for, and a human who has answered has stopped
+  // producing anything that could push it through.
+  //
+  // A raw TCP socket for the agent, because this test needs a receiver that
+  // really stops reading: `ws`'s `pause()` is not implemented under bun. The
+  // relay writes unmasked frames, so the JSON is plain in the stream and
+  // "did the handback arrive" is a substring of the bytes.
+  const { socket: agentSocket } = await rawUpgrade(relay.port, "role=agent")
+  const human = await connect(relay.port, "human")
+  agentSocket.pause()
+
+  const paused = waitForLog(relay, "human paused", {})
+  // Enough to fill both socket buffers and make the relay's write to the agent
+  // return false. Each message is just under the 4 KiB human ceiling, so this
+  // is about eight megabytes aimed at a receiver that has stopped reading.
+  const filler = JSON.stringify({
+    type: "char",
+    ch: "x",
+    pad: "p".repeat(3800),
+  })
+  for (let i = 0; i < 2_000; i++) human.socket.send(filler)
+  human.send({ type: "handback" })
+  await paused
+
+  let seen = ""
+  agentSocket.on("data", (chunk: Buffer) => {
+    seen += chunk.toString("utf8")
+  })
+  const resumed = waitForLog(relay, "human resumed", {})
+  agentSocket.resume()
+  await resumed
+
+  const deadline = Date.now() + 8000
+  while (!seen.includes('"handback"') && Date.now() < deadline) {
+    await Bun.sleep(50)
+  }
+  expect(seen).toContain('"handback"')
+  agentSocket.destroy()
+}, 20000)

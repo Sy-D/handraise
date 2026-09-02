@@ -1555,10 +1555,13 @@ test("an openable link is shown as the address it actually opens", async () => {
   await showFrame()
   // The first character is a Cyrillic a. The eye reads apple.com and the
   // browser goes to xn--pple-43d.com, so showing the payload beside an anchor
-  // that resolves it shows the human one address and opens another.
-  const homograph = "https://аpple.com/verify?to=‮gnp.exe"
+  // that resolves it shows the human one address and opens another. (A payload
+  // carrying a bidi override never gets this far — it is refused outright, and
+  // `NEVER_OPENABLE` covers that.)
+  const homograph = "https://аpple.com/verify?token=abc"
   const resolved = new URL(homograph).href
   expect(resolved).not.toBe(homograph)
+  expect(resolved).toContain("xn--pple-43d.com")
 
   agent.send({
     type: "links",
@@ -1575,6 +1578,60 @@ test("an openable link is shown as the address it actually opens", async () => {
   expect(
     await page.locator("#sheet-links .link-note").first().textContent(),
   ).toContain("wrote this address differently")
+  expect(consoleErrors).toEqual([])
+})
+
+test("a dialer string and an authenticator secret are named, not opened", async () => {
+  await showFrame()
+  // "Not a link" says nothing useful about either of these, and both are
+  // things a human should hand to an app deliberately rather than in one tap
+  // from a page nobody vetted.
+  agent.send({
+    type: "links",
+    links: [
+      { text: "tel:*21*1234567890%23", kind: "url" },
+      {
+        text: "otpauth://totp/Example:ada?secret=JBSWY3DPEHPK3PXP",
+        kind: "url",
+      },
+    ],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await page.locator("#sheet-links a").count()).toBe(0)
+  const notes = await page.locator("#sheet-links .link-note").allTextContents()
+  expect(notes[0]).toContain("Phone number")
+  expect(notes[1]).toContain("Authenticator secret")
+  expect(consoleErrors).toEqual([])
+})
+
+test("the host of an openable link is the loud part of it", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  // The one question a human answers before tapping Open is whose site this
+  // is, and on a 390px screen the host is otherwise a few characters lost in
+  // a token.
+  const host = page.locator("#sheet-links .link-host")
+  expect(await host.textContent()).toBe("verify.example.com")
+  const weights = await page.evaluate(() => {
+    const loud = document.querySelector("#sheet-links .link-host")
+    const rest = document.querySelector("#sheet-links .link-text > span")
+    if (!loud || !rest) return null
+    return {
+      loud: getComputedStyle(loud).fontWeight,
+      quiet: getComputedStyle(rest).color,
+      loudColour: getComputedStyle(loud).color,
+    }
+  })
+  expect(Number(weights?.loud)).toBeGreaterThanOrEqual(600)
+  expect(weights?.quiet).not.toBe(weights?.loudColour)
   expect(consoleErrors).toEqual([])
 })
 

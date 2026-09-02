@@ -4,18 +4,27 @@
  * `jsQR` wants what a canvas gives a browser: four bytes per pixel, row-major,
  * RGBA. Node has no canvas and no image decoder — but it does have zlib, and a
  * PNG is a zlib stream of filtered scanlines. That is the whole of this file:
- * about a hundred lines instead of a native dependency that has to build on
+ * about two hundred lines instead of a native dependency that has to build on
  * every platform a handraise user runs an agent on.
  *
  * It decodes the subset that is actually produced here, and refuses the rest
  * loudly rather than guessing:
  *
- *   - 8 bits per channel, non-interlaced. Chromium's `Page.captureScreenshot`
- *     emits colour type 2 (RGB) for a screenshot and 6 (RGBA) when the page has
- *     transparency; measured, docs/measurements/05-qr.md.
+ *   - 8 bits per channel, non-interlaced, deflate, filter method 0. Chromium's
+ *     `Page.captureScreenshot` emits colour type 2 (RGB) for a screenshot and 6
+ *     (RGBA) when the page has transparency; measured, docs/measurements/05-qr.md.
  *   - No palette (colour type 3) and no 16-bit depth. Nothing in this repo
  *     produces either, and a decoder path with no input is a decoder path
  *     nobody has ever run.
+ *
+ * **What it does not check: the CRCs.** Every chunk carries one and this reads
+ * none of them, because the contract is "Chromium's own screenshot, over an
+ * in-process CDP call" — there is no lossy channel between the encoder and
+ * here for a CRC to catch. What it does check is every length and boundary,
+ * which is the part an attacker controls: a file whose chunk lengths walk off
+ * the end, whose image data decompresses to the wrong size, or whose header
+ * claims a size nothing could have produced is rejected by name rather than
+ * quietly turned into pixels for a security-sensitive classifier.
  */
 import { inflateSync } from "node:zlib"
 
@@ -32,15 +41,29 @@ const CHANNELS = new Map<number, number>([
 /** Length + type + CRC around every chunk's payload. */
 const CHUNK_OVERHEAD = 12
 
+/** IHDR's payload is exactly this long, always. */
+const IHDR_LENGTH = 13
+
 /**
- * The largest image this will decode, in pixels.
+ * The largest image this will decode.
  *
- * 64 megapixels is roughly an 8000x8000 screenshot: far past any viewport, and
- * far short of what a dishonest IHDR could ask a decoder to allocate. It is
- * checked before anything is inflated, because the header is the only part of
- * a PNG that is cheap to believe.
+ * 8192 on a side covers a 4K viewport at device scale 2 with room to spare;
+ * 33 megapixels is a little over 8192x4096, which is more pixels than any
+ * screenshot handraise takes. Both are checked before a byte is decompressed,
+ * because the header is the only part of a PNG that is cheap to believe and
+ * every allocation below is sized from it.
  */
-export const MAX_PIXELS = 64_000_000
+export const MAX_DIMENSION = 8192
+export const MAX_PIXELS = 33_000_000
+
+/**
+ * The largest compressed image data this will inflate.
+ *
+ * A screenshot of a page is a few hundred kilobytes; 32 MB is two orders of
+ * magnitude of headroom and still a bound. It exists so that a stream is
+ * refused before `inflateSync` is asked to look at it, rather than after.
+ */
+export const MAX_COMPRESSED_BYTES = 32 * 1024 * 1024
 
 /** A decoded image in the one layout `jsQR` and `ImageData` agree on. */
 export interface RgbaImage {
@@ -53,6 +76,8 @@ interface PngHeader {
   width: number
   height: number
   channels: number
+  /** Bytes the image data must decompress to: a filter byte plus a row, per row. */
+  inflatedLength: number
 }
 
 function fail(what: string): never {
@@ -61,45 +86,92 @@ function fail(what: string): never {
 
 /** IHDR is mandatory and always the first chunk, so it is read by position. */
 function readHeader(bytes: Buffer): PngHeader {
-  if (bytes.length < 33 || !bytes.subarray(0, 8).equals(SIGNATURE)) {
+  if (bytes.length < 8 + CHUNK_OVERHEAD + IHDR_LENGTH) {
     fail("the screenshot is not a PNG")
   }
-  if (bytes.subarray(12, 16).toString("ascii") !== "IHDR") {
-    fail("the PNG does not start with IHDR")
+  if (!bytes.subarray(0, 8).equals(SIGNATURE)) {
+    fail("the screenshot is not a PNG")
+  }
+  if (
+    bytes.readUInt32BE(8) !== IHDR_LENGTH ||
+    bytes.subarray(12, 16).toString("ascii") !== "IHDR"
+  ) {
+    fail("the PNG does not start with a 13-byte IHDR")
   }
   const depth = bytes[24]
   const colourType = bytes[25]
+  const compression = bytes[26]
+  const filterMethod = bytes[27]
   const interlace = bytes[28]
   const channels =
     colourType === undefined ? undefined : CHANNELS.get(colourType)
-  if (depth !== 8 || interlace !== 0 || channels === undefined) {
+  if (
+    depth !== 8 ||
+    interlace !== 0 ||
+    compression !== 0 ||
+    filterMethod !== 0 ||
+    channels === undefined
+  ) {
     fail(
-      `unsupported PNG (colour type ${colourType}, ${depth} bits, interlace ${interlace})`,
+      `unsupported PNG (colour type ${colourType}, ${depth} bits, interlace ${interlace}, compression ${compression}, filter method ${filterMethod})`,
     )
   }
   const width = bytes.readUInt32BE(16)
   const height = bytes.readUInt32BE(20)
-  // Before anything is allocated or inflated: a header may claim four billion
-  // pixels each way, and every allocation below is sized from these two numbers.
-  if (width < 1 || height < 1 || width * height > MAX_PIXELS) {
-    fail(`the PNG claims ${width}x${height}, past the ${MAX_PIXELS}-pixel cap`)
+  if (
+    width < 1 ||
+    height < 1 ||
+    width > MAX_DIMENSION ||
+    height > MAX_DIMENSION ||
+    width * height > MAX_PIXELS
+  ) {
+    fail(
+      `the PNG claims ${width}x${height}, past the ${MAX_DIMENSION}px / ${MAX_PIXELS}-pixel cap`,
+    )
   }
-  return { width, height, channels }
+  return {
+    width,
+    height,
+    channels,
+    inflatedLength: (width * channels + 1) * height,
+  }
 }
 
-/** The image data, which a PNG may split over any number of IDAT chunks. */
+/**
+ * The image data, which a PNG may split over any number of IDAT chunks.
+ *
+ * The walk is the boundary check: every chunk's declared length has to fit in
+ * what is left of the file, or the file is lying about its own shape. IEND is
+ * required, so a truncated stream is a refusal rather than whatever the last
+ * complete chunk happened to hold.
+ */
 function collectImageData(bytes: Buffer): Buffer {
   const parts: Buffer[] = []
+  let total = 0
   let offset = 8
+  let ended = false
   while (offset + CHUNK_OVERHEAD <= bytes.length) {
     const length = bytes.readUInt32BE(offset)
     const type = bytes.subarray(offset + 4, offset + 8).toString("ascii")
-    if (type === "IEND") break
+    if (offset + CHUNK_OVERHEAD + length > bytes.length) {
+      fail(`the PNG's ${type} chunk runs past the end of the file`)
+    }
+    if (type === "IEND") {
+      ended = true
+      break
+    }
     if (type === "IDAT") {
+      total += length
+      if (total > MAX_COMPRESSED_BYTES) {
+        fail(
+          `the PNG carries more than ${MAX_COMPRESSED_BYTES} compressed bytes`,
+        )
+      }
       parts.push(bytes.subarray(offset + 8, offset + 8 + length))
     }
     offset += length + CHUNK_OVERHEAD
   }
+  if (!ended) fail("the PNG has no IEND chunk")
   if (parts.length === 0) fail("the PNG carries no image data")
   return Buffer.concat(parts)
 }
@@ -143,9 +215,6 @@ function unfilterRow(
 /** Filtered scanlines (one filter byte each) to raw samples. */
 function unfilter(raw: Buffer, header: PngHeader): Uint8Array {
   const stride = header.width * header.channels
-  if (raw.length < (stride + 1) * header.height) {
-    fail("the PNG's image data is shorter than its dimensions claim")
-  }
   const pixels = new Uint8Array(stride * header.height)
   const firstAbove = new Uint8Array(stride)
   let offset = 0
@@ -184,20 +253,27 @@ function toRgba(pixels: Uint8Array, header: PngHeader): Uint8ClampedArray {
 /**
  * Decode a PNG to RGBA. Throws with a readable message on anything else.
  *
- * The inflate is bounded by the header, which is the whole point of doing it
- * in that order. A PNG's IHDR says exactly how many bytes its image data
- * decompresses to — one filter byte plus one scanline per row — so a stream
- * that inflates past that is not a large picture, it is a zip bomb. Measured
- * without the bound: 815 KB of IDAT claiming an 8x8 image allocated 873 MB and
- * then decoded happily, because the first 200 bytes were a valid 8x8 image.
+ * The inflate is bounded by the header, and that is the whole point of doing
+ * it in that order. A PNG's IHDR says exactly how many bytes its image data
+ * decompresses to — one filter byte plus one scanline per row — so anything
+ * else is not a picture: a stream that inflates past it is a zip bomb, and one
+ * that stops short is a truncated or forged file. Measured without the bound:
+ * 815 KB of IDAT claiming an 8x8 image allocated 873 MB and then decoded
+ * happily, because the first 200 bytes were a valid 8x8 image.
+ *
  * `scanPageForLinks` only ever feeds this Chromium's own screenshot, but
  * `scanQrLinks` is exported and documented as taking a PNG from anywhere.
  */
 export function decodePng(bytes: Buffer): RgbaImage {
   const header = readHeader(bytes)
   const raw = inflateSync(collectImageData(bytes), {
-    maxOutputLength: (header.width * header.channels + 1) * header.height,
+    maxOutputLength: header.inflatedLength,
   })
+  if (raw.length !== header.inflatedLength) {
+    fail(
+      `the PNG's image data decompressed to ${raw.length} bytes, not the ${header.inflatedLength} its header claims`,
+    )
+  }
   return {
     data: toRgba(unfilter(raw, header), header),
     width: header.width,
