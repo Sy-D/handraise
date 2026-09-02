@@ -188,7 +188,8 @@ Three ways, no vendor lock-in:
 
 - **QR code in the terminal** (default) — scan with the phone camera.
 - **`onUrl` callback** — do whatever you want with the link.
-- **`webhookUrl`** — handraise POSTs `{ url, reason, sessionId }` as JSON.
+- **`webhookUrl`** — handraise POSTs `{ url, reason, mode, action?, sessionId }`
+  as JSON (`action` only in approval mode).
   Point it at Slack, Discord, ntfy, a Telegram bot — anything that accepts a
   POST.
 

@@ -8,6 +8,7 @@
  * Slack client that needs a token and a scope.
  */
 import { type Logger, quietLogger } from "./logger"
+import type { HandoffMode } from "./types"
 
 /** Body of the notification POST. */
 export interface WebhookPayload {
@@ -15,6 +16,10 @@ export interface WebhookPayload {
   url: string
   /** The `reason` the agent gave, verbatim. */
   reason: string
+  /** `takeover` or `approval` — what the human is being asked for. */
+  mode: HandoffMode
+  /** The step being decided. Present in approval mode only. */
+  action?: string
   /** Identifies this handoff, for correlating a message with a log line. */
   sessionId: string
 }

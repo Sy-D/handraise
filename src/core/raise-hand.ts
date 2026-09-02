@@ -503,13 +503,17 @@ export async function raiseHand(
     if (options.webhookUrl) {
       // Deliberately not awaited: the human may already be scanning the QR
       // code while a slow Slack endpoint is still thinking.
+      const payload = {
+        url: relay.humanUrl,
+        reason: options.reason,
+        mode,
+        sessionId: handoffId(relay.humanUrl),
+      }
       webhook = notifyWebhook(
         options.webhookUrl,
-        {
-          url: relay.humanUrl,
-          reason: options.reason,
-          sessionId: handoffId(relay.humanUrl),
-        },
+        options.mode === "approval"
+          ? { ...payload, action: options.action }
+          : payload,
         logger,
       )
     }

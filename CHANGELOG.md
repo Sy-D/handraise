@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.4.0
+## [0.4.0] - 2026-09-02
 
 Approval mode. A capability gap ("I can't do this": 2FA, a captcha) and an
 authority boundary ("I may not do this": submit the payment) were the same call
@@ -37,6 +37,9 @@ breaks, and they apply even to an application that never asks for an approval.
 
 ### Added
 
+- **The webhook body carries `mode` and, in approval mode, `action`**, so a
+  chat integration can show the step being decided without a second round
+  trip. `{ url, reason, sessionId }` are unchanged.
 - **`mode: "approval"`.** `raiseHand(page, { mode: "approval", reason, action })`
   shows the human one screenshot and the concrete step, and resolves with
   `approved` or `denied`. `action` is required in that mode and the types
@@ -251,6 +254,7 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
 - TypeScript/Node only.
 
 [Unreleased]: https://github.com/Sy-D/handraise/compare/v0.3.0...HEAD
+[0.4.0]: https://github.com/Sy-D/handraise/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Sy-D/handraise/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Sy-D/handraise/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Sy-D/handraise/releases/tag/v0.1.0
