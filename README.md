@@ -420,16 +420,20 @@ approval needs one decision, and every fourth one here was a denial.
 
 | | completed | to visible | frames | bytes | relay sandbox |
 |---|---|---|---|---|---|
-| takeover — the human drives | 10/10 | 4923ms | 14 | 142 KB | 11.0s |
-| approval — the human decides | 10/10 | 5089ms | 1 | 25 KB | 5.5s |
+| takeover — the human drives | 10/10 | 4718ms | 14 | 142 KB | 10.7s |
+| approval — the human decides | 10/10 | 4896ms | 1 | 25 KB | 5.3s |
 
-Medians over the completed runs; a denied approval counts as completed, because
-the decision was delivered and the bench checks that no money moved. An approval
-injects nothing into the page, so it applies zero inputs and sends one
-screenshot however long the human thinks, while a takeover's stream keeps
-growing while the human works. The 50/50 mix is the harness's choice, not a
-measurement of anyone's traffic — take the per-mode costs and apply your own
-mix.
+Medians over the completed runs. A denied approval counts as completed: the
+decision was delivered, and the bench then loads the account page and requires
+both the session and the absence of a receipt for that run's amount. `to
+visible` includes the relay cold start (~3 s) that both modes pay. The relay
+seconds include the human's time, so they are a floor — a real person takes
+longer than this scripted one — and only the takeover pays that cost: an
+approval injects nothing and sends one screenshot however long the human thinks.
+The approval arm signs itself in with the shared secret, so only the takeover
+arm is measured against a wall it cannot pass, and the 50/50 mix is the
+harness's choice rather than a measurement of anyone's traffic:
+[method and caveats](benchmarks/README.md).
 
 At N=30 the right-hand column is the worst observation, not a fitted p99 — we
 say what we measured. The input round trip sits on the network RTT floor from

@@ -102,24 +102,42 @@ Aurora Bank instance, interleaved (takeover, approval, takeover, …), on
 
 | | completed | time to visible p50 / p75 | handoff p50 / p75 | frames | bytes | inputs | relay-sandbox s |
 |---|---|---|---|---|---|---|---|
-| takeover | 10/10 | 4923 / 5809 ms | 6621 / 7011 ms | 14 | 142 KB | 8 | 11.0 |
-| approval | 10/10 | 5089 / 5381 ms | 2091 / 2293 ms | 1 | 25 KB | 0 | 5.5 |
+| takeover | 10/10 | 4718 / 4808 ms | 6927 / 7202 ms | 14 | 142 KB | 8 | 10.7 |
+| approval | 10/10 | 4896 / 4977 ms | 2063 / 2084 ms | 1 | 25 KB | 0 | 5.3 |
 
-All per-handoff figures are medians over the runs that completed. `time to
-visible` is `raiseHand()` → the first frame arriving on the human's socket, the
-same measurement as the latency bench, so the two modes are comparable and both
-carry the same relay cold start (3211 ms takeover, 3068 ms approval, at p50).
+All per-handoff figures are medians over the runs that completed, and the two
+time columns measure different spans:
+
+- `time to visible` is `raiseHand()` → the first frame arriving on the human's
+  socket. It is the same measurement as the latency bench, so the two modes are
+  comparable, and it includes the relay cold start both modes pay (3099 ms
+  takeover, 3039 ms approval, at p50).
+- `handoff` is the wide event's `durationMs`: the relay being up → the handoff
+  settling. It **excludes** that cold start, which is why an approval's handoff
+  (2063 ms) is shorter than its time to visible (4896 ms).
+
 `frames` and `bytes` are what the agent put on the wire: an approval is one
-screenshot, 25 KB of base64 payload, and it injects nothing into the page —
-`inputsApplied` is 0 by construction, not by luck. `relay-sandbox s` is wall-clock from `raiseHand()` to
-the promise settling, which covers creating the sandbox, the handoff and
-destroying it: the closest thing to a bill.
+screenshot, 25 KB of base64 payload, and it injects nothing into the page — so
+`inputsApplied` is 0 by construction, not by luck. `relay-sandbox s` is
+wall-clock from `raiseHand()` to the promise settling, which covers creating the
+sandbox, the handoff and destroying it: the closest thing to a bill.
+
+That last column includes the human's occupancy, so read it as a floor and not
+as a property of the two modes. Of the 5.4 s gap here, 5.0 s is the scripted
+human tapping and typing through the takeover; the approval side is 0.0 s,
+because the script answers the moment the screenshot lands. Both modes pay the
+same cold start. Only the takeover pays for the person's time, and a real person
+takes longer than a script — an approval does not, because the one frame is
+already on the phone while they think.
 
 A denied approval counts as completed, and that is a deliberate choice: the
-workflow reached a decision and the agent obeyed it. The bench asserts the money
-did not move — for a denial it requires that no transfer receipt exists on the
-page — so "completed" means the mechanism delivered an answer, not that the
-answer was yes.
+workflow reached a decision and the agent obeyed it. Obeying is checked rather
+than assumed: after a denial the bench loads the account page — the only page
+that renders a receipt — and requires the session banner to be there AND no
+receipt for that run's amount. Both halves can fail, and the harness proves it
+can fail by submitting anyway under a temporary fixture. So "completed" means
+the mechanism delivered an answer the agent then honoured, not that the answer
+was yes.
 
 What may be claimed from this, and nothing wider: on this workload, an approval
 costs one frame where a takeover costs a stream, and both modes delivered their
@@ -135,8 +153,11 @@ measured — the interrupt is the transfer, which comes after. Only the takeover
 arm is barred from the secret, because there the wall is the whole test.
 
 The counting is load-bearing rather than decorative, and that is testable:
-`MIXED_FAULT=invert-completed bun run bench:mixed` inverts the completion test,
-and both modes must then read 0 of N.
+`MIXED_FAULT=invert-completed bun run bench:mixed` inverts the page sensors —
+the signed-in banner and the receipt — and both modes must then read 0 of N,
+denials included. The switch deliberately does not flip the verdict at the end:
+a verdict flip looks identical for a check that never reads the page, which is a
+mistake this bench made once and now tests against.
 
 ## Reading the raw files
 
