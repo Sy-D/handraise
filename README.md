@@ -266,8 +266,11 @@ proven. Browserbase Live View, Cloudflare Browser Run, Scrapfly and AuthLoop are
 hosted platform features of their own clouds; if you run on one, use theirs.
 handraise brings the same handoff to Solari browsers, which have no native live
 view (Solari's VNC is desktop-only), as a portable library instead — less
-polished, and it works where those don't. Its scope stops at the handoff, not
-wall detection ([`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
+polished, and it works where those don't. What the hosted live views do not
+have is the second mode: an approval is a yes-or-no on one screenshot, no
+live session exposed at all, answerable from a chat channel. Its scope stops
+at the handoff, not wall detection
+([`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
 
 ## Security
 
@@ -338,6 +341,11 @@ with `isTrusted: true`.
 - An approval shows the page as it was when the agent asked. If the page
   changes underneath (a session expiring, a redirect), the human is deciding on
   a stale picture — the frame is not refreshed.
+- A verification that shows a QR code to scan (reCAPTCHA's "scan to verify
+  you're human") needs a second screen today: open the handoff link on a
+  laptop and scan it with the phone — the phone cannot scan its own display.
+  Decoding the QR from the live frame and handing the phone the link is
+  planned.
 - TypeScript/Node only for now.
 
 ## Contributing
