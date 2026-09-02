@@ -1,10 +1,15 @@
 // Runs the SHIPPED artifact under node — the consumer's runtime, not bun's.
 // Exists because a CJS-interop difference made the QR silently break in dist
 // while every bun-driven test stayed green.
+import { readFileSync } from "node:fs"
+
 const m = await import("../dist/index.js")
 const expected = [
   "raiseHand",
   "handoffQr",
+  "scanQrLinks",
+  "createQrScanner",
+  "OPENABLE_SCHEMES",
   "consoleLogger",
   "quietLogger",
   "noopLogger",
@@ -38,10 +43,37 @@ if (
 const qr = m.handoffQr(
   `https://example.preview.getsolari.com/?pt_token=${"x".repeat(240)}`,
 )
-if (!qr || !qr.includes("▄")) {
+if (!qr?.includes("▄")) {
   console.error("dist smoke: QR did not render under node")
   process.exit(1)
 }
+// The other direction, and the same trap: `jsqr` is a CommonJS UMD bundle, so
+// its default import is exactly the shape that broke `qrcode-terminal` in dist
+// while bun stayed green. Decode a real screenshot to prove it survived.
+const shot = readFileSync(
+  new URL("../src/core/fixtures/qr-page.png", import.meta.url),
+)
+const links = m.scanQrLinks(shot)
+if (links.length !== 1 || links[0].kind !== "url") {
+  console.error(
+    "dist smoke: the QR decoder did not read the fixture under node",
+  )
+  process.exit(1)
+}
+
+// The worker is a second build entry loaded by URL at runtime, so it is the
+// one part of this package that a bundler can drop without anything failing to
+// import. Under node, against dist/qr-worker.js, on a real screenshot.
+const scanner = m.createQrScanner()
+const offThread = await scanner.scan(shot)
+await scanner.close()
+if (offThread.length !== 1 || offThread[0].text !== links[0].text) {
+  console.error(
+    "dist smoke: the QR worker did not decode the fixture under node",
+  )
+  process.exit(1)
+}
+
 console.log(
-  `dist smoke ok — ${expected.length} exports, QR ${qr.split("\n").length} rows`,
+  `dist smoke ok — ${expected.length} exports, QR ${qr.split("\n").length} rows, decoded ${links[0].text.length} chars on the main thread and on the worker`,
 )

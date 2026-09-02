@@ -15,6 +15,7 @@ import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
 import type { AddressInfo } from "node:net"
 import { fileURLToPath } from "node:url"
+import { deflateSync } from "node:zlib"
 import type { Browser, BrowserContext, CDPSession, Page } from "playwright-core"
 import WebSocket, { WebSocketServer } from "ws"
 
@@ -167,10 +168,62 @@ const CLOSED_PORT = "http://127.0.0.1:1"
 const SAMPLE_JPEG = readFileSync(
   fileURLToPath(new URL("./fixtures/sample-frame.jpg", import.meta.url)),
 )
+
+/**
+ * A real screenshot of a real page carrying a real QR code, so a `scanqr` is
+ * answered by the decoder rather than by a stub that always agrees.
+ * `page.screenshot({ type: "png" })` is what a scan asks for; an approval's one
+ * frame asks for a JPEG, and `fakePage` answers each with its own bytes.
+ */
+const QR_PAGE_PNG = readFileSync(
+  fileURLToPath(new URL("./fixtures/qr-page.png", import.meta.url)),
+)
+const QR_PAGE_LINK = `https://verify.example.com/device?token=${"a1b2c3d4".repeat(20)}`
+
+/** A white PNG: a page with nothing on it to find. */
+function blankPng(width: number, height: number): Buffer {
+  const raw = Buffer.alloc(height * (width * 3 + 1), 0xff)
+  for (let y = 0; y < height; y++) raw[y * (width * 3 + 1)] = 0
+  const chunk = (type: string, body: Buffer): Buffer => {
+    const head = Buffer.alloc(8)
+    head.writeUInt32BE(body.length, 0)
+    head.write(type, 4, "ascii")
+    const crc = Buffer.alloc(4)
+    crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), body])), 0)
+    return Buffer.concat([head, body, crc])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 2
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ])
+}
+
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff
+  for (const byte of bytes) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit++) {
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+const BLANK_PNG = blankPng(64, 40)
 const VIEWPORT = { width: 1280, height: 800 }
 
 /** CDP sessions opened on the fake page since the last reset. */
 let cdpSessions = 0
+
+/** Screenshots the newest `fakePage()` has been asked for. */
+let screenshots = 0
 
 /** Kills the browser session behind the newest `fakePage()`. */
 let killSession: () => void = () => undefined
@@ -185,8 +238,10 @@ function fakePage(
   cdp: CDPSession,
   screenshotDelayMs = 0,
   storageStateDelayMs = 0,
+  pngScreenshot: Buffer = QR_PAGE_PNG,
 ): Page {
   cdpSessions = 0
+  screenshots = 0
   let browser: Browser
   let connected = true
   const gone = new Set<() => void>()
@@ -232,10 +287,12 @@ function fakePage(
     // A live page, which is what `raiseHand` checks before it starts anything.
     isClosed: () => false,
     // SAFETY: approval mode calls screenshot() for its one frame and reads the
-    // viewport for that frame's metadata; neither result is used as anything else.
-    screenshot: (async () => {
+    // viewport for that frame's metadata; a QR scan calls it for a PNG. Neither
+    // result is used as anything else.
+    screenshot: (async (options?: { type?: "png" | "jpeg" }) => {
       if (screenshotDelayMs > 0) await Bun.sleep(screenshotDelayMs)
-      return SAMPLE_JPEG
+      screenshots += 1
+      return options?.type === "png" ? pngScreenshot : SAMPLE_JPEG
     }) as Page["screenshot"],
     viewportSize: () => VIEWPORT,
     // SAFETY: as the browser's, above — an unused chaining emitter.
@@ -1617,4 +1674,227 @@ test("a logger whose methods reject does not break the handoff either", async ()
   } finally {
     process.off("unhandledRejection", record)
   }
+})
+
+test("a logger that throws does not break the handoff", async () => {
+  // `logger` is a public option and it is the caller's object: a pino instance
+  // over a closed transport throws. Every call handraise makes to it sits on a
+  // failure path or inside a promise callback, so a throw would either lose
+  // the outcome (the wide event is logged before it is returned) or reject a
+  // promise nobody awaits, and node ends the process for that.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const down = (): never => {
+    throw new Error("logger is down (EPIPE)")
+  }
+  const hostile: Logger = { debug: down, info: down, warn: down, error: down }
+  const events: HandoffEvent[] = []
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "the logger is hostile",
+      logger: hostile,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "hostile-logger",
+    relayColdStartMs: 5,
+    logger: hostile,
+  })
+
+  await until("the phone to connect", () => human.inbox.length >= 0)
+  human.send({ type: "handback" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  // The wide event still reaches the caller: `logger.info` throwing must not
+  // take `onEvent` with it.
+  expect(events).toHaveLength(1)
+})
+
+// --- QR passthrough --------------------------------------------------------
+
+/**
+ * A takeover with a phone attached, ready to press Scan QR. Returns the pieces
+ * the tests below drive; each one ends the handoff itself.
+ */
+async function scannableHandoff(pngScreenshot: Buffer = QR_PAGE_PNG): Promise<{
+  human: Awaited<ReturnType<typeof connectHuman>>
+  events: HandoffEvent[]
+  handoff: ReturnType<typeof runHandoff>
+}> {
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 0, 0, pngScreenshot),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "The site wants this code scanned with a phone",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "qr-handoff",
+    relayColdStartMs: 12,
+    logger: noopLogger,
+  })
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+  return { human, events, handoff }
+}
+
+/** Every `links` message the phone has been sent so far. */
+function linksSeen(
+  inbox: RelayMessage[],
+): Extract<RelayMessage, { type: "links" }>[] {
+  return inbox.filter(
+    (message): message is Extract<RelayMessage, { type: "links" }> =>
+      message.type === "links",
+  )
+}
+
+test("a scan reads the page and sends the human the link it carries", async () => {
+  const { human, events, handoff } = await scannableHandoff()
+
+  human.send({ type: "scanqr" })
+  await until(
+    "the phone to be sent links",
+    () => linksSeen(human.inbox).length === 1,
+  )
+
+  const answer = linksSeen(human.inbox)[0]
+  expect(answer?.source).toBe("qr")
+  expect(answer?.links).toEqual([{ text: QR_PAGE_LINK, kind: "url" }])
+
+  human.send({ type: "handback" })
+  await handoff
+  expect(events[0]?.qrScans).toBe(1)
+  expect(events[0]?.qrHits).toBe(1)
+})
+
+test("a page with no code answers nothing found, and still counts as a scan", async () => {
+  const { human, events, handoff } = await scannableHandoff(BLANK_PNG)
+
+  human.send({ type: "scanqr" })
+  await until(
+    "the phone to be sent links",
+    () => linksSeen(human.inbox).length === 1,
+  )
+  expect(linksSeen(human.inbox)[0]?.links).toEqual([])
+
+  human.send({ type: "handback" })
+  await handoff
+  // A scan that found nothing still happened, and the gap between these two is
+  // the number worth watching.
+  expect(events[0]?.qrScans).toBe(1)
+  expect(events[0]?.qrHits).toBe(0)
+})
+
+test("a second scan inside the rate limit is dropped, not queued", async () => {
+  const { human, events, handoff } = await scannableHandoff()
+
+  // A held button, a double tap, or a second holder of the handoff link. The
+  // limit is enforced here and not on the phone, because the socket behind
+  // that link is reachable from any HTTP client.
+  human.send({ type: "scanqr" })
+  human.send({ type: "scanqr" })
+  human.send({ type: "scanqr" })
+  await until(
+    "the phone to be sent links",
+    () => linksSeen(human.inbox).length >= 1,
+  )
+  // Long enough for a queued scan to have answered, and well inside the 2s floor.
+  await Bun.sleep(400)
+
+  expect(linksSeen(human.inbox)).toHaveLength(1)
+  human.send({ type: "handback" })
+  await handoff
+  expect(events[0]?.qrScans).toBe(1)
+  // One screenshot for the scan and no other: a takeover casts, it does not
+  // screenshot, so this is the whole count.
+  expect(screenshots).toBe(1)
+})
+
+test("a scan that lands after the handoff ended is not counted or sent", async () => {
+  // A screenshot is a CDP round trip and the human can hand back while it is
+  // in flight. What comes back cannot be delivered — the phone has already
+  // been told it is over — so it is not a scan that happened, and the wide
+  // event must not claim one. The event is built after the scan task is
+  // awaited, so the counters it reads are final.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 400, 0, QR_PAGE_PNG),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "The site wants this code scanned with a phone",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "qr-settle-race",
+    relayColdStartMs: 12,
+    logger: noopLogger,
+  })
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+
+  human.send({ type: "scanqr" })
+  // Inside the 400 ms the fake page holds the screenshot for.
+  await Bun.sleep(120)
+  human.send({ type: "handback" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  expect(linksSeen(human.inbox)).toHaveLength(0)
+  expect(events[0]?.qrScans).toBe(0)
+  expect(events[0]?.qrHits).toBe(0)
+})
+
+test("an approval never scans, whatever the phone sends", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Transfer EUR 12,430.00 to Acme GmbH",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "qr-approval",
+    relayColdStartMs: 12,
+    logger: noopLogger,
+  })
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+
+  human.send({ type: "scanqr" })
+  await Bun.sleep(300)
+  expect(linksSeen(human.inbox)).toHaveLength(0)
+
+  human.send({ type: "approve" })
+  await handoff
+  expect(events[0]?.qrScans).toBe(0)
+  // The one screenshot is the approval's own frame; the scan added none.
+  expect(screenshots).toBe(1)
 })

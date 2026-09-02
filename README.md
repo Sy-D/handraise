@@ -206,8 +206,8 @@ zoom and pan yourself; double-tap toggles between zoomed and fit. Typing goes
 straight into the focused field, character by character — and if that field is
 a one-time code, the phone offers the SMS code it just received.
 
-Four keys under the input, because a phone's virtual keyboard cannot be trusted
-to send them:
+Under the input, four keys a phone's virtual keyboard cannot be trusted to
+send, and one that asks the agent a question about the page:
 
 | Key | What it does |
 |---|---|
@@ -215,6 +215,44 @@ to send them:
 | ⇥ | Move to the next field |
 | ⏎ | Submit / press Enter |
 | Clear | Empty the focused field (select-all + backspace; disabled while nothing is focused, and kept well away from ⌫) |
+| Scan QR | Read the QR codes on the page and show what they say |
+
+### QR codes on the page
+
+Some walls ask for a *second device*: reCAPTCHA's "scan to verify", a WhatsApp
+Web login, an authenticator enrolment. The human is holding the phone the site
+wants — and the code is on that phone's screen, so it cannot be scanned.
+
+**Scan QR** asks the agent instead. It takes a fresh full-resolution screenshot
+of the page, decodes it, and sends back what each code said. The phone shows the
+link in full and offers **Open in new tab** — so the link is opened on the
+phone, which is the device the site was asking for. Takeover mode only, one scan
+per 2 seconds, and a symbol below about 120 CSS pixels will not decode — scroll
+or zoom the remote page and scan again.
+
+The code came off a page nobody vetted, so:
+
+- Only `http`, `https` and `mailto:` get an **Open** button. Everything else —
+  `javascript:`, `data:`, `blob:`, `content:`, and anything carrying an
+  invisible character — is shown as text with a Copy button and no link. The
+  agent classifies it and the phone applies the same rule again, because the
+  handoff URL is a bearer credential and the socket behind it takes messages
+  from anyone holding it.
+- **`tel:` and `otpauth:` are shown and copyable, never opened.** A `tel:` code
+  can carry a dialler control sequence, and an `otpauth:` code enrols a TOTP
+  secret in your authenticator. Both are one tap and hard to take back, so the
+  sheet names them ("Phone number", "Authenticator secret") and you hand them
+  to the right app yourself.
+- An openable link is shown **as the address it opens**, with the host as the
+  loud part of it. `https://аpple.com` with a Cyrillic а reads as apple.com and
+  goes to `xn--pple-43d.com`; the sheet shows the second one and says the code
+  wrote it differently.
+- The agent process never fetches any of it, and never decodes on its own event
+  loop: the decode runs on a worker thread, so a handoff stays answerable while
+  it happens.
+
+Measured: [`docs/measurements/05-qr.md`](docs/measurements/05-qr.md); the
+decisions are in [ADR 0008](docs/adr/0008-qr-passthrough.md).
 
 Below that, two ways out. **✋ Hand back** ends the handoff as `resolved` — one
 tap, the agent continues. **I can't do this** ends it as `aborted` — the agent
@@ -288,6 +326,21 @@ await raiseHand(page, {
 | `denied` | approval | Do not carry out the action. |
 | `timeout` | both | Nobody answered within `timeoutMs`. |
 | `disconnected` | both | The browser session died mid-handoff. |
+
+### `scanQrLinks(png): ScannedLink[]`
+
+The decoder behind the phone's **Scan QR** button, exported so an agent can
+read a code without asking a human. Takes the bytes of a PNG screenshot,
+returns up to two `{ text, kind }` — `kind: "url"` only for a scheme in
+`OPENABLE_SCHEMES`, which is also exported. It reads and classifies; it never
+opens anything.
+
+```ts
+import { scanQrLinks } from "handraise"
+
+const codes = scanQrLinks(await page.screenshot({ type: "png" }))
+if (codes[0]?.kind === "url") console.log(codes[0].text)
+```
 
 ### Errors
 
@@ -369,8 +422,10 @@ handraise brings the same handoff to Solari browsers, which have no native live
 view (Solari's VNC is desktop-only), as a portable library instead — less
 polished, and it works where those don't. What the hosted live views do not
 have is the second mode: an approval is a yes-or-no on one screenshot, no
-live session exposed at all, answerable from a chat channel. Its scope stops
-at the handoff, not wall detection
+live session exposed at all, answerable from a chat channel. Nor do they have
+an answer to a device-change check — a QR code a phone is asked to scan, on
+the phone's own screen — which handraise reads off the page and hands over as
+a link. Its scope stops at the handoff, not wall detection
 ([`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
 
 ## Security
@@ -444,14 +499,17 @@ a 2FA, and each handoff consumes one sandbox, destroyed when it ends.
 
 ## Verified how
 
-Benchmark method and raw data: [`benchmarks/`](benchmarks/README.md). The four
+Benchmark method and raw data: [`benchmarks/`](benchmarks/README.md). The five
 platform measurements the design rests on — transport, screencast, input
-injection, session lifetime — are in
+injection, session lifetime, QR decoding — are in
 [`docs/measurements/`](docs/measurements/README.md). The e2e test drives the
 whole loop with no mocks: a Solari browser signs into a TOTP-protected demo app
 ([`test-app/`](test-app/), deployed into a sandbox), hits the 2FA wall, raises
 its hand, a scripted "human" types the code through the real handoff UI, and
-the test asserts the signed-in page — ~6s end to end. Injected events arrive
+the test asserts the signed-in page — ~6s end to end. The same run then drives
+the QR passthrough: the app shows a device-change code, the human asks for a
+scan, and the link that comes back is fetched from outside the browser to reach
+the confirmation page. Injected events arrive
 with `isTrusted: true`.
 
 ## Limitations (v1)
@@ -464,11 +522,12 @@ with `isTrusted: true`.
 - An approval shows the page as it was when the agent asked. If the page
   changes underneath (a session expiring, a redirect), the human is deciding on
   a stale picture — the frame is not refreshed.
-- A verification that shows a QR code to scan (reCAPTCHA's "scan to verify
-  you're human") needs a second screen today: open the handoff link on a
-  laptop and scan it with the phone — the phone cannot scan its own display.
-  Decoding the QR from the live frame and handing the phone the link is
-  planned.
+- The QR passthrough is **untested against reCAPTCHA itself**: its demo never
+  served the scan-to-verify variant, which Google shows at its own discretion.
+  The mechanism is proven end to end against a page that behaves the same way
+  ([measurement 05 §7](docs/measurements/05-qr.md)). A code drawn below ~120
+  CSS pixels does not decode, and three or more codes on one screen are not
+  attempted.
 - TypeScript/Node only for now.
 
 ## Contributing

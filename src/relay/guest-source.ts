@@ -44,27 +44,92 @@ const PORT = Number(process.argv[2] || process.env.HANDRAISE_RELAY_PORT || 3000)
 const AGENT_KEY = process.argv[3] || process.env.HANDRAISE_AGENT_KEY || ""
 
 /**
+ * Every message type on the wire, in both directions, named once.
+ *
+ * This file is plain JavaScript, so comparing a message against a bare quoted
+ * string is unchecked: a typo is not a compile error, it is a message that is
+ * silently never matched. The literal unions in src/relay/protocol.ts do that
+ * work for the rest of the codebase; these constants are their counterpart
+ * here, and \`relay.test.ts\` asserts the two sets against each other so neither
+ * can grow a member alone.
+ *
+ * The mobile page below gets this same object injected at serve time — one
+ * definition for the relay and the page it serves, never two that can drift.
+ */
+const MSG = {
+  // agent -> human
+  FRAME: "frame",
+  STATE: "state",
+  FOCUS: "focus",
+  LINKS: "links",
+  ENDED: "ended",
+  // human -> agent
+  TAP: "tap",
+  SCANQR: "scanqr",
+  CHAR: "char",
+  KEY: "key",
+  CLEAR: "clear",
+  SCROLL: "scroll",
+  HANDBACK: "handback",
+  ABORT: "abort",
+  APPROVE: "approve",
+  DENY: "deny",
+  // either direction
+  PING: "ping",
+  PONG: "pong",
+}
+
+/** The two things a handoff can ask of a human. */
+const MODE = { TAKEOVER: "takeover", APPROVAL: "approval" }
+
+/**
+ * The URL schemes the page may offer an "Open" button for, from a QR code the
+ * agent read off whatever site it got stuck on.
+ *
+ * Three. \`tel:\` and \`otpauth:\` are deliberately not here: opening one hands a
+ * dialler a string that can be a control sequence, and opening the other
+ * enrols an attacker-chosen secret in an authenticator. Both are shown and
+ * copyable with a label that says what they are.
+ *
+ * The agent classifies each link before it sends it, and the page checks the
+ * scheme again against this list. Both locks are needed: the human's link is a
+ * bearer URL and the socket behind it is reachable from any HTTP client, so
+ * \`kind: "url"\` is a hint the page must not have to trust. Asserted equal to
+ * \`OPENABLE_SCHEMES\` in src/core/qr-scan.ts by relay.test.ts.
+ */
+const OPENABLE_SCHEMES = ["http:", "https:", "mailto:"]
+
+/**
  * What this handoff asks of the human: \`takeover\` (drive the page) or
  * \`approval\` (answer one question about one screenshot). It arrives as argv
  * and never as a message, so no client can talk the relay into the other set.
  */
-const MODE =
-  (process.argv[4] || process.env.HANDRAISE_MODE) === "approval"
-    ? "approval"
-    : "takeover"
+const HANDOFF_MODE =
+  (process.argv[4] || process.env.HANDRAISE_MODE) === MODE.APPROVAL
+    ? MODE.APPROVAL
+    : MODE.TAKEOVER
 
 /** The human messages this relay forwards. Everything else from that side is dropped. */
 const HUMAN_MESSAGES = new Set(
-  MODE === "approval"
-    ? ["approve", "deny"]
-    : ["tap", "char", "key", "clear", "scroll", "handback", "abort"],
+  HANDOFF_MODE === MODE.APPROVAL
+    ? [MSG.APPROVE, MSG.DENY]
+    : [
+        MSG.TAP,
+        MSG.CHAR,
+        MSG.KEY,
+        MSG.CLEAR,
+        MSG.SCROLL,
+        MSG.SCANQR,
+        MSG.HANDBACK,
+        MSG.ABORT,
+      ],
 )
 
 /**
  * The human messages that end a handoff, in either mode. They are held for an
  * agent that is not connected at the moment, and they stop the frame replay.
  */
-const TERMINAL_HUMAN = new Set(["handback", "abort", "approve", "deny"])
+const TERMINAL_HUMAN = new Set([MSG.HANDBACK, MSG.ABORT, MSG.APPROVE, MSG.DENY])
 
 /** Must equal HEARTBEAT_INTERVAL_MS in src/relay/protocol.ts (asserted in relay.test.ts). */
 const HEARTBEAT_INTERVAL_MS = 20000
@@ -79,10 +144,33 @@ const OP_PONG = 0xa
 /** A screencast frame is ~12-65 KB of base64; anything past this is a bug or an attack. */
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
+/**
+ * The ceiling for a message from the human, which is a different number
+ * entirely.
+ *
+ * Every message this side may send is a handful of fields — a tap is two
+ * integers, the longest is one character of text — so four kilobytes is
+ * already a thousandfold of what any of them needs. The agent's frames are the
+ * reason the cap above is megabytes; a bearer-link holder padding an accepted
+ * \`scanqr\` to eight of them is the reason this one is not. Enforced in the
+ * reader, before anything is parsed.
+ */
+const MAX_HUMAN_MESSAGE_BYTES = 4 * 1024
+
+/**
+ * The relay's own floor between two scans, in milliseconds.
+ *
+ * The core enforces this too and its copy is the one that protects the
+ * browser. This one protects the relay and the agent's socket: a burst of
+ * accepted \`scanqr\` objects still costs a forward, a parse on the other side
+ * and a wake-up each, and none of that is the core's to refuse.
+ */
+const SCAN_INTERVAL_MS = 2000
+
 /** Grace before a replaced/closed socket is force-destroyed if it hangs on. */
 const CLOSE_GRACE_MS = 1000
 
-const PONG = JSON.stringify({ type: "pong" })
+const PONG = JSON.stringify({ type: MSG.PONG })
 
 /** role -> peer. At most one connection per role; a new one replaces the old. */
 const peers = new Map()
@@ -117,6 +205,9 @@ let pendingForAgent = null
  * scrubbed, because the agent does not yet know it has been answered.
  */
 let humanEnded = false
+
+/** When the relay last forwarded a \`scanqr\`. See SCAN_INTERVAL_MS. */
+let lastScanAt = 0
 
 /**
  * Forget everything that shows the remote page. Not the ending, which a late
@@ -154,7 +245,7 @@ function encodeFrame(payload, opcode) {
  * frames and fragmentation (browsers do not fragment, but proxies may).
  * \`onMessage(payload, opcode)\` fires once per complete application message.
  */
-function createReader(onMessage, onPing, onClose) {
+function createReader(onMessage, onPing, onClose, maxBytes) {
   let buffered = Buffer.alloc(0)
   let fragments = []
   let fragmentBytes = 0
@@ -178,7 +269,7 @@ function createReader(onMessage, onPing, onClose) {
         length = Number(buffered.readBigUInt64BE(2))
         offset = 10
       }
-      if (length > MAX_MESSAGE_BYTES) {
+      if (length > maxBytes) {
         onClose()
         return
       }
@@ -212,7 +303,7 @@ function createReader(onMessage, onPing, onClose) {
       // Per-frame length is capped above, but a stream of small continuation
       // frames that never sets fin would grow \`fragments\` without bound (60 MB
       // reassembled to 148 MB, verified). Cap the running sum too.
-      if (fragmentBytes > MAX_MESSAGE_BYTES) {
+      if (fragmentBytes > maxBytes) {
         onClose()
         return
       }
@@ -248,7 +339,13 @@ function closePeer(peer, reason) {
   // up on it after two seconds), so the scrub cannot wait for it. A handoff
   // that is still running restores this by itself: every agent reconnect
   // re-sends its state, and in approval mode its screenshot.
-  if (peer.role === "agent") forgetPage()
+  if (peer.role === "agent") {
+    forgetPage()
+    // An agent that is gone will never drain, so its backpressure must not be
+    // what keeps the human muted: the handback they are about to send has to
+    // be read, held, and given to whichever agent connects next.
+    resumeHuman()
+  }
   // Detach the reader so a replaced client that ignores the close frame can no
   // longer feed route(); a lingering listener is how a peer keeps injecting.
   if (peer.read) peer.socket.removeListener("data", peer.read)
@@ -288,7 +385,7 @@ function messageType(payload) {
 
 /** Keep what a human who joins late has to be shown, and drop what they must not. */
 function rememberFromAgent(type, payload) {
-  if (type === "ended") {
+  if (type === MSG.ENDED) {
     // Terminal: keep the ending for a late human, drop everything that could
     // show the logged-in page to whoever opens the link next.
     lastEnded = payload
@@ -301,9 +398,9 @@ function rememberFromAgent(type, payload) {
   // Forwarding that is harmless; storing it would put the page back in front
   // of the next visitor after this relay decided to drop it.
   if (humanEnded) return
-  if (type === "frame") lastFrame = payload
-  else if (type === "state") lastState = payload
-  else if (type === "focus") lastFocus = payload
+  if (type === MSG.FRAME) lastFrame = payload
+  else if (type === MSG.STATE) lastState = payload
+  else if (type === MSG.FOCUS) lastFocus = payload
 }
 
 /** One line per relay at most: a hostile client must not be able to fill the log. */
@@ -314,7 +411,7 @@ function logDrop(type) {
   dropLogged = true
   log("human message dropped", {
     type: String(type).slice(0, 32),
-    mode: MODE,
+    mode: HANDOFF_MODE,
     ended: humanEnded,
   })
 }
@@ -329,6 +426,19 @@ function acceptFromHuman(type, payload) {
   if (humanEnded || !HUMAN_MESSAGES.has(type)) {
     logDrop(type)
     return false
+  }
+  // The scan floor, enforced here as well as in the core. The core's copy is
+  // what protects the browser from a screenshot loop; this one keeps a burst of
+  // accepted scans from costing a forward, a wake-up and a JSON parse on the
+  // agent's side for each one. Dropped, never queued: a scan is only worth
+  // anything against the page as it is now.
+  if (type === MSG.SCANQR) {
+    const now = Date.now()
+    if (now - lastScanAt < SCAN_INTERVAL_MS) {
+      logDrop(type)
+      return false
+    }
+    lastScanAt = now
   }
   if (TERMINAL_HUMAN.has(type)) {
     // The human is done, for good. Buffer this for an agent that is
@@ -353,7 +463,7 @@ function route(peer, payload, opcode) {
     return
   }
   const type = messageType(payload)
-  if (type === "ping") {
+  if (type === MSG.PING) {
     sendText(peer, PONG)
     return
   }
@@ -361,8 +471,44 @@ function route(peer, payload, opcode) {
   else if (!acceptFromHuman(type, payload)) return
   // Newest frame wins: drop a frame bound for a backpressured receiver rather
   // than queue it in memory. Control and terminal messages are never dropped.
-  if (type === "frame" && other?.backpressure) return
+  if (type === MSG.FRAME && other?.backpressure) return
   write(other, payload, opcode)
+  // The human is producing faster than the agent's socket can take it. Stop
+  // reading that socket rather than growing this process's write queue with
+  // input nobody has asked for yet: TCP holds it, and the agent's \`drain\`
+  // starts it again.
+  //
+  // What this does and does not promise. The message just written is not held
+  // back, so the one that triggered the pause is delivered. Anything already
+  // behind it in the human's socket buffer — a handback among them — is *not
+  // lost but is delayed*, until the agent drains or goes away; \`closePeer\`
+  // resumes the human for the second case, so a dead agent cannot mute one
+  // forever. Separating terminal messages out would mean parsing before the
+  // flow-control decision, which is the work the 4 KiB cap exists to avoid.
+  if (peer.role === "human" && other?.backpressure) holdHuman(peer)
+}
+
+/**
+ * Stop reading a human socket until the agent's has drained.
+ *
+ * Not a drop. Everything already read has been routed, and everything still in
+ * flight is where TCP is best at holding it. \`resumeHuman\` runs on the agent's
+ * \`drain\` and again when the agent goes away entirely, so a human is never
+ * left muted by a peer that is not coming back.
+ */
+function holdHuman(peer) {
+  if (peer.paused) return
+  peer.paused = true
+  peer.socket.pause()
+  log("human paused", { reason: "agent backpressure" })
+}
+
+function resumeHuman() {
+  const human = peers.get("human")
+  if (!human?.paused) return
+  human.paused = false
+  human.socket.resume()
+  log("human resumed", {})
 }
 
 function log(event, detail) {
@@ -374,6 +520,26 @@ function log(event, detail) {
       human: peers.has("human"),
       ...detail,
     }),
+  )
+}
+
+/**
+ * The mobile page, with this relay's two facts substituted in: which mode it
+ * is serving, and the wire vocabulary. The page never spells a message type
+ * itself — it reads \`MSG\` out of the same object the router above uses, so a
+ * type that is renamed in one place cannot survive in the other.
+ */
+function renderPage() {
+  // Function replacements, so a \`$&\` or a \`$'\` in a substituted value stays a
+  // literal instead of becoming a back-reference that rewrites the page.
+  const vocabulary = JSON.stringify({
+    msg: MSG,
+    mode: MODE,
+    schemes: OPENABLE_SCHEMES,
+  })
+  return PAGE.replace("__HANDRAISE_MODE__", () => HANDOFF_MODE).replace(
+    "__HANDRAISE_VOCAB__",
+    () => vocabulary,
   )
 }
 
@@ -392,9 +558,9 @@ const server = createServer((req, res) => {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
     })
-    // MODE is one of two literals, so this substitution can only produce the
-    // two pages this file was written for.
-    res.end(PAGE.replace("__HANDRAISE_MODE__", MODE))
+    // HANDOFF_MODE is one of two literals, so this substitution can only
+    // produce the two pages this file was written for.
+    res.end(renderPage())
     return
   }
   res.writeHead(404, {
@@ -454,7 +620,14 @@ server.on("upgrade", (req, socket, head) => {
   const previous = peers.get(role)
   if (previous) closePeer(previous, "replaced")
 
-  const peer = { role, socket, open: true, backpressure: false }
+  const peer = {
+    role,
+    socket,
+    open: true,
+    backpressure: false,
+    // Human only: set while its socket is held for a backpressured agent.
+    paused: false,
+  }
   peers.set(role, peer)
   log("peer connected", { role })
 
@@ -462,12 +635,15 @@ server.on("upgrade", (req, socket, head) => {
     (payload, opcode) => route(peer, payload, opcode),
     (payload) => write(peer, payload, OP_PONG),
     () => closePeer(peer, "peer closed the socket"),
+    role === "human" ? MAX_HUMAN_MESSAGE_BYTES : MAX_MESSAGE_BYTES,
   )
   peer.read = read
   if (head?.length) read(head)
   socket.on("data", read)
   socket.on("drain", () => {
     peer.backpressure = false
+    // The agent can take input again, so the human may speak again.
+    if (peer.role === "agent") resumeHuman()
   })
   socket.on("error", () => closePeer(peer, "socket error"))
   socket.on("close", () => closePeer(peer, "socket closed"))
@@ -503,7 +679,7 @@ server.listen(PORT, "0.0.0.0", () => {
   // Report the bound port, not the requested one: port 0 asks the OS to pick a
   // free one, which is how the local test suite avoids fighting for 3000.
   const bound = server.address()
-  log("relay listening", { port: bound?.port ?? PORT, mode: MODE })
+  log("relay listening", { port: bound?.port ?? PORT, mode: HANDOFF_MODE })
 })
 
 const PAGE = \`<!doctype html>
@@ -783,14 +959,18 @@ const PAGE = \`<!doctype html>
      or one step and sit together in typing order; clear destroys the whole
      field with no undo, so it is a word rather than a glyph a stranger has to
      guess at, and it sits behind a gutter the thumb has to reach for. A missed
-     backspace can no longer empty the field. */
-  #key-clear {
+     backspace can no longer empty the field.
+
+     Scan QR is past the gutter with it — not because it is destructive, but
+     because it is not a key. It asks the agent a question about the page
+     instead of typing into it, and the three glyphs keep their own group. */
+  #key-clear, #key-qr {
     flex: 0 0 auto;
     min-width: 44px;
-    margin-left: 18px;
     padding: 0 8px;
     font-size: 13px;
   }
+  #key-clear { margin-left: 18px; }
   .key:active:not(:disabled) {
     color: var(--text);
     border-color: oklch(0.44 0 0);
@@ -898,6 +1078,90 @@ const PAGE = \`<!doctype html>
   #overlay[hidden] { display: none; }
   #overlay h1 { margin: 0; font-size: 20px; letter-spacing: -0.02em; }
   #overlay p { margin: 0; color: var(--muted); font-size: 14px; }
+  /* What the QR code said.
+     A sheet and not a second overlay: the overlay ends the session, this one is
+     an answer the human reads and dismisses, and the frame stays behind it
+     because the next thing they do is usually on the page. It rises from the
+     bottom edge, where the thumb already is. */
+  #sheet {
+    position: fixed;
+    inset: 0;
+    /* Above the ending overlay, which is 10. The overlay is opaque, and a
+       handback taken before the human tapped Open would otherwise bury the
+       link this whole feature exists to deliver — with the button disabled,
+       the socket closing and no way to scan again. The sheet has its own Done
+       button, so the end screen is one tap away. */
+    z-index: 11;
+    display: flex;
+    align-items: flex-end;
+    background: oklch(0.11 0 0 / 0.72);
+  }
+  #sheet[hidden] { display: none; }
+  #sheet-card {
+    width: 100%;
+    max-height: 80%;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+    border-top: 1px solid var(--line);
+    border-radius: var(--radius) var(--radius) 0 0;
+    background: var(--surface);
+    transform: translateY(0);
+    transition: transform 220ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+  @starting-style {
+    #sheet-card { transform: translateY(100%); }
+  }
+  #sheet-title { margin: 0; font-size: 17px; letter-spacing: -0.02em; }
+  #sheet-links { display: flex; flex-direction: column; gap: 12px; }
+  .link {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg);
+  }
+  /* The link is the thing being decided on, so it is shown in full and it
+     wraps. anywhere, because a token has no spaces to break at — a truncated
+     URL is exactly how somebody is talked into opening the wrong one. */
+  .link-text {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.35;
+    color: var(--text);
+    overflow-wrap: anywhere;
+  }
+  /* The host is the one word that answers "whose site is this". The rest of a
+     URL is a token nobody reads, so it stays muted and the host does not. */
+  .link-host { color: var(--text); font-weight: 600; }
+  .link-text > span:not(.link-host) { color: var(--muted); }
+  .link-note { margin: 0; font-size: 12px; color: var(--muted); }
+  .link-actions { display: flex; gap: 8px; }
+  /* Same box for the anchor and the button, so the row does not shift by a
+     pixel between a link that can be opened and one that can only be copied. */
+  .link-action {
+    flex: 1 1 0;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 12px;
+    border: 1px solid var(--field);
+    border-radius: var(--radius);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    text-decoration: none;
+  }
+  .link-action:active { background: oklch(0.26 0 0 / 0.4); }
+  #sheet-close { min-height: 44px; }
+  .empty { margin: 0; color: var(--muted); font-size: 14px; }
   /* One page, two jobs. The relay bakes the mode into the body, and the
      controls belonging to the other job are gone rather than disabled: the
      relay refuses to route what they would have sent anyway. */
@@ -934,6 +1198,10 @@ const PAGE = \`<!doctype html>
     .ghost::before { display: none; }
     .ghost[data-holding] { background: oklch(0.65 0.2 25 / 0.14); }
     #approve[data-holding] { background: oklch(0.985 0 0 / 0.12); }
+    #sheet-card { transition: none; }
+    @starting-style {
+      #sheet-card { transform: none; }
+    }
     #overlay { transition: opacity 150ms linear; }
     @starting-style {
       #overlay { opacity: 0; transform: none; }
@@ -967,6 +1235,7 @@ const PAGE = \`<!doctype html>
         <button id="key-tab" class="key" type="button" aria-label="Next field">&#8677;</button>
         <button id="key-enter" class="key" type="button" aria-label="Enter">&#9166;</button>
         <button id="key-clear" class="key" type="button" aria-label="Clear the field" disabled>Clear</button>
+        <button id="key-qr" class="key" type="button" aria-label="Read the QR codes on the page">Scan QR</button>
       </div>
     </div>
     <p class="ask approval-only">
@@ -987,6 +1256,13 @@ const PAGE = \`<!doctype html>
     <h1 id="overlay-title"></h1>
     <p id="overlay-note"></p>
   </div>
+  <div id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <div id="sheet-card">
+      <h2 id="sheet-title"></h2>
+      <div id="sheet-links"></div>
+      <button id="sheet-close" class="primary" type="button">Done</button>
+    </div>
+  </div>
 <script>
 (function () {
   var dot = document.getElementById("dot")
@@ -1004,6 +1280,21 @@ const PAGE = \`<!doctype html>
   var overlayTitle = document.getElementById("overlay-title")
   var overlayNote = document.getElementById("overlay-note")
   var actionEl = document.getElementById("action")
+  var sheet = document.getElementById("sheet")
+  var sheetTitle = document.getElementById("sheet-title")
+  var sheetLinks = document.getElementById("sheet-links")
+
+  /**
+   * The wire vocabulary, injected by the relay that served this page from the
+   * one definition at the top of server.js. Not a copy: a message type renamed
+   * up there is renamed here in the same edit, and relay.test.ts asserts both
+   * against the TypeScript protocol.
+   */
+  var VOCAB = __HANDRAISE_VOCAB__
+  var MSG = VOCAB.msg
+  var MODE = VOCAB.mode
+  /** The schemes this page may build an "Open" link for. See server.js. */
+  var OPENABLE = VOCAB.schemes
 
   /**
    * Takeover or approval, decided by the relay that served this page. In
@@ -1011,10 +1302,22 @@ const PAGE = \`<!doctype html>
    * driving anything: the input row and the key bar are not on the page, and
    * the two messages below are the only ones this side can produce.
    */
-  var APPROVAL = document.body.dataset.mode === "approval"
-  var SENDABLE = APPROVAL
-    ? { approve: 1, deny: 1, ping: 1 }
-    : { tap: 1, char: 1, key: 1, clear: 1, scroll: 1, handback: 1, abort: 1, ping: 1 }
+  var APPROVAL = document.body.dataset.mode === MODE.APPROVAL
+  var SENDABLE = {}
+  ;(APPROVAL
+    ? [MSG.APPROVE, MSG.DENY, MSG.PING]
+    : [
+        MSG.TAP,
+        MSG.CHAR,
+        MSG.KEY,
+        MSG.CLEAR,
+        MSG.SCROLL,
+        MSG.SCANQR,
+        MSG.HANDBACK,
+        MSG.ABORT,
+        MSG.PING
+      ]
+  ).forEach(function (type) { SENDABLE[type] = 1 })
 
   var ws = null
   var retries = 0
@@ -1096,7 +1399,7 @@ const PAGE = \`<!doctype html>
       return
     }
     // A heartbeat is only worth anything now. Replaying it later says nothing.
-    if (message.type === "ping") return
+    if (message.type === MSG.PING) return
     if (outbox.length >= MAX_QUEUED) {
       outbox.shift()
       dropped++
@@ -1544,7 +1847,7 @@ const PAGE = \`<!doctype html>
     // the wheel delta the agent forwards is the inverse of the finger movement.
     // Divided by the zoom, or a magnified page would scroll magnified too.
     var fdy = Math.round((-stepped * frameH) / (box.h * view.scale))
-    if (fdy !== 0) send({ type: "scroll", fdy: fdy })
+    if (fdy !== 0) send({ type: MSG.SCROLL, fdy: fdy })
   }
 
   canvas.addEventListener("pointerdown", function (e) {
@@ -1640,7 +1943,7 @@ const PAGE = \`<!doctype html>
     if (APPROVAL) return
     var point = toFrame(e.clientX, e.clientY)
     if (!point) return
-    send({ type: "tap", fx: point.x, fy: point.y })
+    send({ type: MSG.TAP, fx: point.x, fy: point.y })
     markTap(e.clientX, e.clientY)
   })
   canvas.addEventListener("pointercancel", function (e) {
@@ -1658,8 +1961,8 @@ const PAGE = \`<!doctype html>
     while (shared < mirrored.length && shared < next.length && mirrored[shared] === next[shared]) {
       shared++
     }
-    for (var back = mirrored.length; back > shared; back--) send({ type: "key", key: "Backspace" })
-    for (var i = shared; i < next.length; i++) send({ type: "char", ch: next[i] })
+    for (var back = mirrored.length; back > shared; back--) send({ type: MSG.KEY, key: "Backspace" })
+    for (var i = shared; i < next.length; i++) send({ type: MSG.CHAR, ch: next[i] })
     mirrored = next
   })
   // The mirror and the field are one state: writing kbd.value fires no input
@@ -1672,13 +1975,13 @@ const PAGE = \`<!doctype html>
   kbd.addEventListener("keydown", function (e) {
     if (e.key === "Enter") {
       e.preventDefault()
-      send({ type: "key", key: "Enter" })
+      send({ type: MSG.KEY, key: "Enter" })
       resetMirror()
       return
     }
     // An empty field fires no input event, so this is the only signal that the
     // human wants to delete a character the remote page still holds.
-    if (e.key === "Backspace" && kbd.value === "") send({ type: "key", key: "Backspace" })
+    if (e.key === "Backspace" && kbd.value === "") send({ type: MSG.KEY, key: "Backspace" })
   })
 
   /**
@@ -1721,20 +2024,20 @@ const PAGE = \`<!doctype html>
       kbd.value = kbd.value.slice(0, -1)
       mirrored = kbd.value
     }
-    send({ type: "key", key: "Backspace" })
+    send({ type: MSG.KEY, key: "Backspace" })
   })
   var clearKey = keyButton("key-clear", function () {
-    send({ type: "clear" })
+    send({ type: MSG.CLEAR })
     resetMirror()
   })
   // Tab moves to another field, Enter usually submits: either way what the
   // human types next belongs to a different context than what is mirrored here.
   keyButton("key-tab", function () {
-    send({ type: "key", key: "Tab" })
+    send({ type: MSG.KEY, key: "Tab" })
     resetMirror()
   })
   keyButton("key-enter", function () {
-    send({ type: "key", key: "Enter" })
+    send({ type: MSG.KEY, key: "Enter" })
     resetMirror()
   })
 
@@ -1747,6 +2050,312 @@ const PAGE = \`<!doctype html>
     clearKey.disabled = !(focus && focus.rect)
   }
 
+  // ------------------------------------------------------------ QR codes ---
+  //
+  // The site wants a phone to scan the code it is showing, and the phone is
+  // the thing showing it. So the agent reads it off its own screenshot and
+  // sends back what it said; this half is the button that asks and the sheet
+  // that answers.
+
+  /** Long enough for a screenshot plus a decode across a continent. */
+  var SCAN_TIMEOUT_MS = 12000
+  /** The floor the agent enforces too, kept here so the button rarely hits it. */
+  var SCAN_INTERVAL_MS = 2000
+  var SCAN_HINT = "Reading the page…"
+  var SCAN_FAILED_HINT = "The agent didn't answer — try again"
+  var SCAN_SOON_HINT = "One scan at a time — try again in a moment"
+  var scanning = false
+  var scanTimer = null
+  var lastScanAt = 0
+
+  /**
+   * A link is openable only if this page says so.
+   *
+   * The agent already classified it, but that classification arrives over a
+   * socket anybody holding the handoff URL can write to, and the payload came
+   * off a page the agent did not choose. So the scheme is checked again here,
+   * against the allowlist the relay injected: "javascript:", "data:" and
+   * everything else nobody thought of get a Copy button and no anchor.
+   */
+  /**
+   * Whitespace and control characters, the same rule the agent applies.
+   *
+   * The URL parser deletes a tab or a newline without a word, so a payload
+   * that reads as one host parses as another. Rejecting it outright is what
+   * keeps the parse honest.
+   */
+  function hasUnsafeCharacter(value) {
+    for (var i = 0; i < value.length; i++) {
+      var code = value.charCodeAt(i)
+      if (code <= 0x20 || (code >= 0x7f && code <= 0x9f)) return true
+      // Invisible by design: zero-width joiners and the bidi overrides and
+      // isolates. A right-to-left override reverses the visible tail of a
+      // path, and nothing on the screen says it happened.
+      if (code >= 0x200b && code <= 0x200f) return true
+      if (code >= 0x202a && code <= 0x202e) return true
+      if (code >= 0x2066 && code <= 0x2069) return true
+    }
+    return false
+  }
+
+  /**
+   * A link is openable only if this page says so.
+   *
+   * The agent already classified it, but that classification arrives over a
+   * socket anybody holding the handoff URL can write to, and the payload came
+   * off a page the agent did not choose. So the whole rule is applied again
+   * here — scheme, smuggled control characters, and credentials in the
+   * authority, which is the oldest way to make a link read as one host and go
+   * to another. Not just the scheme: half a lock is not two locks.
+   */
+  function openable(link) {
+    if (!link || link.kind !== "url") return false
+    if (link.text.length === 0 || hasUnsafeCharacter(link.text)) return false
+    try {
+      var url = new URL(link.text)
+      if (url.username !== "" || url.password !== "") return false
+      return OPENABLE.indexOf(url.protocol) !== -1
+    } catch (err) {
+      return false
+    }
+  }
+
+  /**
+   * What the card shows, and what Open and Copy use — one string, never two.
+   *
+   * The payload came out of a QR code drawn by a page nobody vetted, and the
+   * URL parser resolves things the eye cannot: a Cyrillic a in a host lands on
+   * a punycode domain, and a right-to-left override reverses the visible tail
+   * of a path. Showing the raw text next to an anchor that resolves it means
+   * the human reads one address and opens another. So an openable link is
+   * shown as its resolved form, and the card says so when the two differ.
+   * Nothing is truncated; the whole link is still on the screen.
+   */
+  /**
+   * The authority as the code actually wrote it, lowercased.
+   *
+   * Not what the parser made of it — that is the whole point. Empty for a
+   * scheme with no authority (mailto:), where there is no host to be deceived
+   * about.
+   */
+  function writtenHost(text) {
+    // Deliberately not a regular expression: this whole script is a template
+    // literal in server.js, which eats the backslash a regex needs. Two
+    // indexOf calls and a loop cannot be broken by that.
+    var mark = text.indexOf("://")
+    if (mark === -1) return ""
+    var rest = text.slice(mark + 3)
+    var end = rest.length
+    for (var i = 0; i < rest.length; i++) {
+      var c = rest.charAt(i)
+      if (c === "/" || c === "?" || c === "#") { end = i; break }
+    }
+    var authority = rest.slice(0, end)
+    var at = authority.lastIndexOf("@")
+    return (at === -1 ? authority : authority.slice(at + 1)).toLowerCase()
+  }
+
+  function resolveLink(link) {
+    if (!openable(link)) return { shown: link.text, changed: false, host: "" }
+    var url = new URL(link.text)
+    return {
+      shown: url.href,
+      // Only when the host the code wrote is not the host the browser will
+      // connect to. Comparing the whole string instead fired on
+      // "https://example.com" — the parser adds the trailing slash — and on any
+      // capital letter in a scheme or a domain, which is to say on some of the
+      // commonest shapes a QR code has. A warning that goes off on ordinary
+      // input is one a human learns to tap past, and this one has to land on
+      // the day it means a Cyrillic homograph.
+      changed: writtenHost(link.text) !== "" && writtenHost(link.text) !== url.host,
+      // The ASCII host, which is the one the browser will connect to and the
+      // one word on the card worth reading before tapping Open.
+      host: url.host
+    }
+  }
+
+  /**
+   * What a payload is, when it is not something this page will open.
+   *
+   * Two of them are actions rather than pages and are named as such, because
+   * "not a link" says nothing useful about a phone number or an authenticator
+   * secret — and because both are things a human should hand to an app
+   * deliberately rather than in one tap from a page nobody vetted.
+   */
+  function describePayload(text) {
+    var scheme = ""
+    try { scheme = new URL(text).protocol } catch (err) { scheme = "" }
+    if (scheme === "tel:") {
+      return "Phone number. Copy it and dial it yourself — a code like this can carry dialler commands."
+    }
+    if (scheme === "otpauth:") {
+      return "Authenticator secret. Add it by hand, and never from a page you did not expect to see it on."
+    }
+    return "Not a link this page will open. Copy it instead."
+  }
+
+  function actionButton(label, run) {
+    var button = document.createElement("button")
+    button.type = "button"
+    button.className = "link-action"
+    button.textContent = label
+    button.addEventListener("click", run)
+    return button
+  }
+
+  /**
+   * Copy, with the one thing that can go wrong said out loud. The clipboard
+   * API needs a secure context and a user gesture; this has both, but a phone
+   * browser may still refuse, and a Copy button that silently does nothing is
+   * worse than one that admits it.
+   */
+  function copyButton(text) {
+    return actionButton("Copy", function () {
+      var clipboard = navigator.clipboard
+      if (!clipboard) { flashHint("This browser won't let the page copy"); return }
+      clipboard.writeText(text).then(
+        function () { flashHint("Copied") },
+        function () { flashHint("This browser won't let the page copy") }
+      )
+    })
+  }
+
+  function linkNote(card, message) {
+    var note = document.createElement("p")
+    note.className = "link-note"
+    note.textContent = message
+    card.appendChild(note)
+  }
+
+  /** One card per code. textContent only: this string came off a hostile page. */
+  function linkCard(link) {
+    var card = document.createElement("div")
+    card.className = "link"
+    var resolved = resolveLink(link)
+    var text = document.createElement("p")
+    text.className = "link-text"
+    // The host, drawn as the loud part. Everything else in a URL is noise to
+    // the one question a human is answering — whose site is this — and on a
+    // 390px screen the host is otherwise a few characters lost in a token.
+    var split = resolved.host ? resolved.shown.indexOf(resolved.host) : -1
+    if (split === -1) {
+      text.textContent = resolved.shown
+    } else {
+      var before = document.createElement("span")
+      before.textContent = resolved.shown.slice(0, split)
+      var host = document.createElement("span")
+      host.className = "link-host"
+      host.textContent = resolved.host
+      var after = document.createElement("span")
+      after.textContent = resolved.shown.slice(split + resolved.host.length)
+      text.appendChild(before)
+      text.appendChild(host)
+      text.appendChild(after)
+    }
+    card.appendChild(text)
+    var actions = document.createElement("div")
+    actions.className = "link-actions"
+    if (openable(link)) {
+      if (resolved.changed) {
+        linkNote(
+          card,
+          "The code wrote this address differently. This is where it really goes."
+        )
+      }
+      var open = document.createElement("a")
+      open.className = "link-action"
+      open.href = resolved.shown
+      open.target = "_blank"
+      // noopener: the opened page must not get a handle on this one, which is
+      // the tab holding a live handoff. noreferrer keeps the handoff URL — a
+      // bearer credential — out of the other site's logs.
+      open.rel = "noopener noreferrer"
+      open.textContent = "Open in new tab"
+      actions.appendChild(open)
+    } else {
+      linkNote(card, describePayload(link.text))
+    }
+    // Copy takes what is on the card, so what a human pastes elsewhere is the
+    // address they read here and not the one the code smuggled.
+    actions.appendChild(copyButton(resolved.shown))
+    card.appendChild(actions)
+    return card
+  }
+
+  /**
+   * The wire's array, parsed into cards this page can draw.
+   *
+   * A links message carrying a null, a number or an object with no text used
+   * to throw out of the message handler, which skipped endScan() and left the
+   * Scan QR button dead until its twelve-second deadline. Parse it here
+   * instead: anything that is not a payload is not a card.
+   */
+  function readLinks(raw) {
+    var links = []
+    if (!Array.isArray(raw)) return links
+    for (var i = 0; i < raw.length; i++) {
+      var entry = raw[i]
+      if (!entry || entry.text === undefined || entry.text === null) continue
+      var text = String(entry.text)
+      if (text.length === 0) continue
+      links.push({ text: text, kind: entry.kind === "url" ? "url" : "text" })
+    }
+    return links
+  }
+
+  function showLinks(links) {
+    sheetLinks.textContent = ""
+    if (links.length === 0) {
+      sheetTitle.textContent = "No QR code found"
+      var empty = document.createElement("p")
+      empty.className = "empty"
+      empty.textContent =
+        "Nothing on this screen decoded as a QR code. Scroll the page to bring it into view, then scan again."
+      sheetLinks.appendChild(empty)
+    } else {
+      sheetTitle.textContent =
+        links.length > 1 ? links.length + " codes on the page" : "On the page"
+      for (var i = 0; i < links.length; i++) {
+        sheetLinks.appendChild(linkCard(links[i]))
+      }
+    }
+    sheet.hidden = false
+  }
+
+  /** Let the button go again, whatever ended the scan. */
+  function endScan() {
+    if (scanTimer) { clearTimeout(scanTimer); scanTimer = null }
+    scanning = false
+    qrKey.disabled = finished
+    if (hint.textContent === SCAN_HINT) setHint()
+  }
+
+  var qrKey = keyButton("key-qr", function () {
+    if (scanning) return
+    // The agent drops a scan that comes too soon, and a dropped scan is an
+    // answer that never arrives. Say so here instead of spending the wait.
+    if (Date.now() - lastScanAt < SCAN_INTERVAL_MS) {
+      flashHint(SCAN_SOON_HINT)
+      return
+    }
+    lastScanAt = Date.now()
+    scanning = true
+    qrKey.disabled = true
+    hint.textContent = SCAN_HINT
+    send({ type: MSG.SCANQR })
+    // The answer may never come: the agent may have gone, or dropped this one.
+    // Without a deadline the button would stay dead for the rest of the session.
+    scanTimer = setTimeout(function () {
+      scanTimer = null
+      endScan()
+      flashHint(SCAN_FAILED_HINT)
+    }, SCAN_TIMEOUT_MS)
+  })
+
+  document.getElementById("sheet-close").addEventListener("click", function () {
+    sheet.hidden = true
+  })
+
   function finish(title, note) {
     finished = true
     overlayTitle.textContent = title
@@ -1758,6 +2367,9 @@ const PAGE = \`<!doctype html>
     placeRing()
     setHint()
     setClearEnabled()
+    // A scan can no longer be answered: there is no agent left to ask. The
+    // sheet stays if it is open — the link is still worth reading.
+    endScan()
     applyKind("text")
     kbd.blur()
     // A queued answer now has a deadline: keep reconnecting to flush it, but
@@ -1841,11 +2453,11 @@ const PAGE = \`<!doctype html>
     // is; approve is the hold, because it is the one that cannot be undone.
     // That is the takeover's rule with the sides swapped, for the same reason.
     document.getElementById("deny").addEventListener("click", function () {
-      send({ type: "deny" })
+      send({ type: MSG.DENY })
       finish(ENDINGS.denied[0], ENDINGS.denied[1])
     })
     holdButton(document.getElementById("approve"), function () {
-      send({ type: "approve" })
+      send({ type: MSG.APPROVE })
       finish(ENDINGS.approved[0], ENDINGS.approved[1])
     })
   } else {
@@ -1853,11 +2465,11 @@ const PAGE = \`<!doctype html>
     // spirit: the agent looks, fails and asks again. Confirming the happy path
     // is the classic mistake, so this stays a single tap.
     document.getElementById("handback").addEventListener("click", function () {
-      send({ type: "handback" })
+      send({ type: MSG.HANDBACK })
       finish(ENDINGS.resolved[0], ENDINGS.resolved[1])
     })
     holdButton(document.getElementById("abort"), function () {
-      send({ type: "abort" })
+      send({ type: MSG.ABORT })
       finish("Thanks for looking", "The agent knows it can't be done here and will stop. You can close this tab.")
     })
   }
@@ -1866,14 +2478,14 @@ const PAGE = \`<!doctype html>
     var message
     try { message = JSON.parse(raw) } catch (err) { return }
     if (!message) return
-    if (message.type === "frame") showFrame(message.data, message.meta)
-    else if (message.type === "state") {
+    if (message.type === MSG.FRAME) showFrame(message.data, message.meta)
+    else if (message.type === MSG.STATE) {
       reason.textContent = message.reason
       // textContent, never innerHTML: the action is the agent's own sentence,
       // and it goes on the screen a decision is made from.
       if (message.action) actionEl.textContent = message.action
     }
-    else if (message.type === "focus") {
+    else if (message.type === MSG.FOCUS) {
       focus = readFocus(message)
       applyKind(focus.rect ? focus.kind : "text")
       placeRing()
@@ -1881,7 +2493,11 @@ const PAGE = \`<!doctype html>
       setHint()
       setClearEnabled()
     }
-    else if (message.type === "ended") {
+    else if (message.type === MSG.LINKS) {
+      endScan()
+      showLinks(readLinks(message.links))
+    }
+    else if (message.type === MSG.ENDED) {
       var ending = ENDINGS[message.outcome] || ["Session ended", "You can close this tab."]
       finish(ending[0], ending[1])
     }
@@ -1944,7 +2560,7 @@ const PAGE = \`<!doctype html>
     setHint()
   }
   applyTransform(false)
-  setInterval(function () { send({ type: "ping" }) }, 20000)
+  setInterval(function () { send({ type: MSG.PING }) }, 20000)
   window.addEventListener("resize", render)
   // The stage also changes size without the window doing so: a longer reason
   // takes the header to its second line. The letterbox has to follow.

@@ -298,9 +298,12 @@ export function createInputTarget(cdp: CdpChannel): InputTarget {
         appliedCount += 1
         return
       }
+      case "scanqr":
       case "handback":
       case "abort":
-        // Lifecycle, not input. raiseHand handles these.
+        // Not input: nothing about these touches the page through this module.
+        // raiseHand handles them — the first by taking a screenshot, the other
+        // two by ending the handoff.
         return
     }
   }

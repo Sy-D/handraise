@@ -39,6 +39,7 @@ import type {
 import { notifyWebhook } from "../webhook"
 import { NO_FOCUS, probeFocus } from "./focus"
 import { createInputTarget } from "./input"
+import { createQrScanner, scanPageForLinks } from "./qr-scan"
 import { DEFAULT_PROFILE, type FramePump, startFramePump } from "./screencast"
 import { type ApprovalFrame, captureApprovalFrame } from "./snapshot"
 import { connectRelay, type RelayConnection } from "./socket"
@@ -60,6 +61,14 @@ const RELAY_SLACK_MS = 5 * 60_000
  * relay's sandbox slot. Better to lose the cookies than the whole function.
  */
 const STORAGE_STATE_TIMEOUT_MS = 5_000
+
+/**
+ * Floor between two QR scans. Two seconds is the shortest gap at which a
+ * second scan can say something new — the human has to move the page for it
+ * to — and it is long enough that a stuck button cannot turn a live cast into
+ * a screenshot loop.
+ */
+const QR_SCAN_INTERVAL_MS = 2_000
 
 /** Resolve `promise`, or reject with `label` if it has not settled in `ms`. */
 function withTimeout<T>(
@@ -376,6 +385,64 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       })
   }
 
+  /**
+   * Scans the human asked for and answers they were actually sent.
+   *
+   * Both count delivered results, not attempts: a scan whose answer is thrown
+   * away because the handoff settled while it was in flight is not something
+   * anybody was told, and the event is built after the counters are frozen so
+   * it cannot report a number that changed afterwards.
+   */
+  let qrScans = 0
+  let qrHits = 0
+  // One scan at a time, and never two inside the interval. A scan costs a
+  // full-resolution screenshot of a page that is already casting to a phone,
+  // so a held button must not be able to turn into a screenshot loop. The
+  // phone and the relay enforce the same floor; this is the one that counts,
+  // because the socket behind the handoff URL is reachable from any HTTP client.
+  let scanning = false
+  let lastScanAt = 0
+  // The decode runs on a worker thread. The scanner object is free — it starts
+  // no thread until the first scan — so it is made here and closed at
+  // teardown unconditionally. `scanTask` is the handle teardown waits on, so a
+  // decode is never still running against a page the caller has moved on from.
+  const scanner = createQrScanner()
+  let scanTask: Promise<void> = Promise.resolve()
+
+  /**
+   * Read the QR codes on the page and send the human what they carry.
+   *
+   * Off the critical path, like the focus probe — nothing on the handoff's own
+   * path awaits it — but retained, so teardown can.
+   */
+  const scanQr = (): void => {
+    const now = Date.now()
+    if (scanning || over || now - lastScanAt < QR_SCAN_INTERVAL_MS) return
+    lastScanAt = now
+    scanning = true
+    scanTask = scanPageForLinks(page, scanner)
+      .then((links) => {
+        // Checked here, between the screenshot and the answer: the handoff can
+        // settle while a CDP round trip is in flight, and an answer nobody can
+        // be sent is not a scan that happened.
+        if (over) return undefined
+        qrScans += 1
+        if (links.length > 0) qrHits += 1
+        return link?.send({ type: "links", links, source: "qr" })
+      })
+      // A screenshot fails when the page is closing, which is a handoff that
+      // is about to end as `disconnected` — the phone gets that, and its own
+      // deadline releases the button. Answering with an empty list here would
+      // tell the human the page has no code on it, which is a different and
+      // untrue thing.
+      .catch((error) => {
+        logger.warn("qr_scan_failed", { error: String(error) })
+      })
+      .finally(() => {
+        scanning = false
+      })
+  }
+
   const onHuman = (message: HumanToAgent): void => {
     const ending = endingFor(mode, message.type)
     if (ending) {
@@ -386,6 +453,12 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     // abandoned, so no further input may run against it. An approval never
     // injects anything at all: the human is answering, not driving.
     if (terminal || mode === "approval") return
+    // The one message that asks the agent about the page instead of changing
+    // it, so it is answered before the input path and needs no frame metadata.
+    if (message.type === "scanqr") {
+      scanQr()
+      return
+    }
     // Input can only be mapped once a frame has defined the coordinate space.
     const meta = pump?.lastMeta()
     if (!meta || !input) return
@@ -544,6 +617,12 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   clearTimeout(timer)
   browser?.off("disconnected", onGone)
   page.off("close", onGone)
+  // Let a scan that was in flight when the handoff settled finish reporting
+  // itself, then stop its worker. Awaited before the wide event is built, so
+  // `qrScans` and `qrHits` are frozen by the time it reads them; the decode
+  // has its own six-second deadline, so this cannot wait on a hung thread.
+  await scanTask
+  await scanner.close()
   await pump?.stop()
   // The ending must reach the phone, so wait briefly for a reconnect if the
   // socket is momentarily down rather than dropping it like a stale frame.
@@ -565,6 +644,8 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     framesSent,
     bytesSent,
     inputsApplied: input?.applied() ?? 0,
+    qrScans,
+    qrHits,
     reconnects: connection.stats().reconnects,
     storageStateCaptured: storageState !== undefined,
   }

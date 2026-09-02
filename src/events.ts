@@ -47,6 +47,17 @@ export interface HandoffEvent {
    * in approval mode, which injects nothing.
    */
   inputsApplied: number
+  /**
+   * QR scans the human asked for and the agent performed. Requests dropped by
+   * the rate limit are not counted — they cost nothing and happened only in
+   * the sense that a button was pressed twice. Always 0 in approval mode,
+   * which offers no scan.
+   */
+  qrScans: number
+  /** Of those, the ones that found at least one code. `qrScans - qrHits` is
+   *  how often the human was told "nothing here", which is the number worth
+   *  watching: it is either a page that has no code or a decode that failed. */
+  qrHits: number
   /** Agent-socket reconnects during the handoff (the 60 s idle cut, drops). */
   reconnects: number
   /** Whether cookies + localStorage were captured after a handback. */

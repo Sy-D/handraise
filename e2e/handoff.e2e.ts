@@ -26,7 +26,7 @@ import type { Page } from "playwright-core"
 
 import type { HandoffEvent } from "../src/events"
 import { raiseHand } from "../src/index"
-import { startTestApp } from "../test-app/deploy"
+import { previewPath, startTestApp } from "../test-app/deploy"
 import { msUntilNextStep, totp } from "../test-app/totp"
 import { openHandoffPage } from "./human-sim"
 
@@ -242,6 +242,111 @@ try {
     `the relay sandbox is gone (${relayGone.status})`,
   )
   await relayGone.text()
+
+  // --- QR passthrough: the code on the page, opened on the phone ---------
+  //
+  // The device-change check, which the human on a phone cannot answer by
+  // scanning their own screen. The agent reads the code off a full-resolution
+  // screenshot and hands the human the link; the human opens it, and the site
+  // is satisfied on a device that has never seen it before.
+  const qrAt = Date.now()
+  await page.goto(previewPath(app.url, "/qr"), {
+    waitUntil: "domcontentloaded",
+    timeout: 30_000,
+  })
+  await page.waitForSelector('[data-testid="qr-code"]', { timeout: 15_000 })
+
+  // The selector only says the element is there. A scan that finds nothing is
+  // then two different bugs — a code that never drew, or a decoder that could
+  // not read it — and this is what tells them apart.
+  const drawn = await page.evaluate(() => {
+    const image = document.querySelector("img")
+    if (!image) return null
+    const rect = image.getBoundingClientRect()
+    return {
+      complete: image.complete,
+      natural: image.naturalWidth,
+      css: Math.round(rect.width),
+      src: image.src.length,
+    }
+  })
+  log("qr_page", drawn ?? { drawn: false })
+  check(
+    (drawn?.natural ?? 0) > 0,
+    `the code is drawn on the page (${JSON.stringify(drawn)})`,
+  )
+
+  let qrUrl = ""
+  let qrEvent: HandoffEvent | undefined
+  const scanning = raiseHand(page, {
+    reason: "Aurora Bank wants this code scanned with your phone",
+    qr: false,
+    timeoutMs: 60_000,
+    onUrl: (url) => {
+      qrUrl = url
+    },
+    onEvent: (raised) => {
+      qrEvent = raised
+    },
+  })
+  pending = scanning
+
+  while (qrUrl === "") await Bun.sleep(50)
+  const scanner = await openHandoffPage(qrUrl)
+  await scanner.waitForFrame()
+
+  const scanAt = Date.now()
+  const links = await scanner.scanqr()
+  timings.qrScanMs = Date.now() - scanAt
+  log("qr_scanned", {
+    ms: timings.qrScanMs,
+    count: links.length,
+    kind: links[0]?.kind,
+  })
+  if (links.length === 0) {
+    // Keep the pixels the agent was looking at. Reading a failure off a
+    // screenshot beats guessing at it from a count.
+    const evidence = "/tmp/handraise-qr-e2e-failure.png"
+    await Bun.write(evidence, await page.screenshot({ type: "png" }))
+    log("qr_evidence", { path: evidence })
+  }
+  check(
+    links.length === 1,
+    `the agent found exactly one code (${links.length})`,
+  )
+  check(
+    links[0]?.text === app.verifyUrl,
+    "the link the human got is the one inside the code on the page",
+  )
+  check(links[0]?.kind === "url", "an https link is offered as openable")
+
+  // The human "opens" it. A phone, not this browser: no session cookie, no
+  // preview cookie, nothing but the link itself.
+  const visited = await fetch(links[0]?.text ?? "", { cache: "no-store" })
+  const visitedBody = await visited.text()
+  check(visited.status === 200, `the link opens (${visited.status})`)
+  check(
+    visitedBody.includes('data-testid="verified"'),
+    "opening it reached the confirmation page",
+  )
+
+  await scanner.handback()
+  const scanned = await scanning
+  pending = null
+  timings.qrCaseMs = Date.now() - qrAt
+  log("qr_done", {
+    outcome: scanned.outcome,
+    scans: qrEvent?.qrScans,
+    hits: qrEvent?.qrHits,
+    ms: timings.qrCaseMs,
+  })
+  check(scanned.outcome === "resolved", "the QR handoff resolved")
+  check(
+    qrEvent?.qrScans === 1,
+    `the wide event counts one scan (${qrEvent?.qrScans})`,
+  )
+  check(qrEvent?.qrHits === 1, `and one hit (${qrEvent?.qrHits})`)
+  await scanner.close()
 
   // --- Approval: the human answers a question, and drives nothing --------
   //

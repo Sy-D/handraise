@@ -7,8 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — 0.6.0
 
+QR passthrough, and typed errors on everything `raiseHand` throws.
+
+A device-change check draws a QR code and asks for a phone — and handraise's
+human is holding that phone, looking at the code on its screen. A phone cannot
+scan itself, so until now this needed a second device. The agent reads the code
+off the page instead and hands the human the link.
+
+The QR half is additive: no existing call, type or outcome changes. The errors
+half is not entirely — a page that is already dead now throws instead of
+returning `disconnected`. Both are under **Changed**.
+
 ### Added
 
+- **A `Scan QR` key on the phone, in takeover mode.** It asks the agent to read
+  the QR codes on the page; the answer arrives as a sheet showing what each one
+  said, with **Open in new tab** and **Copy**. The button is disabled while a
+  scan is in flight and releases itself if no answer comes.
+- **Two protocol messages**: human→agent `{ type: "scanqr" }`, and agent→human
+  `{ type: "links", links: ScannedLink[], source: "qr" }` — always sent, with
+  an empty list when nothing decoded, because silence reads as a broken button.
+  The relay routes `scanqr` in takeover mode only.
+- **`scanQrLinks(png)`, `createQrScanner()` and `OPENABLE_SCHEMES` are
+  exported.** The decoder is usable without a human: hand it a PNG screenshot,
+  get back up to two `{ text, kind }`. `scanQrLinks` is synchronous;
+  `createQrScanner()` is the same decode on a worker thread, which is what a
+  handoff uses — measured, a 4K screenshot held the event loop for 2132 ms and
+  now holds it for 1 ms.
+- **`kind` is `"url"` only for `http:`, `https:` and `mailto:`**, with no
+  control or bidi characters and no credentials in the authority. `tel:` and
+  `otpauth:` were openable in earlier drafts of this release and are not: a
+  dialler control sequence and an authenticator enrolment are actions rather
+  than pages, and neither is worth one tap from a page nobody vetted. They are
+  still decoded, shown in full and copyable, under a label that names them.
+- **The phone applies that whole rule again** rather than trusting a label that
+  crossed a socket a stranger holding the link can write to, and an openable
+  link is displayed, anchored and copied as the address it resolves to, with
+  the host as the loud part — so a homograph host cannot show one address and
+  open another.
+- **The PNG decoder refuses what it cannot have produced.** Dimensions,
+  compressed size and the exact inflated length are all bounded by the header
+  before a byte is decompressed, chunk boundaries are walked, and IEND is
+  required. CRCs are deliberately not checked, and the ADR says why.
+- **The relay bounds its own ingress**: 4 KiB per human message enforced before
+  the parse, the scan floor enforced there as well as in the core, and the
+  human socket held while the agent's is backpressured — with terminal answers
+  delivered first, never dropped.
+- **`HandoffEvent.qrScans` and `HandoffEvent.qrHits`.** Two new **required**
+  number fields on the wide event — additive for callers, who receive the
+  event rather than construct it, but a TypeScript consumer that builds a
+  `HandoffEvent` literal in a test will need them. Both are 0 in approval mode,
+  which offers no scan. `qrScans - qrHits` is the number worth watching.
+- **`jsqr` as a runtime dependency** (pure JavaScript, no dependencies of its
+  own), and a PNG decoder written against `node:zlib` in `src/core/png.ts`.
+  `BarcodeDetector` does not exist in Solari's Chromium, so the decode happens
+  in the agent process — never in the remote page, whose JavaScript belongs to
+  whoever the agent got stuck on.
+- **[ADR 0008](docs/adr/0008-qr-passthrough.md)** and
+  **[measurement 05](docs/measurements/05-qr.md)**, reproducible with
+  `bun --env-file=.env scripts/measure-qr-decode.ts`.
 - **Typed errors: `HandraiseError`, `HandraiseErrorCode`, `isHandraiseError`.**
   Everything `raiseHand` throws now carries a `code` you can branch on —
   `missing_api_key`, `invalid_mode`, `empty_action`, `browser_unusable`,
@@ -59,6 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `node20`). It always was the floor: `@solarisdk/browser` and the patchright
   runtime it wraps require Node 20, so a Node 18 install never worked; the
   package just did not say so.
+- **`src/relay/guest/server.js` names its wire vocabulary.** `MSG` and `MODE`
+  replace the bare strings the untyped relay compared against, and the mobile
+  page it serves is handed the same object at serve time instead of keeping its
+  own copy. `relay.test.ts` asserts `MSG` against the TypeScript protocol's own
+  unions, so neither side can grow a message alone. No behaviour change.
 - **A page that is already dead is now refused instead of handed off.**
   `raiseHand` used to create a relay, fail on the first CDP call and *return*
   `{ outcome: "disconnected" }`. It now throws a `HandraiseError`
@@ -82,6 +144,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   references itself) becomes a plain redacted `Error` rather than an exception.
   Apart from the page check above, nothing throws that did not throw before,
   and no outcome became an exception.
+
+### Known limits
+
+- A scan takes a fresh full-resolution `page.screenshot()`, 293 ms p50 measured
+  from Germany. It is rate-limited to one per 2 s in the core.
+- A symbol drawn below about 120 CSS pixels does not decode. The live cast
+  frame — 800 px, JPEG quality 60 — fails well before that, which is why the
+  scan does not reuse it.
+- A code the page drew at a resampled size can be sharp and still not be found
+  on the first pass, so a scan looks again at 2x and then at four overlapping
+  corners. A page with no code at all pays all three, about 320 ms of CPU.
+- Two codes on one screen need a tiled second pass to be found at all; three or
+  more are not attempted.
+- **reCAPTCHA itself is untested.** Its demo never served the scan-to-verify
+  variant, which Google shows at its own discretion. The mechanism is proven
+  end to end in the live e2e against a page that behaves the same way.
 
 ## [0.5.1] - 2026-09-02
 

@@ -4,9 +4,15 @@
  * `fetch`, with redirects followed by hand so the cookies are visible.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { totp } from "./totp"
 
 const APP_PATH = new URL("./guest/app.js", import.meta.url).pathname
+const QR_DIR = mkdtempSync(join(tmpdir(), "handraise-qr-"))
+const QR_FILE = join(QR_DIR, "qr.json")
+const VERIFY_TOKEN = "a-one-time-device-token"
 const USER = "grace"
 const PASS = "hopper 1906"
 /** Fixed, so a failure is reproducible; the app never sees it in plain text. */
@@ -100,6 +106,14 @@ beforeAll(async () => {
   await probe.stop(true)
   baseUrl = `http://127.0.0.1:${port}`
 
+  // The device-change code, written the way deploy.ts writes it into the
+  // sandbox: after the app is running, because only then is there an absolute
+  // link to encode. A temporary file, so the repository stays clean.
+  writeFileSync(
+    QR_FILE,
+    JSON.stringify({ token: VERIFY_TOKEN, png: "data:image/png;base64,AAAA" }),
+  )
+
   app = Bun.spawn(["node", APP_PATH], {
     env: {
       ...process.env,
@@ -107,6 +121,7 @@ beforeAll(async () => {
       TOTP_SECRET: SECRET,
       APP_USER: USER,
       APP_PASS: PASS,
+      QR_FILE,
     },
     stdout: "ignore",
     stderr: "inherit",
@@ -125,6 +140,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   app?.kill()
+  rmSync(QR_DIR, { recursive: true, force: true })
 })
 
 test("GET /healthz answers 200 ok", async () => {
@@ -341,4 +357,37 @@ test("an unknown path is a 404 page", async () => {
   const response = await fetch(`${baseUrl}/nope`)
   expect(response.status).toBe(404)
   expect(await response.text()).toContain('data-testid="not-found"')
+})
+
+test("GET /qr needs the session and then shows the code", async () => {
+  const anonymous = await fetch(`${baseUrl}/qr`, { redirect: "manual" })
+  expect(anonymous.status).toBe(303)
+  expect(anonymous.headers.get("location")).toBe("/")
+
+  const jar = await loginToTotpStep()
+  await request(jar, "/totp", form([["code", totp(SECRET)]]))
+  const response = await request(jar, "/qr")
+  expect(response.status).toBe(200)
+  const html = await response.text()
+  expect(html).toContain('data-testid="qr-code"')
+  expect(html).toContain("data:image/png;base64,AAAA")
+})
+
+test("GET /verified takes the token and nothing else", async () => {
+  // No session anywhere in this test: the token is the whole credential, which
+  // is what makes the link worth passing to a phone that has never seen this
+  // site. That is the shape of a real device-change check.
+  const ok = await fetch(
+    `${baseUrl}/verified?token=${encodeURIComponent(VERIFY_TOKEN)}`,
+  )
+  expect(ok.status).toBe(200)
+  expect(await ok.text()).toContain('data-testid="verified"')
+
+  for (const token of ["", "wrong", `${VERIFY_TOKEN}x`]) {
+    const refused = await fetch(
+      `${baseUrl}/verified?token=${encodeURIComponent(token)}`,
+    )
+    expect(refused.status).toBe(403)
+    expect(await refused.text()).toContain('data-testid="not-verified"')
+  }
 })

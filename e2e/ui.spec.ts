@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url"
 import { type Browser, chromium, type Page } from "playwright-core"
 import WebSocket from "ws"
 
+import { NEVER_OPENABLE } from "../src/core/qr-fixtures"
 import type {
   FocusRect,
   FrameMeta,
@@ -81,6 +82,8 @@ interface RelayLog {
 
 interface AgentClient {
   send(message: RelayMessage): void
+  /** Put bytes on the wire that the protocol has no way to describe. */
+  sendRaw(text: string): void
   next(): Promise<RelayMessage>
   /** Every message this socket has seen, in order. `next()` never consumes it,
    *  so a test can assert that something was sent *exactly once*. */
@@ -187,6 +190,9 @@ async function connectAgent(port: number): Promise<AgentClient> {
   return {
     send(message) {
       socket.send(JSON.stringify(message))
+    },
+    sendRaw(text) {
+      socket.send(text)
     },
     received,
     next() {
@@ -618,7 +624,7 @@ test("the clear key is offered only while a remote field is focused", async () =
   expect(consoleErrors).toEqual([])
 })
 
-const KEY_IDS = ["#key-back", "#key-tab", "#key-enter", "#key-clear"]
+const KEY_IDS = ["#key-back", "#key-tab", "#key-enter", "#key-clear", "#key-qr"]
 
 /** Every key button's box, in the order the ids are given. */
 async function keyBoxes(): Promise<Box[]> {
@@ -1387,3 +1393,402 @@ test("the reconnect loop gives up flushing once its deadline passes", async () =
   )
   expect(unexpected).toEqual([])
 }, 20000)
+
+// --- QR passthrough: the button, the sheet, and what it refuses to open ----
+
+const QR_LINK = "https://verify.example.com/device?token=abc123"
+
+/**
+ * Wait for the result sheet to be on screen (or gone).
+ *
+ * When it is coming in, wait for the card to have finished rising as well: it
+ * starts a `translateY(100%)` below the fold, so between the `hidden` flip and
+ * the end of the transition its contents are outside the viewport and
+ * `elementFromPoint` over them answers null.
+ */
+async function waitForSheet(visible: boolean): Promise<void> {
+  await page.waitForFunction((want: boolean) => {
+    const sheet = document.getElementById("sheet")
+    if (!sheet || !sheet.hidden !== want) return false
+    if (!want) return true
+    const card = document.getElementById("sheet-card")
+    return card ? card.getBoundingClientRect().bottom <= innerHeight + 1 : false
+  }, visible)
+}
+
+/** The text of every link card in the sheet, in order. */
+function sheetTexts(): Promise<string[]> {
+  return page
+    .locator("#sheet-links .link-text")
+    .allTextContents()
+    .then((texts) => texts.map((text) => text.trim()))
+}
+
+test("the scan button is offered in a takeover and not in an approval", async () => {
+  await showFrame()
+  expect(await page.locator("#key-qr").isVisible()).toBe(true)
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
+
+  // The whole input bar is gone in an approval: the human is answering a
+  // question about one screenshot, and there is no live page to scan.
+  await reopenFixture("approval")
+  agent.send({ type: "frame", data: frameData, meta: META })
+  await page.waitForTimeout(150)
+  expect(await page.locator("#key-qr").isVisible()).toBe(false)
+
+  // The page will not even put it on the wire: `scanqr` is not in an approval's
+  // vocabulary. (The relay refuses it too — relay.test.ts "approval mode drops
+  // every takeover message the human sends" — because a hidden control is not
+  // a restriction.)
+  await page.evaluate(() => {
+    document.getElementById("key-qr")?.click()
+  })
+  await page.waitForTimeout(200)
+  expect(agent.received.some((message) => message.type === "scanqr")).toBe(
+    false,
+  )
+  expect(consoleErrors).toEqual([])
+})
+
+test("pressing scan asks the agent once and waits for the answer", async () => {
+  await showFrame()
+
+  await page.locator("#key-qr").click()
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && button.disabled
+  })
+  const scans = agent.received.filter((message) => message.type === "scanqr")
+  expect(scans).toHaveLength(1)
+  expect(await page.locator("#hint").textContent()).toBe("Reading the page…")
+
+  // A second press while the first is in flight must not reach the agent: the
+  // core would drop it anyway, and a dropped scan is an answer that never comes.
+  await page.locator("#key-qr").click({ force: true })
+  await page.waitForTimeout(100)
+  expect(
+    agent.received.filter((message) => message.type === "scanqr"),
+  ).toHaveLength(1)
+
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})
+
+test("the sheet shows the link and opens it in a new tab, never in this one", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([QR_LINK])
+  const open = page.locator("#sheet-links a.link-action")
+  expect(await open.isVisible()).toBe(true)
+  expect(await open.getAttribute("href")).toBe(QR_LINK)
+  // This tab is holding a live handoff. The opened site must not get a handle
+  // on it, and must not be told the handoff URL it came from.
+  expect(await open.getAttribute("target")).toBe("_blank")
+  expect(await open.getAttribute("rel")).toBe("noopener noreferrer")
+
+  // Copy is offered whatever the link is, and the sheet is dismissible.
+  expect(
+    await page.locator("#sheet-links button.link-action").textContent(),
+  ).toBe("Copy")
+  await page.locator("#sheet-close").click()
+  await waitForSheet(false)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a scan that found nothing says so rather than showing an empty sheet", async () => {
+  await showFrame()
+  await page.locator("#key-qr").click()
+  agent.send({ type: "links", links: [], source: "qr" })
+  await waitForSheet(true)
+
+  expect(await page.locator("#sheet-title").textContent()).toBe(
+    "No QR code found",
+  )
+  expect(await sheetTexts()).toEqual([])
+  expect(await page.locator("#sheet-links .empty").textContent()).toContain(
+    "Nothing on this screen decoded",
+  )
+  // And the button is usable again, or the human cannot try after scrolling.
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a payload the page may not open gets no anchor, whatever the agent called it", async () => {
+  await showFrame()
+  // Every one of these arrives labelled `kind: "url"`, which is the lie the
+  // page has to survive: the handoff URL is a bearer credential and the socket
+  // behind it is reachable from any HTTP client, so this side applies the whole
+  // rule again instead of trusting the label. The list is the core's own, so
+  // the two locks cannot drift into checking different things.
+  agent.send({
+    type: "links",
+    links: NEVER_OPENABLE.map((text) => ({ text, kind: "url" as const })),
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([...NEVER_OPENABLE])
+  // No anchor at all — not a disabled one, and not one with a neutered href.
+  expect(await page.locator("#sheet-links a").count()).toBe(0)
+  expect(await page.locator("#sheet-links button.link-action").count()).toBe(
+    NEVER_OPENABLE.length,
+  )
+  expect(
+    await page.locator("#sheet-links .link-note").first().textContent(),
+  ).toContain("Not a link this page will open")
+  expect(consoleErrors).toEqual([])
+})
+
+test("an openable link is shown as the address it actually opens", async () => {
+  await showFrame()
+  // The first character is a Cyrillic a. The eye reads apple.com and the
+  // browser goes to xn--pple-43d.com, so showing the payload beside an anchor
+  // that resolves it shows the human one address and opens another. (A payload
+  // carrying a bidi override never gets this far — it is refused outright, and
+  // `NEVER_OPENABLE` covers that.)
+  const homograph = "https://аpple.com/verify?token=abc"
+  const resolved = new URL(homograph).href
+  expect(resolved).not.toBe(homograph)
+  expect(resolved).toContain("xn--pple-43d.com")
+
+  agent.send({
+    type: "links",
+    links: [{ text: homograph, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  // Shown, anchored and copied: one string, and it is the resolved one.
+  expect(await sheetTexts()).toEqual([resolved])
+  expect(
+    await page.locator("#sheet-links a.link-action").getAttribute("href"),
+  ).toBe(resolved)
+  expect(
+    await page.locator("#sheet-links .link-note").first().textContent(),
+  ).toContain("wrote this address differently")
+  expect(consoleErrors).toEqual([])
+})
+
+test("a dialer string and an authenticator secret are named, not opened", async () => {
+  await showFrame()
+  // "Not a link" says nothing useful about either of these, and both are
+  // things a human should hand to an app deliberately rather than in one tap
+  // from a page nobody vetted.
+  agent.send({
+    type: "links",
+    links: [
+      { text: "tel:*21*1234567890%23", kind: "url" },
+      {
+        text: "otpauth://totp/Example:ada?secret=JBSWY3DPEHPK3PXP",
+        kind: "url",
+      },
+    ],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await page.locator("#sheet-links a").count()).toBe(0)
+  const notes = await page.locator("#sheet-links .link-note").allTextContents()
+  expect(notes[0]).toContain("Phone number")
+  expect(notes[1]).toContain("Authenticator secret")
+  expect(consoleErrors).toEqual([])
+})
+
+test("the host of an openable link is the loud part of it", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  // The one question a human answers before tapping Open is whose site this
+  // is, and on a 390px screen the host is otherwise a few characters lost in
+  // a token.
+  const host = page.locator("#sheet-links .link-host")
+  expect(await host.textContent()).toBe("verify.example.com")
+  const weights = await page.evaluate(() => {
+    const loud = document.querySelector("#sheet-links .link-host")
+    const rest = document.querySelector("#sheet-links .link-text > span")
+    if (!loud || !rest) return null
+    return {
+      loud: getComputedStyle(loud).fontWeight,
+      quiet: getComputedStyle(rest).color,
+      loudColour: getComputedStyle(loud).color,
+    }
+  })
+  expect(Number(weights?.loud)).toBeGreaterThanOrEqual(600)
+  expect(weights?.quiet).not.toBe(weights?.loudColour)
+  expect(consoleErrors).toEqual([])
+})
+
+test("an ordinary link is shown verbatim, with no note about it", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([QR_LINK])
+  expect(await page.locator("#sheet-links .link-note").count()).toBe(0)
+  expect(consoleErrors).toEqual([])
+})
+
+test("normalising a link is not the same as changing it", async () => {
+  await showFrame()
+  // Both of these come back from the URL parser as a different string — a
+  // trailing slash appears, a capital is lowered — and neither is a deception.
+  // A bare domain is one of the commonest shapes a QR code has, and a warning
+  // that fires on it is a warning the human learns to tap past, which is
+  // exactly when the homograph case needs it to land.
+  agent.send({
+    type: "links",
+    links: [
+      { text: "https://example.com", kind: "url" },
+      { text: "HTTPS://Example.COM/Path", kind: "url" },
+    ],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([
+    "https://example.com/",
+    "https://example.com/Path",
+  ])
+  expect(await page.locator("#sheet-links .link-note").count()).toBe(0)
+  expect(await page.locator("#sheet-links a.link-action").count()).toBe(2)
+  expect(consoleErrors).toEqual([])
+})
+
+test("the result sheet stays reachable after the handoff ends", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  // The feature's own happy path: the human reads the link and the handoff ends
+  // before they tap Open — they hand back, or it times out. The ending overlay
+  // is opaque and covers the whole screen, so if it wins the stacking order the
+  // link is gone, with the button disabled and no way to scan again.
+  agent.send({ type: "ended", outcome: "resolved" })
+  await waitForOverlay(page)
+
+  const onTop = await page.evaluate(() => {
+    const anchor = document.querySelector("#sheet-links a.link-action")
+    if (!anchor) return "no anchor"
+    const box = anchor.getBoundingClientRect()
+    const hit = document.elementFromPoint(
+      box.x + box.width / 2,
+      box.y + box.height / 2,
+    )
+    return hit?.closest("#sheet") ? "sheet" : (hit?.id ?? hit?.tagName ?? "?")
+  })
+  expect(onTop).toBe("sheet")
+  expect(consoleErrors).toEqual([])
+})
+
+test("a malformed links message neither throws nor wedges the button", async () => {
+  await showFrame()
+  await page.locator("#key-qr").click()
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && button.disabled
+  })
+
+  // A null, a number and an object with no text. This used to throw out of the
+  // message handler, which skipped the code that releases the button — leaving
+  // it dead for the full twelve-second deadline, with no sheet and no reason.
+  // Sent as bytes rather than as a typed message: the protocol has no way to
+  // describe this, and casting one into shape would be the same lie the page
+  // is being tested against.
+  agent.sendRaw(
+    '{"type":"links","links":[null,5,{"kind":"url"}],"source":"qr"}',
+  )
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([])
+  expect(await page.locator("#sheet-title").textContent()).toBe(
+    "No QR code found",
+  )
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a QR payload reaches the sheet as text, never as markup", async () => {
+  await showFrame()
+  const payload = '<img src=x onerror="window.__handraisePwned = 1">'
+  agent.send({
+    type: "links",
+    links: [{ text: payload, kind: "text" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([payload])
+  expect(await page.locator("#sheet-links img").count()).toBe(0)
+  expect(consoleErrors).toEqual([])
+})
+
+test("two codes are both listed, and the sheet says there are two", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [
+      { text: QR_LINK, kind: "url" },
+      { text: "WIFI:S:GuestNet;T:WPA;P:hunter2;;", kind: "text" },
+    ],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await page.locator("#sheet-title").textContent()).toBe(
+    "2 codes on the page",
+  )
+  expect(await sheetTexts()).toEqual([
+    QR_LINK,
+    "WIFI:S:GuestNet;T:WPA;P:hunter2;;",
+  ])
+  expect(await page.locator("#sheet-links a").count()).toBe(1)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a scan the agent never answers releases the button and says why", async () => {
+  await reopenFixture("takeover", false, true)
+  await showFrame()
+  await page.locator("#key-qr").click()
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && button.disabled
+  })
+
+  // The agent drops a scan that came too soon, or has gone away entirely.
+  // Without a deadline the button would stay dead for the rest of the session.
+  await page.clock.fastForward(12_000)
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && !button.disabled
+  })
+  expect(await page.locator("#hint").textContent()).toBe(
+    "The agent didn't answer — try again",
+  )
+  expect(await page.locator("#sheet").isHidden()).toBe(true)
+  expect(consoleErrors).toEqual([])
+})

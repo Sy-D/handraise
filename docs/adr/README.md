@@ -15,6 +15,7 @@ pre-publish security review — they document the history, they do not invent it
 | [0005](0005-handoff-not-wall-detection.md) | handraise is the handoff mechanism, not the wall detection | accepted | Scope decision |
 | [0006](0006-approval-mode.md) | Approval mode: one screenshot, a hold on yes | accepted | Scope decision |
 | [0007](0007-channels.md) | Channels: an in-process hook, not a second WebSocket client | accepted | Scope decision |
+| [0008](0008-qr-passthrough.md) | QR passthrough: the agent reads the code, the phone gets the link | accepted | [Measurement 05](../measurements/05-qr.md) |
 
 ## Format
 

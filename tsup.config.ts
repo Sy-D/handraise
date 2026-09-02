@@ -1,7 +1,17 @@
 import { defineConfig } from "tsup"
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/cli.ts"],
+  // Named rather than a list, so `src/core/qr-worker.ts` lands at
+  // `dist/qr-worker.js` instead of `dist/core/qr-worker.js`. That path is not
+  // cosmetic: `createQrScanner` resolves the worker with
+  // `new URL("./qr-worker.js", import.meta.url)` against `dist/index.js`, and
+  // a worker is loaded by URL at runtime, so it cannot be bundled into its
+  // caller the way an import can.
+  entry: {
+    index: "src/index.ts",
+    cli: "src/cli.ts",
+    "qr-worker": "src/core/qr-worker.ts",
+  },
   format: ["esm"],
   // Types are for consumers of the library. `dist/cli.js` is a `bin`, nobody
   // imports it, and a `cli.d.ts` would only be dead weight in the tarball.
