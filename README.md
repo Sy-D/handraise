@@ -413,6 +413,24 @@ floor of a handoff, not reading speed. The one failure was the platform's
 ~10min session death landing mid-handoff; handraise reported `disconnected`
 instead of claiming success.
 
+Two interrupts do not cost the same, and `bun run bench:mixed` measures them
+side by side: 20 workflows against one live portal, interleaved takeover,
+approval, takeover, on 2026-09-02. A takeover needs the browser driven; an
+approval needs one decision, and every fourth one here was a denial.
+
+| | completed | to visible | frames | bytes | relay sandbox |
+|---|---|---|---|---|---|
+| takeover — the human drives | 10/10 | 4923ms | 14 | 142 KB | 11.0s |
+| approval — the human decides | 10/10 | 5089ms | 1 | 25 KB | 5.5s |
+
+Medians over the completed runs; a denied approval counts as completed, because
+the decision was delivered and the bench checks that no money moved. An approval
+injects nothing into the page, so it applies zero inputs and sends one
+screenshot however long the human thinks, while a takeover's stream keeps
+growing while the human works. The 50/50 mix is the harness's choice, not a
+measurement of anyone's traffic — take the per-mode costs and apply your own
+mix.
+
 At N=30 the right-hand column is the worst observation, not a fitted p99 — we
 say what we measured. The input round trip sits on the network RTT floor from
 Germany to the us-west edge (pass `baseUrl` to co-locate the relay with your
