@@ -18,7 +18,11 @@ import { fileURLToPath } from "node:url"
 import type { Browser, BrowserContext, CDPSession, Page } from "playwright-core"
 import WebSocket, { WebSocketServer } from "ws"
 
-import type { ChannelHandoff, HandoffChannel } from "../channels"
+import type {
+  ChannelHandoff,
+  HandoffChannel,
+  TakeoverChannelHandoff,
+} from "../channels"
 import type { HandoffEvent } from "../events"
 import { type Logger, noopLogger } from "../logger"
 import type { RelayMessage } from "../relay/protocol"
@@ -163,6 +167,9 @@ const VIEWPORT = { width: 1280, height: 800 }
 /** CDP sessions opened on the fake page since the last reset. */
 let cdpSessions = 0
 
+/** Kills the browser session behind the newest `fakePage()`. */
+let killSession: () => void = () => undefined
+
 /**
  * A page whose context yields the fake CDP session and a live fake browser.
  *
@@ -172,13 +179,28 @@ let cdpSessions = 0
 function fakePage(cdp: CDPSession, screenshotDelayMs = 0): Page {
   cdpSessions = 0
   let browser: Browser
+  let connected = true
+  const gone = new Set<() => void>()
+  // Solari sessions die on their own about ten minutes in; `killSession()` is
+  // how a test reproduces that, so the disconnected path is driven rather than
+  // assumed.
+  killSession = () => {
+    connected = false
+    for (const listener of gone) listener()
+  }
   const browserPartial: Partial<Browser> = {
-    // SAFETY: registration the test never fires; the returned emitter is only
+    // SAFETY: only the "disconnected" listener is kept; the returned emitter is
     // for chaining and is never used, so pointing it back at the fake is safe.
-    once: (() => browser) as Browser["once"],
+    once: ((event: string, listener: () => void) => {
+      if (event === "disconnected") gone.add(listener)
+      return browser
+    }) as Browser["once"],
     // SAFETY: as `once`, above — an unused chaining emitter.
-    off: (() => browser) as Browser["off"],
-    isConnected: () => true,
+    off: ((_event: string, listener: () => void) => {
+      gone.delete(listener)
+      return browser
+    }) as Browser["off"],
+    isConnected: () => connected,
   }
   // SAFETY: runHandoff drives only once/off/isConnected on the browser.
   browser = browserPartial as Browser
@@ -932,4 +954,225 @@ test("a takeover handback carries no answeredVia", async () => {
   if (!event) throw new Error("no event")
   expect(event.answeredVia).toBeUndefined()
   expect(JSON.stringify(event)).not.toContain("answeredVia")
+})
+
+// --- The boundaries the ADR claims, as failing-first tests ---------------
+
+test("an answer that arrives after a timeout is refused and emits nothing", async () => {
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+      channels: [recorder.channel],
+    },
+    timeoutMs: 400,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "late-after-timeout",
+    relayColdStartMs: 19,
+    logger: noopLogger,
+  })
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  expect(events).toHaveLength(1)
+
+  // A channel that was notified before the wait ran out still holds a live
+  // `answer`. It has to be inert: the caller has already been told `timeout`
+  // and has moved on.
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+  expect(raised.answer("approve")).toBe(false)
+  await Bun.sleep(50)
+  expect(events).toHaveLength(1)
+  expect(events[0]?.outcome).toBe("timeout")
+  expect(events[0]?.answeredVia).toBeUndefined()
+})
+
+test("an answer that arrives after the session died is refused and emits nothing", async () => {
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "late-after-disconnect",
+    relayColdStartMs: 20,
+    logger: noopLogger,
+  })
+
+  await until("the channel to be notified", () => recorder.seen.length === 1)
+  killSession()
+
+  const end = await handoff
+  expect(end.outcome).toBe("disconnected")
+  expect(events).toHaveLength(1)
+
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+  expect(raised.answer("deny")).toBe(false)
+  await Bun.sleep(50)
+  expect(events).toHaveLength(1)
+  expect(events[0]?.outcome).toBe("disconnected")
+})
+
+test("a session that dies during the screenshot notifies no channel", async () => {
+  // The timeout half of this window is covered above; this is the other way
+  // it closes, and the one that actually happened in the field — a Solari
+  // session hitting its hard lifetime mid-capture.
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 250),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "died-mid-screenshot",
+    relayColdStartMs: 21,
+    logger: noopLogger,
+  })
+
+  // While `page.screenshot()` is still in flight.
+  await Bun.sleep(40)
+  killSession()
+
+  expect((await handoff).outcome).toBe("disconnected")
+  expect(recorder.seen).toEqual([])
+})
+
+test("a channel that mutates its screenshot cannot change what the phone got", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "buffer-isolation",
+    relayColdStartMs: 22,
+    logger: noopLogger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+
+  // A channel gets a Buffer, and a Buffer is writable. An adapter that
+  // compresses or watermarks in place must not be able to change the picture
+  // the human on the phone is deciding on.
+  raised.screenshot.fill(0)
+
+  const frame = human.inbox.find((message) => message.type === "frame")
+  if (frame?.type !== "frame") throw new Error("no frame reached the phone")
+  expect(Buffer.from(frame.data, "base64")).toEqual(SAMPLE_JPEG)
+
+  human.send({ type: "approve" })
+  expect((await handoff).outcome).toBe("approved")
+})
+
+test("a channel whose notify never settles does not hold up the handoff", async () => {
+  // `notify` is not awaited, and this is what that sentence has to mean: a
+  // chat API that accepts the request and never answers costs the handoff
+  // nothing. A regression that awaited it would hang here until the test
+  // timeout rather than fail an assertion, which is the loudest failure this
+  // boundary has.
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+
+  const startedAt = Date.now()
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [{ notify: () => new Promise<void>(() => undefined) }],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "never-settles",
+    relayColdStartMs: 23,
+    logger: noopLogger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  human.send({ type: "approve" })
+  expect((await handoff).outcome).toBe("approved")
+  expect(Date.now() - startedAt).toBeLessThan(4000)
+})
+
+test("a takeover ChannelHandoff has no answer and no screenshot, at compile time", () => {
+  // The runtime shape is asserted elsewhere with `in`. This is the other half:
+  // the union is what stops an adapter from writing `handoff.answer(...)` on a
+  // takeover in the first place, and `tsc --noEmit` covers this file, so a
+  // union that quietly grew those members would fail the typecheck here —
+  // `@ts-expect-error` is an error of its own when there is no error to expect.
+  const takeover: TakeoverChannelHandoff = {
+    mode: "takeover",
+    handoffId: "compile-negative",
+    url: "https://relay.example/?pt_token=x",
+    reason: "Aurora Bank is asking for a 2FA code",
+  }
+  // @ts-expect-error `answer` exists only on the approval member of the union.
+  const answer = takeover.answer
+  // @ts-expect-error `screenshot` exists only on the approval member.
+  const screenshot = takeover.screenshot
+  expect(answer).toBeUndefined()
+  expect(screenshot).toBeUndefined()
+
+  // And through the union itself, which is what an adapter actually receives.
+  const handoff: ChannelHandoff = takeover
+  // @ts-expect-error narrow on `mode` before reaching for an approval field.
+  const unnarrowed = handoff.action
+  expect(unnarrowed).toBeUndefined()
 })
