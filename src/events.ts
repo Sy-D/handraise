@@ -34,7 +34,11 @@ export interface HandoffEvent {
   relayColdStartMs: number
   /** Time from handoff start until the first frame was sent, in ms. */
   firstFrameMs?: number
-  /** Frames handed to the relay over the handoff. Always 1 in approval mode. */
+  /**
+   * Frames handed to the relay over the handoff. In approval mode this is the
+   * one screenshot, sent once per connection because a reconnecting agent has
+   * to put it back on the wire: `1 + reconnects`.
+   */
   framesSent: number
   /** Sum of the base64 frame-payload lengths sent, in bytes. */
   bytesSent: number

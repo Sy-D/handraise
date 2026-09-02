@@ -99,12 +99,35 @@ let lastFocus = null
 /** The terminal \`ended\` message, once the agent has sent it. */
 let lastEnded = null
 /**
- * A terminal human message (handback/abort) held for an agent that is not
- * connected at the moment — typically mid-reconnect. Delivered to the next
- * role=agent so the handoff resolves instead of falsely timing out with no
+ * A terminal human message (handback/abort/approve/deny) held for an agent that
+ * is not connected at the moment — typically mid-reconnect. Delivered to the
+ * next role=agent so the handoff resolves instead of falsely timing out with no
  * storageState. Symmetric to the lastFrame replay for a late human.
  */
 let pendingForAgent = null
+
+/**
+ * Set by the first terminal human message, and never cleared.
+ *
+ * The handoff link is a bearer URL and may be in two hands at once. Without
+ * this, a second holder could overwrite a queued \`deny\` with an \`approve\`
+ * before the agent reconnected to collect it — the answer the agent acts on
+ * would be the last one sent rather than the first one given. It also stops a
+ * reconnecting agent from refilling the replay buffers this relay has just
+ * scrubbed, because the agent does not yet know it has been answered.
+ */
+let humanEnded = false
+
+/**
+ * Forget everything that shows the remote page. Not the ending, which a late
+ * human still has to be told, and not a human answer still waiting for its
+ * agent.
+ */
+function forgetPage() {
+  lastFrame = null
+  lastState = null
+  lastFocus = null
+}
 
 function encodeFrame(payload, opcode) {
   const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload)
@@ -219,6 +242,13 @@ function closePeer(peer, reason) {
   if (!peer.open) return
   peer.open = false
   if (peers.get(peer.role) === peer) peers.delete(peer.role)
+  // An agent that is gone may never come back — a timeout during a socket
+  // outage, a killed process, a \`kill()\` that failed — and its last frame is
+  // the logged-in page. \`ended\` is not guaranteed to arrive (the agent gives
+  // up on it after two seconds), so the scrub cannot wait for it. A handoff
+  // that is still running restores this by itself: every agent reconnect
+  // re-sends its state, and in approval mode its screenshot.
+  if (peer.role === "agent") forgetPage()
   // Detach the reader so a replaced client that ignores the close frame can no
   // longer feed route(); a lingering listener is how a peer keeps injecting.
   if (peer.read) peer.socket.removeListener("data", peer.read)
@@ -258,46 +288,54 @@ function messageType(payload) {
 
 /** Keep what a human who joins late has to be shown, and drop what they must not. */
 function rememberFromAgent(type, payload) {
-  if (type === "frame") lastFrame = payload
-  else if (type === "state") lastState = payload
-  else if (type === "focus") lastFocus = payload
-  else if (type === "ended") {
+  if (type === "ended") {
     // Terminal: keep the ending for a late human, drop everything that could
     // show the logged-in page to whoever opens the link next.
     lastEnded = payload
-    lastFrame = null
-    lastState = null
-    lastFocus = null
+    forgetPage()
     pendingForAgent = null
+    return
   }
+  // The agent goes on sending until it learns it has been answered — it
+  // re-sends state, and in approval mode the screenshot, on every reconnect.
+  // Forwarding that is harmless; storing it would put the page back in front
+  // of the next visitor after this relay decided to drop it.
+  if (humanEnded) return
+  if (type === "frame") lastFrame = payload
+  else if (type === "state") lastState = payload
+  else if (type === "focus") lastFocus = payload
 }
 
-/** One line per handoff at most: a hostile client must not be able to fill the log. */
+/** One line per relay at most: a hostile client must not be able to fill the log. */
 let dropLogged = false
+
+function logDrop(type) {
+  if (dropLogged) return
+  dropLogged = true
+  log("human message dropped", {
+    type: String(type).slice(0, 32),
+    mode: MODE,
+    ended: humanEnded,
+  })
+}
 
 /**
  * Whether a human message may be forwarded at all, and the bookkeeping the
- * terminal ones need. This is where the mode is actually enforced: a \`tap\` on
- * an approval relay dies here, not on the phone that never offered it.
+ * terminal ones need. Two rules meet here, and neither is the phone's to
+ * enforce: the mode's vocabulary — a \`tap\` on an approval relay dies here, not
+ * on the page that never offered it — and first answer wins.
  */
 function acceptFromHuman(type, payload) {
-  if (!HUMAN_MESSAGES.has(type)) {
-    if (!dropLogged) {
-      dropLogged = true
-      log("human message dropped", {
-        type: String(type).slice(0, 32),
-        mode: MODE,
-      })
-    }
+  if (humanEnded || !HUMAN_MESSAGES.has(type)) {
+    logDrop(type)
     return false
   }
   if (TERMINAL_HUMAN.has(type)) {
-    // The human is done. Buffer this for an agent that is mid-reconnect, and
-    // stop replaying the last (logged-in) frame to a late human.
+    // The human is done, for good. Buffer this for an agent that is
+    // mid-reconnect, and stop replaying the last (logged-in) frame.
+    humanEnded = true
     pendingForAgent = payload
-    lastFrame = null
-    lastState = null
-    lastFocus = null
+    forgetPage()
   }
   return true
 }
@@ -876,6 +914,13 @@ const PAGE = \`<!doctype html>
     letter-spacing: -0.02em;
     overflow-wrap: anywhere;
   }
+  /* Peers, and deliberately so. The accent marks the action the interface
+     wants, or nothing (docs/design/phone-ui-audit.md): in a takeover that is
+     "Hand back", and in an approval there is no such answer — an interface
+     that recommends one is training the thumb to take the loudest button. So
+     the two answers are drawn identically and the only asymmetry is the
+     gesture. */
+  #deny, #approve { flex: 1 1 0; }
   /* Approval inverts the takeover's risk: here the answer that cannot be taken
      back is yes, so yes is the one that costs a hold. The fill stays
      monochrome — the red in this interface means destructive, and approving
@@ -934,7 +979,7 @@ const PAGE = \`<!doctype html>
       <button id="abort" class="ghost" type="button"><span class="ghost-label">I can't do this</span></button>
     </div>
     <div class="row approval-only">
-      <button id="deny" class="primary" type="button">Deny</button>
+      <button id="deny" class="ghost" type="button"><span class="ghost-label">Deny</span></button>
       <button id="approve" class="ghost" type="button"><span class="ghost-label">Hold to approve</span></button>
     </div>
   </footer>
@@ -1848,7 +1893,9 @@ const PAGE = \`<!doctype html>
     sock.onopen = function () {
       if (mine !== generation) { sock.close(); return }
       retries = 0
-      setStatus(true)
+      // A page that has already ended is not "live" again; this socket exists
+      // only to carry what is still queued.
+      if (!finished) setStatus(true)
       flushOutbox()
       // finish() left this socket open for exactly that flush.
       if (finished) sock.close()
@@ -1858,8 +1905,12 @@ const PAGE = \`<!doctype html>
       // A stale socket (already superseded) must not touch shared state.
       if (mine !== generation) return
       ws = null
-      if (finished) return
-      setStatus(false)
+      // Being finished is not enough to stop: an answer made while this socket
+      // was already CLOSING is sitting in the outbox, and it is the one message
+      // the agent is waiting for. Abandoning it here showed the human
+      // "Approved" and left the agent to time out.
+      if (finished && !stillSending()) return
+      if (!finished) setStatus(false)
       scheduleReconnect()
     }
     sock.onerror = function () { if (mine === generation) sock.close() }

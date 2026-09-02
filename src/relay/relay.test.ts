@@ -518,3 +518,89 @@ test("a deny reaches an agent that reconnects after the human sent it", async ()
   const second = await connect(approval.port, "agent")
   expect(await second.next()).toEqual({ type: "deny" })
 })
+
+test("the first terminal answer wins, and a second holder cannot overturn it", async () => {
+  // The handoff link is a bearer URL and may be shared. Two people can hold it
+  // at once, and the relay hands the agent whichever answer arrived while it
+  // was away — so the second one must not be able to overwrite a denial with
+  // an approval.
+  const approval = await startRelayProcess("", "approval")
+  const first = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  first.socket.close()
+  await first.closed
+  human.send({ type: "deny" })
+  human.send({ type: "approve" })
+
+  const second = await connect(approval.port, "agent")
+  expect(await second.next()).toEqual({ type: "deny" })
+  // And nothing else: the approval was dropped, not queued behind it.
+  await expect(second.next()).rejects.toThrow(/no message/)
+})
+
+test("a takeover answer is terminal too: an abort cannot follow a handback", async () => {
+  const agent = await connect(relay.port, "agent")
+  const human = await connect(relay.port, "human")
+
+  human.send({ type: "handback" })
+  human.send({ type: "abort" })
+  human.send({ type: "tap", fx: 1, fy: 2 })
+
+  expect(await agent.next()).toEqual({ type: "handback" })
+  await expect(agent.next()).rejects.toThrow(/no message/)
+})
+
+test("an agent frame after the human answered is not replayed to a late human", async () => {
+  const approval = await startRelayProcess("", "approval")
+  const agent = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  agent.send({ type: "state", reason: "may I pay this invoice?" })
+  agent.send({ type: "frame", data: "c2NyZWVuc2hvdA==", meta: META })
+  expect(await human.next()).toEqual({
+    type: "state",
+    reason: "may I pay this invoice?",
+  })
+  human.send({ type: "deny" })
+  expect(await agent.next()).toEqual({ type: "deny" })
+
+  // A reconnecting agent re-sends what it has. The handoff is over, so none of
+  // it may go back into the replay buffer the next visitor is served from.
+  agent.send({ type: "state", reason: "may I pay this invoice?" })
+  agent.send({ type: "frame", data: "c2NyZWVuc2hvdA==", meta: META })
+  await Bun.sleep(150)
+
+  const late = await connect(approval.port, "human")
+  await expect(late.next()).rejects.toThrow(/no message/)
+})
+
+test("the replay buffer is dropped when the agent disconnects, and restored when it returns", async () => {
+  // If the agent dies without delivering its `ended` — a timeout during an
+  // outage, a killed process — the relay would otherwise keep serving the
+  // page's last frame to anyone holding the link until the sandbox idles out.
+  const agent = await connect(relay.port, "agent")
+  agent.send({ type: "state", reason: "Aurora Bank is asking for a code" })
+  agent.send({ type: "frame", data: "Zmlyc3QtZnJhbWU=", meta: META })
+  const human = await connect(relay.port, "human")
+  expect(await human.next()).toEqual({
+    type: "state",
+    reason: "Aurora Bank is asking for a code",
+  })
+
+  agent.socket.close()
+  await agent.closed
+  const late = await connect(relay.port, "human")
+  await expect(late.next()).rejects.toThrow(/no message/)
+
+  // A handoff that is still running recovers on its own: the agent reconnects
+  // and re-sends its state, and the next visitor sees it again.
+  const back = await connect(relay.port, "agent")
+  back.send({ type: "state", reason: "Aurora Bank is asking for a code" })
+  await Bun.sleep(150)
+  const later = await connect(relay.port, "human")
+  expect(await later.next()).toEqual({
+    type: "state",
+    reason: "Aurora Bank is asking for a code",
+  })
+})

@@ -59,12 +59,22 @@ if (answer.outcome !== "approved") return   // "denied", "timeout", "disconnecte
 ```
 
 One screenshot, no live stream, and nothing is injected into the page: the
-agent still owns the session and carries out the action itself. On the phone,
+agent still owns the session and carries out the action itself. (The event's
+`framesSent` counts that screenshot once per connection — `1 + reconnects` —
+because a reconnecting agent has to put it back on the wire.) On the phone,
 **Deny is one tap** and **Approve takes a 700ms hold** — the reverse of
 takeover mode, because here the answer that cannot be taken back is yes. The
 relay enforces it too: an approval relay routes `approve` and `deny` and drops
 every takeover message, so the restriction is not just a hidden button
 ([`docs/adr/0006`](docs/adr/0006-approval-mode.md)).
+
+Upgrading from 0.3.0: nothing changes at runtime, and `raiseHand(page, { reason })`
+compiles as it did. Three exported types changed shape, so a TypeScript
+consumer may have one edit to make even if they never ask for an approval —
+`HandoffOutcome` has two new members, `HandoffEvent.mode` is new and required,
+and `RaiseHandOptions` is now a union (extend `HandoffOptions` or
+`TakeoverOptions` instead of it). The
+[CHANGELOG](CHANGELOG.md) has the detail.
 
 Runnable without writing any code: [`demo/try.ts`](demo/try.ts) raises a hand
 immediately so you can drive it; [`demo/approval.ts`](demo/approval.ts) asks

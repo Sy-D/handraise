@@ -34,6 +34,19 @@ import type {
 } from "../src/relay/protocol"
 import type { HandoffMode } from "../src/types"
 
+/**
+ * The browser's WebSocket. This file imports `ws` under the same name for the
+ * agent side, and the two types are not interchangeable.
+ */
+type BrowserSocket = InstanceType<typeof globalThis.WebSocket>
+
+declare global {
+  interface Window {
+    /** Only present when a test installed `captureSockets` before the page. */
+    handraiseSockets?: BrowserSocket[]
+  }
+}
+
 const SERVER_PATH = fileURLToPath(
   new URL("../src/relay/guest/server.js", import.meta.url),
 )
@@ -244,8 +257,25 @@ afterAll(async () => {
   await browser.close()
 })
 
+/**
+ * Keep every WebSocket the page opens, so a test can put one into CLOSING —
+ * the state where an answer is queued while the page has already finished.
+ * Installed before the page script runs, and only where a test asks for it.
+ */
+function captureSockets(): void {
+  const Native = window.WebSocket
+  const sockets: BrowserSocket[] = []
+  window.handraiseSockets = sockets
+  window.WebSocket = class extends Native {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols)
+      sockets.push(this)
+    }
+  }
+}
+
 /** A relay in `mode`, an agent on it, and the real page in a phone viewport. */
-async function openFixture(mode: HandoffMode): Promise<void> {
+async function openFixture(mode: HandoffMode, capture = false): Promise<void> {
   relay = await startRelay(mode)
   agent = await connectAgent(relay.port)
   consoleErrors = []
@@ -257,15 +287,34 @@ async function openFixture(mode: HandoffMode): Promise<void> {
     if (message.type() === "error") consoleErrors.push(message.text())
   })
   page.on("pageerror", (error) => consoleErrors.push(error.message))
+  if (capture) await page.addInitScript(captureSockets)
   await page.goto(`http://127.0.0.1:${relay.port}/`)
 }
 
-/** Throw the takeover fixture away and come back up in approval mode. */
-async function useApprovalMode(): Promise<void> {
+/** Throw the current fixture away and come back up in `mode`. */
+async function reopenFixture(
+  mode: HandoffMode,
+  capture = false,
+): Promise<void> {
   await page.close()
   agent.close()
   relay.process.kill("SIGKILL")
-  await openFixture("approval")
+  await openFixture(mode, capture)
+}
+
+/**
+ * Close the page's socket and answer in the same breath, so the answer is made
+ * while the socket is CLOSING rather than after it is gone. Returns the socket
+ * state the click actually saw.
+ */
+function answerWhileClosing(buttonId: string): Promise<number> {
+  return page.evaluate((id: string) => {
+    const live = window.handraiseSockets?.at(-1)
+    if (!live) throw new Error("no socket was captured")
+    live.close()
+    document.getElementById(id)?.click()
+    return live.readyState
+  }, buttonId)
 }
 
 beforeEach(async () => {
@@ -1065,8 +1114,8 @@ const APPROVAL_HINT = "Approve needs a hold. Deny is one tap."
 const APPROVAL_HOLD_HINT = "Hold the button to approve"
 
 /** Put the page in approval mode and give it the agent's ask. */
-async function showApproval(): Promise<void> {
-  await useApprovalMode()
+async function showApproval(capture = false): Promise<void> {
+  await reopenFixture("approval", capture)
   agent.send({
     type: "state",
     reason: APPROVAL_REASON,
@@ -1109,6 +1158,24 @@ test("approval mode states the action and offers no way to type", async () => {
     expect(box.height).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
     expect(box.width).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
   }
+
+  // Peers, down to the pixel: the accent marks the action the interface wants,
+  // and an approval has none. Only the gesture differs.
+  const paint = await page.evaluate(() => {
+    const of = (id: string) => {
+      const node = document.getElementById(id)
+      if (!node) throw new Error(`no #${id}`)
+      const style = getComputedStyle(node)
+      return {
+        background: style.backgroundColor,
+        color: style.color,
+        border: style.border,
+        fontWeight: style.fontWeight,
+      }
+    }
+    return { deny: of("deny"), approve: of("approve") }
+  })
+  expect(paint.deny).toEqual(paint.approve)
   expect(consoleErrors).toEqual([])
 })
 
@@ -1181,5 +1248,61 @@ test("an approval ending shows the matching terminal overlay", async () => {
   expect(await page.locator("#overlay-note").textContent()).toBe(
     "The agent has your approval and is continuing. You can close this tab.",
   )
+  expect(consoleErrors).toEqual([])
+})
+
+test("an approval answered while the socket is closing still reaches the agent", async () => {
+  await showApproval(true)
+
+  // The gap this closes: `send` queues the answer because the socket is not
+  // open, `finish` marks the page done, and the socket's own close handler
+  // then used to stop reconnecting — with the answer still in the queue. The
+  // human saw "Denied" and the agent waited out its timeout.
+  const state = await answerWhileClosing("deny")
+  expect(state).toBe(WebSocket.CLOSING)
+
+  await waitForOverlay(page)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Denied")
+  expect(await agent.next()).toEqual({ type: "deny" })
+  expect(consoleErrors).toEqual([])
+}, 20000)
+
+test("a hand back given while the socket is closing still reaches the agent", async () => {
+  // The same hole, on the mode that has had it since 0.3.0.
+  await reopenFixture("takeover", true)
+  await showFrame()
+
+  const state = await answerWhileClosing("handback")
+  expect(state).toBe(WebSocket.CLOSING)
+
+  await waitForOverlay(page)
+  expect(await agent.next()).toEqual({ type: "handback" })
+  expect(consoleErrors).toEqual([])
+}, 20000)
+
+test("one finger pans the approval screenshot and still sends nothing", async () => {
+  await showApproval()
+  await showFrame()
+
+  // At fit there is nowhere to pan to, so zoom in first.
+  const box = await page.locator("#view").boundingBox()
+  if (!box) throw new Error("canvas has no bounding box")
+  const centre = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+  await page.mouse.dblclick(centre.x, centre.y)
+  await page.waitForTimeout(300)
+  const before = await zoomTransform(page)
+  expect(before.scale).toBeGreaterThan(1.5)
+
+  // The one gesture that was re-purposed rather than disabled: in a takeover
+  // this drag scrolls the remote page, and here it may only move the picture.
+  await page.mouse.move(centre.x, centre.y)
+  await page.mouse.down()
+  await page.mouse.move(centre.x + 60, centre.y + 60, { steps: 6 })
+  await page.mouse.up()
+  await page.waitForTimeout(200)
+
+  const after = await zoomTransform(page)
+  expect(after.tx !== before.tx || after.ty !== before.ty).toBe(true)
+  expect(agent.received).toEqual([])
   expect(consoleErrors).toEqual([])
 })

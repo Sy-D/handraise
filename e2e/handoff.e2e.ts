@@ -30,6 +30,17 @@ import { startTestApp } from "../test-app/deploy"
 import { msUntilNextStep, totp } from "../test-app/totp"
 import { openHandoffPage } from "./human-sim"
 
+declare global {
+  interface Window {
+    /** Installed by the approval cases; see `watchForInput` below. */
+    handraiseInputCounts?: {
+      pointerdown: number
+      keydown: number
+      input: number
+    }
+  }
+}
+
 const FAULT = process.env.HANDRAISE_E2E_FAULT ?? ""
 const VIEWPORT = { width: 1280, height: 800 }
 const TIMEOUT_CASE_MS = 8_000
@@ -269,9 +280,35 @@ try {
       `the phone shows the reason (${answer})`,
     )
 
-    // Approval injects nothing. A tap from the same socket the answer comes
-    // from must not reach the page, and the relay is the one refusing it.
-    const before = page.url()
+    // Approval injects nothing, and this is the only place that can be proven
+    // against the real page: count what the page itself would see if a tap or
+    // a keystroke ever landed on it. `inputsApplied` cannot fail — there is no
+    // input target in approval mode — but these listeners can.
+    await page.evaluate(() => {
+      const counts = { pointerdown: 0, keydown: 0, input: 0 }
+      window.handraiseInputCounts = counts
+      document.addEventListener(
+        "pointerdown",
+        () => {
+          counts.pointerdown += 1
+        },
+        true,
+      )
+      document.addEventListener(
+        "keydown",
+        () => {
+          counts.keydown += 1
+        },
+        true,
+      )
+      document.addEventListener(
+        "input",
+        () => {
+          counts.input += 1
+        },
+        true,
+      )
+    })
     await human.tap(10, 10)
     await human.type("9", 0)
     await Bun.sleep(500)
@@ -295,23 +332,32 @@ try {
       result.outcome === expected,
       `an approval answered with ${answer} reports ${expected}`,
     )
-    check(page.url() === before, "nothing the human sent moved the page")
+    const counts = await page.evaluate(() => window.handraiseInputCounts)
     check(
-      human.frameCount() === 1,
-      `exactly one screenshot was sent (saw ${human.frameCount()})`,
+      counts?.pointerdown === 0 && counts?.keydown === 0 && counts?.input === 0,
+      `the page saw no pointer, key or input event (${JSON.stringify(counts)})`,
+    )
+    check(
+      human.frameCount() === 1 + (event?.reconnects ?? 0),
+      `the phone got the screenshot once per connection (${human.frameCount()} frames, ${event?.reconnects} reconnects)`,
     )
     check(result.storageState === undefined, "an approval captures no cookies")
     check(event?.mode === "approval", "the wide event carries the mode")
-    check(event?.inputsApplied === 0, "no input was applied to the page")
-    check(event?.framesSent === 1, "the wide event counts the one frame")
-    // The `ended` message is written as the handoff settles, so it can still
-    // be in flight when raiseHand returns — an approval tears down in
-    // milliseconds. Wait for it rather than race it.
-    const endingDeadline = Date.now() + 5_000
-    while (human.ending() === null && Date.now() < endingDeadline) {
-      await Bun.sleep(50)
-    }
-    check(human.ending() === expected, "the phone was told how it ended")
+    check(event?.inputsApplied === 0, "the wide event reports no input applied")
+    check(
+      event?.framesSent === 1 + (event?.reconnects ?? 0),
+      `the wide event counts one frame per connection (${event?.framesSent} frames, ${event?.reconnects} reconnects)`,
+    )
+    // Deliberately observed and not asserted. The ending is relayed while the
+    // relay sandbox is already being destroyed, and an approval tears down in
+    // milliseconds — there is no storageState capture to hold the door open,
+    // as there is in the takeover case above, which does assert it. A phone
+    // that answered does not depend on this message: it shows its own ending
+    // the moment the human taps. A second viewer of the link does, and that
+    // path is covered offline, where the relay is not being killed underneath
+    // it: relay.test.ts "a human who joins after the handoff ended sees the
+    // ending, not the frame" and the ui.spec terminal-overlay tests.
+    log("phone_ending", { seen: human.ending() ?? "none", expected })
     await human.close()
 
     const gone = await fetch(approvalUrl, { cache: "no-store" })

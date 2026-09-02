@@ -22,7 +22,8 @@ export const needHumanToolSpec = {
     'have changed. Use mode "approval" when you could do it but are not ' +
     "allowed to decide alone — paying, sending, deleting: the human sees one " +
     "screenshot and the `action` you name, and answers yes or no while the " +
-    "browser stays yours.",
+    "browser stays yours. That screenshot is the page exactly as it is when " +
+    "you call this, so navigate and fill the form in first, then ask.",
   inputSchema: {
     type: "object",
     properties: {
@@ -73,7 +74,8 @@ export type NeedHumanDefaults = Omit<HandoffOptions, "reason">
 
 /**
  * What each ending means to a model that has never seen the outcome enum.
- * Approval mode can only produce the middle two; takeover only the first two.
+ * Takeover reaches the first two, approval the middle two, and both can end in
+ * `timeout` or `disconnected` — which is why there are six.
  */
 const SUMMARIES = {
   resolved:
@@ -102,7 +104,7 @@ function optionsFor(
   input: NeedHumanInput,
 ): RaiseHandOptions {
   if (input.mode !== "approval") return { ...defaults, reason: input.reason }
-  if (!input.action) {
+  if (!input.action?.trim()) {
     throw new Error(
       'needHuman: mode "approval" needs an `action` — the concrete step the human says yes or no to. Call it again with one, or use the default takeover mode if you are stuck rather than blocked.',
     )

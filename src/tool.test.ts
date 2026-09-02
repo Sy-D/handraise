@@ -47,3 +47,17 @@ test("a takeover call needs no action and is the default", () => {
   expect(spec.mode.description).toContain("default")
   expect(spec.action.description).toContain('Required with mode "approval"')
 })
+
+test("an approval whose action is only whitespace is refused too", async () => {
+  const needHuman = createNeedHumanTool(UNUSED_PAGE)
+
+  const asking = needHuman({
+    mode: "approval",
+    reason: "I may not move money without a human",
+    action: "   ",
+  })
+
+  // A blank line on a phone is not a decision, and " " passes a truthiness
+  // check — which is exactly how this one gets shipped.
+  await expect(asking).rejects.toThrow(/needHuman: mode "approval" needs an/)
+})

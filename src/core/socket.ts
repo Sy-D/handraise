@@ -142,6 +142,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       case "tap":
       case "char":
       case "key":
+      case "clear":
       case "scroll":
       case "handback":
       case "abort":

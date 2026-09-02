@@ -181,7 +181,14 @@ export async function startRelay(
   const agentKey = randomUUID()
   // Fixed at boot, never taken from a message: the relay's whole job in
   // approval mode is to refuse what the takeover UI would have sent.
-  const mode: HandoffMode = options.mode ?? "takeover"
+  //
+  // Constructed here rather than passed through, because it is interpolated
+  // into the `sh -c` line below. `raiseHand` already rejects anything that is
+  // not one of these two words, and TypeScript closes it for its own callers,
+  // but this package ships as JavaScript: the value that reaches a shell is
+  // one of two literals written in this file, whatever the caller supplied.
+  const mode: HandoffMode =
+    options.mode === "approval" ? "approval" : "takeover"
   const sandbox = await createSandbox(client, timeoutMs)
 
   let killed = false

@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url"
 import WebSocket, { WebSocketServer } from "ws"
 
 import type { HumanToAgent, RelayMessage } from "../relay/protocol"
+import type { HandoffMode } from "../types"
 import { connectRelay, type RelayConnection } from "./socket"
 
 const SERVER_PATH = fileURLToPath(
@@ -58,11 +59,11 @@ async function until(
 }
 
 /** The real relay, on an OS-assigned port read back out of its startup log. */
-function startRelayProcess(): Promise<{
+function startRelayProcess(mode: HandoffMode = "takeover"): Promise<{
   port: number
   process: ChildProcessByStdio<null, Readable, Readable>
 }> {
-  const child = spawn(process.execPath, [SERVER_PATH, "0"], {
+  const child = spawn(process.execPath, [SERVER_PATH, "0", "", mode], {
     stdio: ["ignore", "pipe", "pipe"],
   })
   cleanups.push(() => {
@@ -343,3 +344,89 @@ test("close() ends the handoff and stops reconnecting", async () => {
   await connection.send({ type: "state", reason: "too late" })
   expect(fake.received.length).toBe(sent)
 })
+
+/**
+ * One of every message the human can send, exhaustive by construction: the
+ * mapped type below is keyed by `HumanToAgent["type"]`, so adding a member to
+ * the protocol is a compile error here until it is listed.
+ */
+const SAMPLES = {
+  tap: { type: "tap", fx: 412, fy: 233 },
+  char: { type: "char", ch: "7" },
+  key: { type: "key", key: "Enter" },
+  clear: { type: "clear" },
+  scroll: { type: "scroll", fdy: 40 },
+  handback: { type: "handback" },
+  abort: { type: "abort" },
+  approve: { type: "approve" },
+  deny: { type: "deny" },
+} satisfies { [K in HumanToAgent["type"]]: Extract<HumanToAgent, { type: K }> }
+
+/** Which mode's relay routes which of them (`HUMAN_MESSAGES` in guest/server.js). */
+const ROUTED_BY = {
+  takeover: ["tap", "char", "key", "clear", "scroll", "handback", "abort"],
+  approval: ["approve", "deny"],
+} satisfies Record<HandoffMode, HumanToAgent["type"][]>
+
+/** The answers that end a handoff. The relay accepts the first one and no more. */
+const TERMINAL = new Set<string>(["handback", "abort", "approve", "deny"])
+
+/** Send a batch through one relay, and report what came out the other end. */
+async function deliverBatch(
+  mode: HandoffMode,
+  types: HumanToAgent["type"][],
+): Promise<HumanToAgent["type"][]> {
+  const relay = await startRelayProcess(mode)
+  const received: HumanToAgent[] = []
+  const connection = track(
+    connectRelay({
+      url: `ws://127.0.0.1:${relay.port}/ws?role=agent`,
+      onMessage: (message) => received.push(message),
+    }),
+  )
+  await until("the agent socket to open", () => connection.isOpen())
+  const human = await rawPeer(relay.port, "human")
+
+  for (const type of types) human.socket.send(JSON.stringify(SAMPLES[type]))
+  await until(
+    `all ${types.length} ${mode} messages to arrive`,
+    () => received.length === types.length,
+  )
+  return received.map((message) => message.type)
+}
+
+/**
+ * Send everything this mode routes, and report what came out the other end.
+ * One relay per terminal answer, because the first answer ends the handoff and
+ * the relay then correctly refuses the rest.
+ */
+async function deliverThroughRelay(
+  mode: HandoffMode,
+): Promise<HumanToAgent["type"][]> {
+  const routed: HumanToAgent["type"][] = [...ROUTED_BY[mode]]
+  const ordinary = routed.filter((type) => !TERMINAL.has(type))
+  const seen = ordinary.length > 0 ? await deliverBatch(mode, ordinary) : []
+  for (const type of routed.filter((each) => TERMINAL.has(each))) {
+    seen.push(...(await deliverBatch(mode, [type])))
+  }
+  return seen
+}
+
+test("every human message the protocol defines reaches the agent", async () => {
+  // The human's vocabulary is written down three times: the protocol union,
+  // the relay's per-mode HUMAN_MESSAGES, and the switch in socket.ts. They
+  // drifted once — `clear` was in the first two and missing from the third, so
+  // the phone's Clear key left the socket and died in the agent's own router,
+  // silently. This is the test that turns that drift into a red build.
+  const takeover = await deliverThroughRelay("takeover")
+  const approval = await deliverThroughRelay("approval")
+
+  expect(takeover).toEqual(ROUTED_BY.takeover)
+  expect(approval).toEqual(ROUTED_BY.approval)
+
+  // And no message in the protocol is routed by neither mode.
+  const routed = new Set<string>([...ROUTED_BY.takeover, ...ROUTED_BY.approval])
+  for (const type of Object.keys(SAMPLES)) {
+    expect(routed.has(type)).toBe(true)
+  }
+}, 15000)

@@ -13,15 +13,16 @@
 import { afterEach, expect, test } from "bun:test"
 import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
+import type { AddressInfo } from "node:net"
 import { fileURLToPath } from "node:url"
 import type { Browser, BrowserContext, CDPSession, Page } from "playwright-core"
-import WebSocket from "ws"
+import WebSocket, { WebSocketServer } from "ws"
 
 import type { HandoffEvent } from "../events"
 import { noopLogger } from "../logger"
 import type { RelayMessage } from "../relay/protocol"
-import type { HandoffMode, StorageState } from "../types"
-import { runHandoff } from "./raise-hand"
+import type { HandoffMode, RaiseHandOptions, StorageState } from "../types"
+import { raiseHand, runHandoff } from "./raise-hand"
 import type { ScreencastFrame } from "./screencast"
 
 const SERVER_PATH = fileURLToPath(
@@ -145,14 +146,25 @@ function fakeCdp(): FakeCdp {
 
 const STORAGE: StorageState = { cookies: [], origins: [] }
 
+/**
+ * A gateway that cannot answer. The guards under test throw before any client
+ * is built; this is only here so that a regression fails against a closed port
+ * rather than creating a sandbox with whatever key the environment holds.
+ */
+const CLOSED_PORT = "http://127.0.0.1:1"
+
 /** A real 800x500 JPEG, so the approval frame's metadata is parsed, not guessed. */
 const SAMPLE_JPEG = readFileSync(
   fileURLToPath(new URL("./fixtures/sample-frame.jpg", import.meta.url)),
 )
 const VIEWPORT = { width: 1280, height: 800 }
 
+/** CDP sessions opened on the fake page since the last reset. */
+let cdpSessions = 0
+
 /** A page whose context yields the fake CDP session and a live fake browser. */
 function fakePage(cdp: CDPSession): Page {
+  cdpSessions = 0
   let browser: Browser
   const browserPartial: Partial<Browser> = {
     // SAFETY: registration the test never fires; the returned emitter is only
@@ -166,7 +178,10 @@ function fakePage(cdp: CDPSession): Page {
   browser = browserPartial as Browser
   const contextPartial: Partial<BrowserContext> = {
     browser: () => browser,
-    newCDPSession: async () => cdp,
+    newCDPSession: async () => {
+      cdpSessions += 1
+      return cdp
+    },
     storageState: async () => STORAGE,
   }
   // SAFETY: runHandoff drives only browser/newCDPSession/storageState here.
@@ -324,6 +339,7 @@ test("an approval handoff sends one screenshot and settles on approve", async ()
     human.inbox.filter((message) => message.type === "frame"),
   ).toHaveLength(1)
   // No CDP session is opened at all: no screencast, no input, no focus probe.
+  expect(cdpSessions).toBe(0)
   expect(cdp.calls).toEqual([])
 
   const event = events[0]
@@ -331,6 +347,8 @@ test("an approval handoff sends one screenshot and settles on approve", async ()
   expect(events).toHaveLength(1)
   expect(event.mode).toBe("approval")
   expect(event.outcome).toBe("approved")
+  // One frame per connection, and this handoff had exactly one connection.
+  expect(event.reconnects).toBe(0)
   expect(event.framesSent).toBe(1)
   expect(event.bytesSent).toBeGreaterThan(0)
   expect(event.inputsApplied).toBe(0)
@@ -407,4 +425,131 @@ test("a denied approval reports denied", async () => {
       (message) => message.type === "ended" && message.outcome === "denied",
     ),
   )
+})
+
+/**
+ * A bare WebSocket server standing in for the relay, which cuts every
+ * connection the moment it has received a frame.
+ *
+ * The real relay is the right peer for routing; it is the wrong one here,
+ * because what is under test is what the agent puts on the wire *after* its
+ * handoff is over. Terminating on every frame means a connection that carries
+ * a frame can never also carry the ending — so an ending that arrives at all
+ * proves the frame was withheld.
+ */
+interface FakeRelay {
+  port: number
+  /** Messages received, split by the connection they arrived on. */
+  connections: RelayMessage[][]
+}
+
+async function startFrameCuttingRelay(): Promise<FakeRelay> {
+  const server = new WebSocketServer({ port: 0, host: "127.0.0.1" })
+  const connections: RelayMessage[][] = []
+  const sockets: WebSocket[] = []
+
+  server.on("connection", (socket: WebSocket) => {
+    const inbox: RelayMessage[] = []
+    connections.push(inbox)
+    sockets.push(socket)
+    socket.on("message", (data: Buffer) => {
+      // SAFETY: the only writer on this socket is the handoff under test.
+      const message = JSON.parse(data.toString("utf8")) as RelayMessage
+      inbox.push(message)
+      if (message.type === "frame") socket.terminate()
+    })
+  })
+  await new Promise<void>((resolve) =>
+    server.once("listening", () => resolve()),
+  )
+  cleanups.push(() => {
+    for (const socket of sockets) socket.terminate()
+    server.close()
+  })
+
+  const address = server.address()
+  // SAFETY: the server listens on a TCP port; `address()` only returns a
+  // string for a unix socket.
+  const port = (address as AddressInfo).port
+  return { port, connections }
+}
+
+test("the approval screenshot is not re-published once the handoff is over", async () => {
+  // The relay scrubs its replay buffer when a handoff ends, so that whoever
+  // opens the link next cannot see the page. A reconnect during teardown that
+  // re-sent the screenshot would undo exactly that.
+  const relay = await startFrameCuttingRelay()
+  const cdp = fakeCdp()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${relay.port}/`,
+    options: {
+      mode: "approval",
+      reason: "Agent wants to submit this payment",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+    },
+    // Long enough for a reconnect or two while the "human" decides, short
+    // enough that the ending falls into one of them.
+    timeoutMs: 1200,
+    handoffId: "approval-reconnect",
+    relayColdStartMs: 3,
+    logger: noopLogger,
+  })
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  // `raiseHand` does not wait for the relay to read its ending, so this test
+  // has to.
+  await until("the ending to reach the relay", () =>
+    relay.connections.some((inbox) =>
+      inbox.some((message) => message.type === "ended"),
+    ),
+  )
+
+  // Every connection that carried a frame was cut, so the one that carried the
+  // ending is one the agent chose not to re-send the screenshot on.
+  const ending = relay.connections.find((inbox) =>
+    inbox.some((message) => message.type === "ended"),
+  )
+  expect(ending).toBeDefined()
+  expect(ending?.filter((message) => message.type === "frame")).toEqual([])
+  // It really did reconnect: the first connection was cut on the frame.
+  expect(relay.connections.length).toBeGreaterThan(1)
+}, 20000)
+
+test("an approval with a blank action is refused before a relay is started", async () => {
+  // The tool guards this for the model; the library has to guard it for every
+  // caller, and here is the one place raiseHand may still throw — no URL
+  // exists yet, so nobody has been asked for anything.
+  const asking = raiseHand(fakePage(fakeCdp().cdp), {
+    mode: "approval",
+    reason: "The agent may not move money without a human",
+    action: "   ",
+    // bun loads .env, so a key is usually in the environment when this runs.
+    // A closed port is what keeps a regression here from creating a real
+    // sandbox instead of failing.
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+
+  await expect(asking).rejects.toThrow(/needs a non-empty `action`/)
+})
+
+test("an unknown mode is refused before anything is created", async () => {
+  // `HandoffMode` closes this for TypeScript callers. This package ships as
+  // JavaScript, the mode reaches the relay's command line, and an unknown one
+  // would otherwise fall open as a takeover — with a live input path.
+  // `Object.assign` is how a test written in TypeScript produces the value a
+  // JavaScript caller would pass.
+  const options: RaiseHandOptions = {
+    reason: "The agent may not move money without a human",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  }
+  Object.assign(options, { mode: "approval; touch /tmp/handraise-pwned" })
+
+  const asking = raiseHand(fakePage(fakeCdp().cdp), options)
+  await expect(asking).rejects.toThrow(/unknown mode/)
 })

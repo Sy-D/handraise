@@ -11,8 +11,29 @@ Approval mode. A capability gap ("I can't do this": 2FA, a captcha) and an
 authority boundary ("I may not do this": submit the payment) were the same call
 with a different `reason`, and the outcome could not tell them apart. They are
 now two modes of `raiseHand`, and an approval needs no takeover at all: one
-screenshot, the action in words, yes or no. Additive — existing code compiles
-and behaves exactly as before.
+screenshot, the action in words, yes or no.
+
+What is unchanged: a `raiseHand(page, { reason })` call, a `switch` on
+`outcome` without an exhaustiveness guard, and anything that only reads a
+`HandoffEvent`. What is not: three exported types changed shape, and a
+TypeScript consumer may have to edit one line — the section below says which.
+
+### Breaking for TypeScript consumers
+
+Nothing changes at runtime for a takeover caller. These are compile-time
+breaks, and they apply even to an application that never asks for an approval.
+
+- **`HandoffOutcome` has two new members**, `approved` and `denied`. A
+  `Record<HandoffOutcome, X>` needs the two extra keys, and a `switch` with a
+  `never` exhaustiveness guard needs the two extra arms. The four existing
+  values keep their meaning.
+- **`HandoffEvent.mode` is new and required.** Reading an event is unchanged;
+  code that *constructs* one — a test fixture, a hand-built `onEvent` payload —
+  has to set it.
+- **`RaiseHandOptions` is now a union** of `TakeoverOptions | ApprovalOptions`,
+  so `interface Yours extends RaiseHandOptions` no longer compiles. Extend
+  `HandoffOptions` (everything both modes share) or `TakeoverOptions` instead;
+  both are exported.
 
 ### Added
 
@@ -21,7 +42,8 @@ and behaves exactly as before.
   `approved` or `denied`. `action` is required in that mode and the types
   enforce it; `raiseHand(page, { reason })` is unchanged and still a takeover.
   `HandoffOutcome` grows by `approved` and `denied`, and `HandoffEvent` carries
-  `mode`, which is what makes `framesSent: 1` and `inputsApplied: 0` readable.
+  `mode`, which is what makes `inputsApplied: 0` and `framesSent: 1 +
+  reconnects` readable.
 - **Approval injects nothing.** No screencast, no CDP input, no focus probe, no
   `storageState` capture, and no CDP session at all: the page the human decides
   on is the page the agent stays on. One JPEG instead of 23–80 KB/s.
@@ -49,6 +71,46 @@ and behaves exactly as before.
 - The relay no longer forwards non-text frames or unknown message types from
   the human side. Both were previously relayed and then ignored by the agent,
   so the closed message set is now closed at the relay rather than downstream.
+
+### Fixed
+
+- **The phone's Clear key did nothing.** `clear` was in the protocol, the relay
+  routed it and `input.ts` implemented it, but the agent's own message switch
+  never listed it, so it was dropped one hop short of the page. The human
+  pressed a key that gave feedback and changed nothing. A test now sends one of
+  every message the protocol defines through the real relay and the real
+  socket, so the three vocabularies cannot drift apart again.
+- **An answer given while the phone's socket was closing was thrown away.** If
+  the socket had started closing when the human tapped, the message went into
+  the outbox, the page showed the ending, and the socket's close handler then
+  stopped reconnecting because the page was "finished" — with the answer still
+  queued. The human saw "Handed back" or "Approved" and the agent waited out
+  its full timeout. The page now keeps reconnecting until the outbox is empty.
+  Present since 0.3.0 for hand back and give up.
+- **An unknown `mode` is refused before anything is created**, rather than
+  falling open as a takeover. TypeScript closes it; this package also ships as
+  JavaScript. An approval with a blank or whitespace-only `action` is refused
+  the same way, in `raiseHand` and in the `needHuman` tool: a human cannot
+  approve a sentence that is not there.
+
+### Security
+
+- **The first answer wins, permanently.** The handoff link is a bearer URL and
+  can be in two hands at once. A terminal message from the human ended the
+  handoff but did not lock the relay, so a second holder could overwrite a
+  queued `deny` with an `approve` before the agent reconnected to collect it —
+  and the agent would act on the second one. The relay now takes the first
+  answer, refuses every human message after it, and refuses to let a
+  reconnecting agent refill the replay buffers it has just scrubbed. Present
+  since 0.2.0 for hand back and give up.
+- **The relay forgets the page when its agent disconnects.** Replay buffers
+  were purged only when the agent's `ended` arrived, and that message is not
+  guaranteed: the agent gives up on it after two seconds, and a sandbox that
+  fails to be destroyed stays public until it idles out. Anyone holding the
+  link could be served the last frame of a logged-in page in that window. The
+  relay now drops the last frame, state and focus the moment the authenticated
+  agent socket closes; a handoff that is still running restores them by itself
+  on the next reconnect.
 
 ## [0.3.0] - 2026-09-02
 

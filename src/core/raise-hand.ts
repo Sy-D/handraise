@@ -201,10 +201,18 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   let firstFrameMs: number | undefined
   let firstError: string | undefined
 
+  // Set by the first settle, on every path — a human answer, the timeout, a
+  // dead session. Nothing about the page may go on the wire after it: the
+  // relay scrubs its replay buffers when a handoff ends, and a reconnect that
+  // re-sent the screenshot would undo exactly that scrubbing.
+  let over = false
   let settle: (outcome: HandoffOutcome) => void = () => undefined
   // A promise resolves once; that is where "settled exactly once" comes from.
   const finished = new Promise<HandoffOutcome>((resolve) => {
-    settle = resolve
+    settle = (outcome) => {
+      over = true
+      resolve(outcome)
+    }
   })
 
   const browser = page.context().browser()
@@ -280,15 +288,18 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   }
 
   // The approval's single screenshot, kept so a reconnect can put it back on
-  // the wire. A cast would simply send the next frame; this one has no next.
+  // the wire. A cast would simply send the next frame; this one has no next,
+  // which is why `framesSent` counts one per connection and not one per
+  // handoff — every one of them really did go over the wire.
   let approvalFrame: ApprovalFrame | null = null
   const sendApprovalFrame = async (): Promise<void> => {
     const shot = approvalFrame
     // `send` resolves without sending while the socket is down, which is right
     // for a cast and wrong for the only frame there is: skip it, and let the
-    // reconnect's `onOpen` be the one that delivers it (and counts it).
+    // reconnect's `onOpen` be the one that delivers it (and counts it). Once
+    // the handoff is over there is nothing to deliver at all.
     const live = link
-    if (!shot || !live?.isOpen()) return
+    if (!shot || over || !live?.isOpen()) return
     await live.send({ type: "frame", data: shot.data, meta: shot.meta })
     framesSent += 1
     bytesSent += shot.data.length
@@ -409,12 +420,48 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   return { outcome: finalOutcome, storageState }
 }
 
+/** The two modes, as a runtime value. */
+const MODES = new Set<string>(["takeover", "approval"])
+
+/**
+ * Check the mode and, in approval mode, that there is an action to decide on;
+ * return the mode. Everything `raiseHand` refuses to start a handoff for is
+ * here, and here is the one place it may throw: no URL exists yet, so nobody
+ * has been asked for anything and the caller can retry or give up cleanly.
+ *
+ * The types close both of these for TypeScript callers. This package is
+ * published as JavaScript as well, the mode ends up on the relay's command
+ * line, and an approval with no action puts a blank question on a phone.
+ */
+function checkedMode(options: RaiseHandOptions): HandoffMode {
+  const mode = options.mode ?? "takeover"
+  if (!MODES.has(mode)) {
+    throw new Error(
+      `handraise: unknown mode ${JSON.stringify(mode)} — it must be "takeover" or "approval".`,
+    )
+  }
+  // String(): a JavaScript caller can leave `action` out entirely, and a
+  // TypeError from reading `.trim()` of undefined is not an answer.
+  if (
+    options.mode === "approval" &&
+    String(options.action ?? "").trim() === ""
+  ) {
+    throw new Error(
+      'handraise: mode "approval" needs a non-empty `action` — it is the step the human says yes or no to, and the phone shows it as the decision. Without it a human is asked to approve a blank line.',
+    )
+  }
+  // SAFETY: `MODES` holds exactly the two members of HandoffMode, so a value
+  // that passed the check above is one of them.
+  return mode as HandoffMode
+}
+
 /** See `RaiseHand` in ../types.ts for the contract. */
 export async function raiseHand(
   page: Page,
   options: RaiseHandOptions,
 ): Promise<HandoffResult> {
   const logger = options.logger ?? quietLogger
+  const mode = checkedMode(options)
   const apiKey = options.apiKey ?? process.env.SOLARI_API_KEY
   if (!apiKey) {
     throw new Error(
@@ -423,9 +470,6 @@ export async function raiseHand(
   }
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  // Throwing here is allowed and correct: no URL exists yet, so no human has
-  // been asked for anything and the caller can retry or give up cleanly.
-  const mode: HandoffMode = options.mode ?? "takeover"
   const relay = await startRelay(
     options.baseUrl
       ? {
