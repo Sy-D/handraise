@@ -413,20 +413,31 @@ const PAGE = \`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<!-- interactive-widget=resizes-content: Chrome Android otherwise leaves the
+     layout viewport alone when the keyboard opens and the footer - field, keys,
+     both buttons - ends up underneath it. maximum-scale=1 is gone with it: it
+     is a WCAG 1.4.4 failure that iOS has ignored since iOS 10, so it only ever
+     penalised Android. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="dark">
 <meta name="robots" content="noindex">
 <title>handraise</title>
 <style>
-  /* cmpinf.com's dark palette, verbatim: monochrome at chroma 0 throughout,
-     with exactly one colour in the whole interface — the destructive red on
-     the "Can't help" button. oklch has shipped in every mobile browser that
-     can run this page since 2023. */
+  /* cmpinf.com's dark palette: monochrome at chroma 0 throughout. The one
+     colour in the interface is the destructive red, and it is now spent only
+     on the give-up hold while a finger is on it — never at rest, where it used
+     to make "I won't" the loudest thing on the screen. oklch has shipped in
+     every mobile browser that can run this page since 2023.
+
+     The surface, line and field steps are lifted from the original 0.145 /
+     0.24 / 0.26: header, stage and footer measured 1.04:1 against each other
+     and read as one continuous black rectangle, and the control borders at
+     1.28:1 made the key bar a row of ghosts. */
   :root {
     --bg: oklch(0.11 0 0);
-    --surface: oklch(0.145 0 0);
-    --line: oklch(0.24 0 0);
-    --field: oklch(0.26 0 0);
+    --surface: oklch(0.205 0 0);
+    --line: oklch(0.30 0 0);
+    --field: oklch(0.36 0 0);
     --text: oklch(0.985 0 0);
     --muted: oklch(0.68 0 0);
     --danger: oklch(0.65 0.2 25);
@@ -443,16 +454,23 @@ const PAGE = \`<!doctype html>
     line-height: 1.4;
     overscroll-behavior: none;
   }
+  /* dvh, not vh: paired with interactive-widget above it is what keeps the
+     bottom bar above the Android soft keyboard. 100% stays as the fallback. */
+  @supports (height: 100dvh) {
+    html, body { height: 100dvh; }
+  }
+  /* No insets here. They belong to the boxes that actually touch the screen
+     edges; applied on body as well, a notched iPhone got 34 + 10 + 34 = 78px
+     of footer padding out of a screen whose canvas is already starved. */
   body {
     display: flex;
     flex-direction: column;
-    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   }
   header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 10px;
-    padding: 12px 16px;
+    padding: calc(12px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) 12px calc(16px + env(safe-area-inset-left));
     border-bottom: 1px solid var(--line);
     background: var(--surface);
   }
@@ -463,6 +481,8 @@ const PAGE = \`<!doctype html>
     height: 9px;
     border-radius: 50%;
     background: var(--text);
+    /* Optically centred on the first line of the header copy. */
+    margin-top: 4px;
   }
   .dot::after {
     content: "";
@@ -472,12 +492,14 @@ const PAGE = \`<!doctype html>
     border: 1px solid currentColor;
     color: var(--text);
     opacity: 0;
-    animation: pulse 2s ease-out infinite;
   }
+  /* Motion marks change, not permanence. The live state lasts the whole
+     session, so a pulse there signals nothing while animating in the corner of
+     a screen someone is reading a password onto. Only waiting pulses, because
+     waiting is the state where the human needs to know something is trying. */
   .dot.waiting { background: var(--muted); }
-  .dot.waiting::after { color: var(--muted); animation-duration: .9s; }
+  .dot.waiting::after { color: var(--muted); animation: pulse .9s ease-out infinite; }
   .dot.dead { background: var(--danger); }
-  .dot.dead::after { animation: none; }
   @keyframes pulse {
     0% { transform: scale(.6); opacity: .9; }
     100% { transform: scale(1.6); opacity: 0; }
@@ -485,11 +507,29 @@ const PAGE = \`<!doctype html>
   @media (prefers-reduced-motion: reduce) {
     .dot::after { animation: none; }
   }
-  #reason {
-    min-width: 0;
+  /* A stranger scans a QR code and lands on a dark page that asks for a
+     two-factor code. That is the shape of a phishing page, so the page says
+     what it is before it asks for anything. */
+  .head-copy { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    color: var(--muted);
+    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+  }
+  .eyebrow .mark { color: var(--text); font-weight: 600; }
+  /* The reason is the only sentence that tells the human why they are here, so
+     it gets two lines. Truncation is right for a label and wrong for the
+     primary explanation. */
+  #reason {
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
     font-weight: 500;
     letter-spacing: -0.01em;
   }
@@ -500,7 +540,7 @@ const PAGE = \`<!doctype html>
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 10px;
+    padding: 10px calc(10px + env(safe-area-inset-right)) 10px calc(10px + env(safe-area-inset-left));
   }
   canvas {
     width: 100%;
@@ -514,6 +554,29 @@ const PAGE = \`<!doctype html>
     color: var(--muted);
     font-size: 14px;
     pointer-events: none;
+  }
+  /* The remote page is letterboxed to about a third of its size, so a focus
+     outline or a pressed button over there is invisible here. Without a local
+     acknowledgement the human taps again — a double submit on a login form.
+     Lives in #stage, never on the canvas: every frame repaints the canvas. */
+  .tapmark {
+    position: absolute;
+    width: 28px;
+    height: 28px;
+    margin: -14px 0 0 -14px;
+    border: 2px solid var(--text);
+    border-radius: 50%;
+    pointer-events: none;
+    animation: tapmark 300ms cubic-bezier(0.23, 1, 0.32, 1) forwards;
+  }
+  /* From 0.4 and not from 0: nothing in the real world appears from nothing. */
+  @keyframes tapmark {
+    0% { transform: scale(.4); opacity: .9; }
+    100% { transform: scale(1.6); opacity: 0; }
+  }
+  @keyframes tapmark-fade {
+    0% { opacity: .9; }
+    100% { opacity: 0; }
   }
   /* The ring around the focused remote field. A sibling of the canvas, never
      drawn on it: every frame repaints the canvas and would wipe it out.
@@ -531,11 +594,22 @@ const PAGE = \`<!doctype html>
   }
   @media (prefers-reduced-motion: reduce) {
     #focus-ring { transition: none; }
+    /* The acknowledgement is the point, the ripple is not: keep the dot, drop
+       the movement. */
+    .tapmark { animation: tapmark-fade 200ms linear forwards; }
   }
   footer {
     border-top: 1px solid var(--line);
     background: var(--surface);
-    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+    padding: 10px calc(16px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+  }
+  /* At 320px the field and the key bar are fighting over 288px. Give the row
+     its 8px back rather than let the field shrink out of usefulness. */
+  @media (max-width: 360px) {
+    header, footer {
+      padding-right: calc(12px + env(safe-area-inset-right));
+      padding-left: calc(12px + env(safe-area-inset-left));
+    }
   }
   /* Field and key bar on one line. The field takes the slack, the keys never
      shrink and never wrap: a wrapped key bar on a 320px phone would push the
@@ -554,12 +628,13 @@ const PAGE = \`<!doctype html>
   }
   input:focus { outline: none; border-color: oklch(0.44 0 0); }
   .keys { display: flex; flex: none; gap: 6px; }
-  /* 40 x 44 is the smallest tap target that still reads as comfortable on a
-     phone; the glyphs sit at muted weight so the bar does not compete with the
-     hand-back button below it. */
+  /* 44 x 44: the minimum is a target, not a height. These four buttons exist
+     because a phone's soft keyboard is unreliable, so they have to be the most
+     reliable controls on the page. Muted weight so the bar does not compete
+     with the hand-back button below it. */
   .key {
     flex: none;
-    width: 40px;
+    width: 44px;
     min-height: 44px;
     padding: 0;
     border: 1px solid var(--field);
@@ -569,12 +644,26 @@ const PAGE = \`<!doctype html>
     font-size: 16px;
     line-height: 1;
   }
+  /* Ordered by consequence. Backspace, Next and Enter each cost one character
+     or one step and sit together in typing order; clear destroys the whole
+     field with no undo, so it is a word rather than a glyph a stranger has to
+     guess at, and it sits behind a gutter the thumb has to reach for. A missed
+     backspace can no longer empty the field. */
+  #key-clear {
+    width: auto;
+    min-width: 44px;
+    margin-left: 18px;
+    padding: 0 8px;
+    font-size: 13px;
+  }
   .key:active:not(:disabled) {
     color: var(--text);
     border-color: oklch(0.44 0 0);
     background: oklch(0.26 0 0 / 0.4);
   }
-  .key:disabled { opacity: .38; cursor: default; }
+  /* .38 put the glyph at 1.91:1 against the surface — effectively not there.
+     .62 is 3.17:1, so a disabled control still reads as a control. */
+  .key:disabled { opacity: .62; cursor: default; }
   .hint {
     margin: 7px 2px 10px;
     color: var(--muted);
@@ -584,26 +673,68 @@ const PAGE = \`<!doctype html>
     white-space: nowrap;
   }
   .row { display: flex; align-items: center; gap: 10px; }
-  button { font: inherit; font-weight: 600; border-radius: var(--radius); cursor: pointer; }
+  button {
+    font: inherit;
+    font-weight: 600;
+    border-radius: var(--radius);
+    cursor: pointer;
+    /* Press feedback that is felt even under the thumb covering the button. */
+    transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+  .primary:active, .ghost:active { transform: scale(0.97); }
   /* Inverted, the way shadcn's dark primary is: near-white on near-black. */
   .primary {
     flex: 1 1 auto;
+    /* A transparent border, not none: .ghost carries a real 1px one, and two
+       buttons in a row whose boxes differ by 2px is the kind of thing nobody
+       consciously sees and everybody feels. nowrap because the label wrapped
+       to two lines at 320px and took the row's height with it. */
+    border: 1px solid transparent;
     padding: 13px 16px;
-    border: none;
     background: var(--text);
     color: oklch(0.205 0 0);
     letter-spacing: -0.01em;
+    white-space: nowrap;
   }
   .primary:active { background: oklch(0.9 0 0); }
+  /* This button used to hold the only colour in the interface, which made "I
+     won't" the loudest thing on a screen whose job is asking for help. It is
+     monochrome at rest; the red exists only as the hold's progress. */
   .ghost {
+    position: relative;
     flex: none;
+    overflow: hidden;
     padding: 13px 14px;
-    border: 1px solid var(--field);
+    border: 1px solid var(--line);
     background: transparent;
-    color: var(--danger);
+    color: var(--muted);
     font-weight: 500;
+    white-space: nowrap;
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
-  .ghost:active { border-color: var(--danger); background: oklch(0.65 0.2 25 / 0.1); }
+  /* Hold-to-give-up: the fill is the confirmation. Deliberate on press
+     (linear, so it reads as elapsed time), snappy on release. scaleX and not
+     width, so the progress never leaves the compositor. */
+  .ghost::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: oklch(0.65 0.2 25 / 0.22);
+    transform: scaleX(0);
+    transform-origin: left center;
+    transition: transform 200ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+  .ghost[data-holding]::before {
+    transform: scaleX(1);
+    transition: transform 700ms linear;
+  }
+  .ghost[data-holding] { color: var(--text); border-color: var(--danger); }
+  /* The label rides above the fill: an absolutely positioned ::before paints
+     over the button's own text otherwise. */
+  .ghost-label { position: relative; }
   #overlay {
     position: fixed;
     inset: 0;
@@ -617,16 +748,41 @@ const PAGE = \`<!doctype html>
     text-align: center;
     background: oklch(0.11 0 0 / 0.92);
     backdrop-filter: blur(8px);
+    /* Seen once, user-initiated, and it marks the end of the session: the one
+       moment on this page where motion is unambiguously earned. From 0.96, not
+       from 0 — nothing in the real world appears from nothing. */
+    opacity: 1;
+    transform: scale(1);
+    transition:
+      opacity 200ms cubic-bezier(0.23, 1, 0.32, 1),
+      transform 200ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
+  @starting-style {
+    #overlay { opacity: 0; transform: scale(0.96); }
   }
   #overlay[hidden] { display: none; }
   #overlay h1 { margin: 0; font-size: 20px; letter-spacing: -0.02em; }
   #overlay p { margin: 0; color: var(--muted); font-size: 14px; }
+  @media (prefers-reduced-motion: reduce) {
+    button { transition: none; }
+    /* Keep the safety, drop the motion: the hold still takes its 700ms, it
+       just does not animate getting there. */
+    .ghost::before { display: none; }
+    .ghost[data-holding] { background: oklch(0.65 0.2 25 / 0.14); }
+    #overlay { transition: opacity 150ms linear; }
+    @starting-style {
+      #overlay { opacity: 0; transform: none; }
+    }
+  }
 </style>
 </head>
 <body>
   <header>
     <span id="dot" class="dot"></span>
-    <span id="reason">Connecting to the browser…</span>
+    <div class="head-copy">
+      <span class="eyebrow"><span class="mark">handraise</span> · an agent asked for your help</span>
+      <span id="reason">Connecting to the browser…</span>
+    </div>
   </header>
   <main id="stage">
     <canvas id="view"></canvas>
@@ -638,16 +794,16 @@ const PAGE = \`<!doctype html>
       <input id="kbd" type="text" autocomplete="off" autocapitalize="off" autocorrect="off"
         spellcheck="false" enterkeyhint="enter" placeholder="Type here">
       <div class="keys">
-        <button id="key-back" class="key" type="button" aria-label="Backspace">&#9003;</button>
-        <button id="key-clear" class="key" type="button" aria-label="Clear the field" disabled>&#10005;</button>
+        <button id="key-back" class="key" type="button" aria-label="Delete one character">&#9003;</button>
         <button id="key-tab" class="key" type="button" aria-label="Next field">&#8677;</button>
         <button id="key-enter" class="key" type="button" aria-label="Enter">&#9166;</button>
+        <button id="key-clear" class="key" type="button" aria-label="Clear the field" disabled>Clear</button>
       </div>
     </div>
     <p class="hint" id="hint">Typing goes straight to the browser</p>
     <div class="row">
-      <button id="handback" class="primary">&#9995; Hand back to agent</button>
-      <button id="abort" class="ghost">Can't help</button>
+      <button id="handback" class="primary" type="button">&#9995; Hand back</button>
+      <button id="abort" class="ghost" type="button"><span class="ghost-label">I can't do this</span></button>
     </div>
   </footer>
   <div id="overlay" hidden>
@@ -688,6 +844,9 @@ const PAGE = \`<!doctype html>
   var meta = null
   var focus = null
   var HINT_DEFAULT = "Typing goes straight to the browser"
+  /** Long enough that a stray thumb cannot reach it, short enough to not annoy. */
+  var HOLD_MS = 700
+  var HOLD_HINT = "Hold the button to stop the agent"
 
   function send(message) {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(message))
@@ -838,12 +997,30 @@ const PAGE = \`<!doctype html>
     var fdy = Math.round((-stepped * frameH) / box.h)
     if (fdy !== 0) send({ type: "scroll", fdy: fdy })
   })
+  /** Acknowledge the tap where the finger landed, inside the same frame. */
+  function markTap(clientX, clientY) {
+    var host = stage.getBoundingClientRect()
+    var mark = document.createElement("div")
+    mark.className = "tapmark"
+    mark.style.left = (clientX - host.left) + "px"
+    mark.style.top = (clientY - host.top) + "px"
+    var drop = function () { mark.remove() }
+    mark.addEventListener("animationend", drop)
+    // With animations disabled outright, animationend never fires and the marks
+    // would pile up on the stage for the rest of the session.
+    setTimeout(drop, 600)
+    stage.appendChild(mark)
+    if (navigator.vibrate) navigator.vibrate(8)
+  }
+
   canvas.addEventListener("pointerup", function (e) {
     var was = press
     press = null
     if (!was || was.travel >= 10) return
     var point = toFrame(e.clientX, e.clientY)
-    if (point) send({ type: "tap", fx: point.x, fy: point.y })
+    if (!point) return
+    send({ type: "tap", fx: point.x, fy: point.y })
+    markTap(e.clientX, e.clientY)
   })
   canvas.addEventListener("pointercancel", function () { press = null })
 
@@ -960,20 +1137,76 @@ const PAGE = \`<!doctype html>
     if (ws) ws.close()
   }
 
+  // The expected ending, and the only one whose worst case is recoverable in
+  // spirit: the agent looks, fails and asks again. Confirming the happy path is
+  // the classic mistake, so this stays a single tap.
   document.getElementById("handback").addEventListener("click", function () {
     send({ type: "handback" })
-    finish("Handed back", "You can close this tab.")
+    finish(ENDINGS.resolved[0], ENDINGS.resolved[1])
   })
-  document.getElementById("abort").addEventListener("click", function () {
-    send({ type: "abort" })
-    finish("Told the agent", "It knows you couldn't help and will stop waiting. You can close this tab.")
+
+  /**
+   * Giving up ends the handoff for good and there is nothing to undo — the
+   * message leaves the socket and the agent settles on it immediately. So the
+   * gesture costs more than a tap instead of a confirm dialog costing a screen.
+   *
+   * Pointer events only: they cover mouse, touch and pen with one stream, so
+   * the hold cannot start twice from one finger.
+   */
+  var abortButton = document.getElementById("abort")
+  var holdTimer = null
+  var holdFired = false
+  var hintTimer = null
+
+  function flashHint(text) {
+    hint.textContent = text
+    if (hintTimer) clearTimeout(hintTimer)
+    hintTimer = setTimeout(function () { hintTimer = null; setHint() }, 2200)
+  }
+
+  function startHold() {
+    if (holdTimer || finished) return
+    abortButton.dataset.holding = ""
+    holdTimer = setTimeout(function () {
+      holdTimer = null
+      holdFired = true
+      delete abortButton.dataset.holding
+      if (navigator.vibrate) navigator.vibrate(20)
+      send({ type: "abort" })
+      finish("Thanks for looking", "The agent knows it can't be done here and will stop. You can close this tab.")
+    }, HOLD_MS)
+  }
+
+  function cancelHold() {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null }
+    delete abortButton.dataset.holding
+  }
+
+  abortButton.addEventListener("pointerdown", startHold)
+  abortButton.addEventListener("pointerup", cancelHold)
+  abortButton.addEventListener("pointercancel", cancelHold)
+  abortButton.addEventListener("pointerleave", cancelHold)
+  // A keyboard has no press-and-hold of its own, so held Space or Enter is the
+  // same contract. Without this the button is unreachable without a pointer.
+  abortButton.addEventListener("keydown", function (e) {
+    if (e.key !== " " && e.key !== "Enter") return
+    e.preventDefault()
+    if (!e.repeat) startHold()
+  })
+  abortButton.addEventListener("keyup", cancelHold)
+  // A release always fires a click. After a completed hold that click is the
+  // same gesture arriving twice; before 700ms it is a tap that did nothing, and
+  // a tap that does nothing has to say why or the human thinks it is broken.
+  abortButton.addEventListener("click", function () {
+    if (holdFired) { holdFired = false; return }
+    flashHint(HOLD_HINT)
   })
 
   var ENDINGS = {
-    resolved: ["Handed back", "The agent is driving again."],
-    aborted: ["Handoff ended", "The helper couldn't solve it. You can close this tab."],
-    timeout: ["The agent stopped waiting", "Nobody picked this up in time."],
-    disconnected: ["Session lost", "The browser session died. The agent knows."]
+    resolved: ["Thanks — that unblocked it", "The agent is driving again. You can close this tab."],
+    aborted: ["Handoff ended", "You couldn't solve it here. Nothing more to do — you can close this tab."],
+    timeout: ["Too late", "The agent gave up waiting. Nothing you can do here now."],
+    disconnected: ["Connection ended", "The remote browser closed. The agent has been told — this wasn't anything you did."]
   }
 
   function handle(raw) {
@@ -1036,6 +1269,9 @@ const PAGE = \`<!doctype html>
 
   setInterval(function () { send({ type: "ping" }) }, 20000)
   window.addEventListener("resize", render)
+  // The stage also changes size without the window doing so: a longer reason
+  // takes the header to its second line. The letterbox has to follow.
+  if (window.ResizeObserver) new ResizeObserver(render).observe(stage)
   document.addEventListener("visibilitychange", function () {
     if (document.hidden || finished) return
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }

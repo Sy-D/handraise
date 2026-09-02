@@ -68,6 +68,9 @@ interface RelayLog {
 interface AgentClient {
   send(message: RelayMessage): void
   next(): Promise<RelayMessage>
+  /** Every message this socket has seen, in order. `next()` never consumes it,
+   *  so a test can assert that something was sent *exactly once*. */
+  received: RelayMessage[]
   close(): void
 }
 
@@ -147,10 +150,12 @@ async function connectAgent(port: number): Promise<AgentClient> {
     `ws://127.0.0.1:${port}/ws?role=agent&k=${AGENT_KEY}`,
   )
   const inbox: RelayMessage[] = []
+  const received: RelayMessage[] = []
   const waiters: ((message: RelayMessage) => void)[] = []
 
   socket.on("message", (raw: Buffer) => {
     const message = parseMessage(raw.toString("utf8"))
+    received.push(message)
     const waiter = waiters.shift()
     if (waiter) waiter(message)
     else inbox.push(message)
@@ -165,6 +170,7 @@ async function connectAgent(port: number): Promise<AgentClient> {
     send(message) {
       socket.send(JSON.stringify(message))
     },
+    received,
     next() {
       const queued = inbox.shift()
       if (queued) return Promise.resolve(queued)
@@ -258,6 +264,12 @@ afterEach(async () => {
 const FOCUS_RECT: FocusRect = { x: 400, y: 240, width: 200, height: 40 }
 
 const DEFAULT_HINT = "Typing goes straight to the browser"
+const HOLD_HINT = "Hold the button to stop the agent"
+
+/** Apple's 44pt minimum is a target, not a height: both axes have to clear it. */
+const MIN_TAP_TARGET_PX = 44
+/** The gutter that keeps a missed Backspace off "clear the whole field". */
+const MIN_DESTRUCTIVE_GAP_PX = 24
 
 /**
  * Where the ring must end up, computed here the long way round so a mistake in
@@ -325,6 +337,41 @@ test("a tap maps to the exact frame pixel under the finger", async () => {
   if (message.type !== "tap") throw new Error("expected a tap")
   expect(Math.abs(message.fx - expectedFx)).toBeLessThanOrEqual(1)
   expect(Math.abs(message.fy - expectedFy)).toBeLessThanOrEqual(1)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a tap on the canvas is acknowledged on the stage, then cleans up", async () => {
+  await showFrame()
+
+  // The mark lives for 300ms, so count the insertions instead of racing them.
+  await page.evaluate(() => {
+    const stage = document.getElementById("stage")
+    if (!stage) throw new Error("no stage")
+    stage.dataset.marks = "0"
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of Array.from(record.addedNodes)) {
+          if (node instanceof HTMLElement && node.className === "tapmark") {
+            stage.dataset.marks = String(Number(stage.dataset.marks) + 1)
+          }
+        }
+      }
+    }).observe(stage, { childList: true })
+  })
+
+  const box = await page.locator("#view").boundingBox()
+  if (!box) throw new Error("canvas has no bounding box")
+  const frame = letterbox(box.width, box.height)
+  await page.locator("#view").click({
+    position: { x: frame.x + frame.w * 0.5, y: frame.y + frame.h * 0.5 },
+  })
+
+  expect((await agent.next()).type).toBe("tap")
+  expect(await page.locator("#stage").getAttribute("data-marks")).toBe("1")
+  // And it takes itself back out again: no mark may outlive its animation.
+  await page.waitForFunction(
+    () => document.querySelectorAll(".tapmark").length === 0,
+  )
   expect(consoleErrors).toEqual([])
 })
 
@@ -427,6 +474,37 @@ test("the clear key is offered only while a remote field is focused", async () =
   expect(consoleErrors).toEqual([])
 })
 
+const KEY_IDS = ["#key-back", "#key-tab", "#key-enter", "#key-clear"]
+
+/** Every key button's box, in the order the ids are given. */
+async function keyBoxes(): Promise<Box[]> {
+  const boxes: Box[] = []
+  for (const id of KEY_IDS) {
+    const box = await page.locator(id).boundingBox()
+    if (!box) throw new Error(`${id} has no bounding box`)
+    boxes.push({ x: box.x, y: box.y, w: box.width, h: box.height })
+  }
+  return boxes
+}
+
+test("every key is a 44px target and clear is fenced off from backspace", async () => {
+  await showFrame()
+
+  for (const box of await keyBoxes()) {
+    expect(box.w).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
+    expect(box.h).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
+  }
+
+  // ⌫ is pressed the most and ✕ destroys the whole field with no undo. They
+  // are the two keys that must never be neighbours.
+  const [back, , , clear] = await keyBoxes()
+  if (!back || !clear) throw new Error("the key bar is missing keys")
+  expect(clear.x - (back.x + back.w)).toBeGreaterThanOrEqual(
+    MIN_DESTRUCTIVE_GAP_PX,
+  )
+  expect(consoleErrors).toEqual([])
+})
+
 test("the key bar stays on one line on a narrow phone", async () => {
   await page.setViewportSize({ width: 320, height: 568 })
   await showFrame()
@@ -454,19 +532,91 @@ test("hand back sends handback and shows the handed-back overlay", async () => {
   expect(await agent.next()).toEqual({ type: "handback" })
 
   await waitForOverlay(page)
-  expect(await page.locator("#overlay-title").textContent()).toBe("Handed back")
+  // One string for one event: the local path and ENDINGS.resolved used to tell
+  // the same story in two vocabularies.
+  expect(await page.locator("#overlay-title").textContent()).toBe(
+    "Thanks \u2014 that unblocked it",
+  )
+  expect(await page.locator("#overlay-note").textContent()).toBe(
+    "The agent is driving again. You can close this tab.",
+  )
   expect(consoleErrors).toEqual([])
 })
 
-test("abort sends abort and shows the aborted overlay", async () => {
+/** Press the element with a real pointer, hold it, release it. */
+async function pressAndHold(selector: string, holdMs: number): Promise<void> {
+  const box = await page.locator(selector).boundingBox()
+  if (!box) throw new Error(`${selector} has no bounding box`)
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await page.mouse.down()
+  await page.waitForTimeout(holdMs)
+  await page.mouse.up()
+}
+
+function countOf(type: string): number {
+  return agent.received.filter((message) => message.type === type).length
+}
+
+test("a press shorter than the hold never ends the handoff", async () => {
   await showFrame()
 
-  await page.locator("#abort").click()
-  expect(await agent.next()).toEqual({ type: "abort" })
+  // Emil's hold-to-delete: the gesture, not a dialog, is the confirmation. A
+  // thumb that brushes the button — the failure mode this replaces — must do
+  // nothing at all.
+  await pressAndHold("#abort", 300)
+  await page.waitForTimeout(400)
 
+  expect(countOf("abort")).toBe(0)
+  expect(await page.locator("#overlay").isHidden()).toBe(true)
+  expect(await page.locator("#abort").getAttribute("data-holding")).toBe(null)
+  // A tap that does nothing has to say why, or the human thinks it is broken.
+  expect(await page.locator("#hint").textContent()).toBe(HOLD_HINT)
+  expect(consoleErrors).toEqual([])
+})
+
+test("reduced motion drops the fill and keeps the 700ms", async () => {
+  await page.emulateMedia({ reducedMotion: "reduce" })
+  await showFrame()
+
+  // Reduced motion means less movement, never less safety: the progress fill
+  // goes, the cost of the gesture stays.
+  const fill = await page.evaluate(() => {
+    const button = document.getElementById("abort")
+    if (!button) throw new Error("no give-up button")
+    return getComputedStyle(button, "::before").display
+  })
+  expect(fill).toBe("none")
+
+  await pressAndHold("#abort", 300)
+  await page.waitForTimeout(300)
+  expect(countOf("abort")).toBe(0)
+
+  await pressAndHold("#abort", 900)
   await waitForOverlay(page)
+  expect(countOf("abort")).toBe(1)
+  expect(consoleErrors).toEqual([])
+})
+
+test("holding the give-up button past 700ms aborts exactly once", async () => {
+  await showFrame()
+
+  const box = await page.locator("#abort").boundingBox()
+  if (!box) throw new Error("#abort has no bounding box")
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await page.mouse.down()
+  // Mid-hold: the fill is running, so the human can see the cost accruing.
+  await page.waitForTimeout(300)
+  expect(await page.locator("#abort").getAttribute("data-holding")).toBe("")
+  await page.waitForTimeout(600)
+  await page.mouse.up()
+
+  expect(await agent.next()).toEqual({ type: "abort" })
+  await waitForOverlay(page)
+  // The release fires a click on top of the completed hold: one abort, not two.
+  await page.waitForTimeout(400)
+  expect(countOf("abort")).toBe(1)
   expect(await page.locator("#overlay-title").textContent()).toBe(
-    "Told the agent",
+    "Thanks for looking",
   )
   expect(consoleErrors).toEqual([])
 })
@@ -478,11 +628,55 @@ test("an ended message shows the matching terminal overlay", async () => {
 
   await waitForOverlay(page)
   expect(await page.locator("#overlay-title").textContent()).toBe(
-    "Session lost",
+    "Connection ended",
   )
+  // A stranger who just typed a code must not be told they broke something.
   expect(await page.locator("#overlay-note").textContent()).toBe(
-    "The browser session died. The agent knows.",
+    "The remote browser closed. The agent has been told \u2014 this wasn't anything you did.",
   )
+  expect(consoleErrors).toEqual([])
+})
+
+/** The animation running on the status dot's halo right now, or "none". */
+function dotAnimation(target: Page): Promise<string> {
+  return target.evaluate(() => {
+    const dot = document.getElementById("dot")
+    if (!dot) throw new Error("no status dot")
+    return getComputedStyle(dot, "::after").animationName
+  })
+}
+
+test("the header names the page and gives a long reason two lines", async () => {
+  await showFrame()
+
+  // A stranger arriving from a QR code is looking at a dark page that will ask
+  // for a two-factor code. It has to say what it is.
+  expect(await page.locator(".eyebrow").textContent()).toBe(
+    "handraise \u00b7 an agent asked for your help",
+  )
+  // Motion marks change, not permanence: the live state does not pulse.
+  expect(await dotAnimation(page)).toBe("none")
+
+  const short = await page.locator("#reason").boundingBox()
+  if (!short) throw new Error("#reason has no bounding box")
+
+  agent.send({
+    type: "state",
+    reason:
+      "Blocked on two-factor authentication at login.acme-bank.example \u2014 the code went to the phone ending 4417 and expires in a minute.",
+  })
+  await page.waitForFunction(() =>
+    (document.getElementById("reason")?.textContent ?? "").startsWith(
+      "Blocked",
+    ),
+  )
+
+  const long = await page.locator("#reason").boundingBox()
+  if (!long) throw new Error("#reason has no bounding box")
+  // Two lines, not one truncated one — and clamped, so it can never take the
+  // stage with it.
+  expect(long.height).toBeGreaterThan(short.height * 1.5)
+  expect(long.height).toBeLessThan(short.height * 2.5)
   expect(consoleErrors).toEqual([])
 })
 
@@ -583,6 +777,9 @@ test("the page reconnects after its socket drops, with a single live human", asy
     const dot = document.getElementById("dot")
     return dot ? dot.className.includes("waiting") : false
   })
+  // Waiting is the one state where the human needs to know something is still
+  // trying, so this is the one state that pulses.
+  expect(await dotAnimation(page)).toBe("pulse")
   intruder.close()
 
   // The page's backoff reconnect brings the status dot back to live.
