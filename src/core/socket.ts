@@ -145,6 +145,11 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       case "scroll":
       case "handback":
       case "abort":
+      case "approve":
+      case "deny":
+        // Which of these the mode actually acts on is `runHandoff`'s decision,
+        // and the relay's before that. This switch only says what may be a
+        // human message at all.
         if (!shuttingDown) options.onMessage(message)
         return
       default:

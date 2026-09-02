@@ -32,6 +32,7 @@ import type {
   HumanToAgent,
   RelayMessage,
 } from "../src/relay/protocol"
+import type { HandoffMode } from "../src/types"
 
 const SERVER_PATH = fileURLToPath(
   new URL("../src/relay/guest/server.js", import.meta.url),
@@ -96,9 +97,13 @@ function parseMessage(raw: string): RelayMessage {
   return JSON.parse(raw) as RelayMessage
 }
 
-/** Start the real guest server on an OS-assigned port; read the port from its log. */
-function startRelay(): Promise<Relay> {
-  const child = spawn(process.execPath, [SERVER_PATH, "0", AGENT_KEY], {
+/**
+ * Start the real guest server on an OS-assigned port; read the port from its
+ * log. The mode is an argument and not a message: the relay decides what the
+ * human may send, so a test for approval mode has to boot its own relay.
+ */
+function startRelay(mode: HandoffMode = "takeover"): Promise<Relay> {
+  const child = spawn(process.execPath, [SERVER_PATH, "0", AGENT_KEY, mode], {
     stdio: ["ignore", "pipe", "pipe"],
   })
   const logs: string[] = []
@@ -239,8 +244,9 @@ afterAll(async () => {
   await browser.close()
 })
 
-beforeEach(async () => {
-  relay = await startRelay()
+/** A relay in `mode`, an agent on it, and the real page in a phone viewport. */
+async function openFixture(mode: HandoffMode): Promise<void> {
+  relay = await startRelay(mode)
   agent = await connectAgent(relay.port)
   consoleErrors = []
   page = await browser.newPage({
@@ -252,6 +258,18 @@ beforeEach(async () => {
   })
   page.on("pageerror", (error) => consoleErrors.push(error.message))
   await page.goto(`http://127.0.0.1:${relay.port}/`)
+}
+
+/** Throw the takeover fixture away and come back up in approval mode. */
+async function useApprovalMode(): Promise<void> {
+  await page.close()
+  agent.close()
+  relay.process.kill("SIGKILL")
+  await openFixture("approval")
+}
+
+beforeEach(async () => {
+  await openFixture("takeover")
 })
 
 afterEach(async () => {
@@ -1033,3 +1051,135 @@ test("the page reconnects after its socket drops, with a single live human", asy
   expect(openHumans(relay)).toBe(1)
   expect(consoleErrors).toEqual([])
 }, 20000)
+
+// --- Approval mode --------------------------------------------------------
+//
+// A different job on the same page: the human is not driving the browser, they
+// are answering one question about one screenshot. The tests below assert the
+// two halves of that — the screen says what is about to happen, and nothing the
+// human touches can reach the remote page.
+
+const APPROVAL_REASON = "Agent wants to submit this payment"
+const APPROVAL_ACTION = "Submit $12,430 vendor payment to Acme GmbH"
+const APPROVAL_HINT = "Approve needs a hold. Deny is one tap."
+const APPROVAL_HOLD_HINT = "Hold the button to approve"
+
+/** Put the page in approval mode and give it the agent's ask. */
+async function showApproval(): Promise<void> {
+  await useApprovalMode()
+  agent.send({
+    type: "state",
+    reason: APPROVAL_REASON,
+    action: APPROVAL_ACTION,
+  })
+  await page.waitForFunction(
+    (action: string) =>
+      document.getElementById("action")?.textContent === action,
+    APPROVAL_ACTION,
+  )
+}
+
+test("approval mode states the action and offers no way to type", async () => {
+  await showApproval()
+
+  expect(await page.locator("#reason").textContent()).toBe(APPROVAL_REASON)
+  expect(await page.locator(".eyebrow").textContent()).toBe(
+    "handraise · an agent needs your approval",
+  )
+  // The action is the sentence the decision is made on, so it is the largest
+  // type on the page — larger than the reason above it.
+  const sizes = await page.evaluate(() => {
+    const size = (id: string): number => {
+      const node = document.getElementById(id)
+      if (!node) throw new Error(`no #${id}`)
+      return Number.parseFloat(getComputedStyle(node).fontSize)
+    }
+    return { action: size("action"), reason: size("reason") }
+  })
+  expect(sizes.action).toBeGreaterThan(sizes.reason)
+
+  // No keyboard, no key bar: there is nothing on this screen to type into.
+  expect(await page.locator("#kbd").isVisible()).toBe(false)
+  expect(await page.locator(".keys").isVisible()).toBe(false)
+  expect(await page.locator("#hint").textContent()).toBe(APPROVAL_HINT)
+
+  for (const id of ["#deny", "#approve"]) {
+    const box = await page.locator(id).boundingBox()
+    if (!box) throw new Error(`${id} has no bounding box`)
+    expect(box.height).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
+    expect(box.width).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
+  }
+  expect(consoleErrors).toEqual([])
+})
+
+test("deny is one tap and says so on the way out", async () => {
+  await showApproval()
+
+  await page.locator("#deny").click()
+  expect(await agent.next()).toEqual({ type: "deny" })
+
+  await waitForOverlay(page)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Denied")
+  expect(await page.locator("#overlay-note").textContent()).toBe(
+    "The agent has been told not to do it. You can close this tab.",
+  )
+  await page.waitForTimeout(300)
+  expect(countOf("deny")).toBe(1)
+  expect(consoleErrors).toEqual([])
+})
+
+test("approve takes the hold, and a short press only explains", async () => {
+  await showApproval()
+
+  // The inversion of takeover mode: here the irreversible answer is yes, so
+  // yes is the one that costs a hold.
+  await pressAndHold("#approve", 300)
+  await page.waitForTimeout(400)
+  expect(countOf("approve")).toBe(0)
+  expect(await page.locator("#overlay").isHidden()).toBe(true)
+  expect(await page.locator("#hint").textContent()).toBe(APPROVAL_HOLD_HINT)
+
+  await pressAndHold("#approve", 900)
+  expect(await agent.next()).toEqual({ type: "approve" })
+  await waitForOverlay(page)
+  await page.waitForTimeout(400)
+  expect(countOf("approve")).toBe(1)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Approved")
+  expect(consoleErrors).toEqual([])
+})
+
+test("the screenshot zooms but nothing the human touches reaches the page", async () => {
+  await showApproval()
+  await showFrame()
+
+  const box = await page.locator("#view").boundingBox()
+  if (!box) throw new Error("canvas has no bounding box")
+  const centre = { x: box.width / 2, y: box.height / 2 }
+
+  await page.locator("#view").click({ position: centre })
+  await page.mouse.wheel(0, 200)
+  await page.waitForTimeout(300)
+  // Approval injects no input at all — not a tap, not a scroll, not a key.
+  expect(agent.received).toEqual([])
+
+  // It is still a screenshot of a page nobody can read at 29%, so the zoom
+  // gestures stay: a double tap magnifies it.
+  await page.locator("#view").dblclick({ position: centre })
+  await page.waitForTimeout(300)
+  expect((await zoomTransform(page)).scale).toBeGreaterThan(1.5)
+  expect(agent.received).toEqual([])
+  expect(consoleErrors).toEqual([])
+})
+
+test("an approval ending shows the matching terminal overlay", async () => {
+  await showApproval()
+
+  agent.send({ type: "ended", outcome: "approved" })
+
+  await waitForOverlay(page)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Approved")
+  expect(await page.locator("#overlay-note").textContent()).toBe(
+    "The agent has your approval and is continuing. You can close this tab.",
+  )
+  expect(consoleErrors).toEqual([])
+})

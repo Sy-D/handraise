@@ -22,6 +22,7 @@ import { printHandoffQr } from "../qr"
 import { startRelay } from "../relay/deploy"
 import type { AgentToHuman, HumanToAgent } from "../relay/protocol"
 import type {
+  HandoffMode,
   HandoffOutcome,
   HandoffResult,
   RaiseHandOptions,
@@ -31,6 +32,7 @@ import { notifyWebhook } from "../webhook"
 import { NO_FOCUS, probeFocus } from "./focus"
 import { createInputTarget } from "./input"
 import { DEFAULT_PROFILE, type FramePump, startFramePump } from "./screencast"
+import { type ApprovalFrame, captureApprovalFrame } from "./snapshot"
 import { connectRelay, type RelayConnection } from "./socket"
 
 /**
@@ -90,6 +92,35 @@ function endedMessage(outcome: HandoffOutcome): AgentToHuman {
   return { type: "ended", outcome }
 }
 
+/** What the human is looking at, replayed on every (re)connect. */
+function stateMessage(options: RaiseHandOptions): AgentToHuman {
+  if (options.mode === "approval") {
+    return { type: "state", reason: options.reason, action: options.action }
+  }
+  return { type: "state", reason: options.reason }
+}
+
+/**
+ * The human message that ends this mode, and what it means to the caller.
+ *
+ * Each mode answers to its own two messages and ignores the other pair. The
+ * relay refuses to route them in the first place; this is the second lock, for
+ * the case where the relay is not the one this version shipped.
+ */
+function endingFor(
+  mode: HandoffMode,
+  type: HumanToAgent["type"],
+): HandoffOutcome | null {
+  if (mode === "approval") {
+    if (type === "approve") return "approved"
+    if (type === "deny") return "denied"
+    return null
+  }
+  if (type === "handback") return "resolved"
+  if (type === "abort") return "aborted"
+  return null
+}
+
 /**
  * A dead Solari browser session has no error code and no status — the only
  * stable marker is this substring (docs/measurements/04-browser-session-lifetime.md §3). It is a fallback:
@@ -115,6 +146,25 @@ export interface HandoffRun {
   /** Measured by `startRelay()` and mirrored into the event. */
   relayColdStartMs: number
   logger: Logger
+}
+
+/**
+ * Start the live cast for a takeover, wired to the relay socket.
+ *
+ * The frame is written to the relay before it is acknowledged to Chromium, so
+ * the cast paces itself to the phone's link (see screencast.ts). `onSent` runs
+ * after the write resolves, which is what makes the counters truthful.
+ */
+async function startTakeoverCast(
+  cdp: CDPSession,
+  connection: RelayConnection,
+  onSent: (data: string) => void,
+): Promise<FramePump> {
+  return startFramePump(cdp, DEFAULT_PROFILE, async (data, meta) => {
+    // The ack that paces the cast waits on this write. See screencast.ts.
+    await connection.send({ type: "frame", data, meta })
+    onSent(data)
+  })
 }
 
 /**
@@ -144,6 +194,7 @@ function emitHandoffEvent(
  */
 export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   const { page, agentWsUrl, options, timeoutMs, logger } = run
+  const mode: HandoffMode = options.mode ?? "takeover"
   const startedAt = Date.now()
   let framesSent = 0
   let bytesSent = 0
@@ -202,19 +253,16 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   }
 
   const onHuman = (message: HumanToAgent): void => {
-    if (message.type === "handback") {
+    const ending = endingFor(mode, message.type)
+    if (ending) {
       terminal = true
-      settle("resolved")
-      return
-    }
-    if (message.type === "abort") {
-      terminal = true
-      settle("aborted")
+      settle(ending)
       return
     }
     // Once a terminal message has arrived the page is being handed back or
-    // abandoned, so no further input may run against it.
-    if (terminal) return
+    // abandoned, so no further input may run against it. An approval never
+    // injects anything at all: the human is answering, not driving.
+    if (terminal || mode === "approval") return
     // Input can only be mapped once a frame has defined the coordinate space.
     const meta = pump?.lastMeta()
     if (!meta || !input) return
@@ -231,6 +279,22 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       })
   }
 
+  // The approval's single screenshot, kept so a reconnect can put it back on
+  // the wire. A cast would simply send the next frame; this one has no next.
+  let approvalFrame: ApprovalFrame | null = null
+  const sendApprovalFrame = async (): Promise<void> => {
+    const shot = approvalFrame
+    // `send` resolves without sending while the socket is down, which is right
+    // for a cast and wrong for the only frame there is: skip it, and let the
+    // reconnect's `onOpen` be the one that delivers it (and counts it).
+    const live = link
+    if (!shot || !live?.isOpen()) return
+    await live.send({ type: "frame", data: shot.data, meta: shot.meta })
+    framesSent += 1
+    bytesSent += shot.data.length
+    if (firstFrameMs === undefined) firstFrameMs = Date.now() - startedAt
+  }
+
   const connection = connectRelay({
     url: agentWsUrl,
     onMessage: onHuman,
@@ -238,29 +302,37 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     // every reconnect costs one small message and covers the case where the
     // relay restarted underneath us.
     onOpen: () => {
-      void link?.send({ type: "state", reason: options.reason })
+      void link?.send(stateMessage(options))
+      void sendApprovalFrame()
     },
   })
   link = connection
 
   try {
-    cdp = await page.context().newCDPSession(page)
-    input = createInputTarget(cdp)
-    pump = await startFramePump(cdp, DEFAULT_PROFILE, async (data, meta) => {
-      // The ack that paces the cast waits on this write. See screencast.ts.
-      await connection.send({ type: "frame", data, meta })
-      // Counted with the same "send resolved" semantics as pump.frameCount():
-      // a base64 payload is ASCII, so its char length is its byte length.
-      framesSent += 1
-      bytesSent += data.length
-      if (firstFrameMs === undefined) {
-        firstFrameMs = Date.now() - startedAt
-        // The phone now has a picture to draw on. If the agent left a field
-        // focused — the usual case, it got stuck on a login form — the human
-        // sees the ring on the first frame rather than after their first tap.
-        refreshFocus()
-      }
-    })
+    if (mode === "approval") {
+      // One screenshot and nothing else: no CDP session, no screencast, no
+      // focus probe. The page the human decides on is the page as the agent
+      // left it, and it is still that page afterwards.
+      approvalFrame = await captureApprovalFrame(page)
+      await sendApprovalFrame()
+    } else {
+      cdp = await page.context().newCDPSession(page)
+      input = createInputTarget(cdp)
+      pump = await startTakeoverCast(cdp, connection, (data) => {
+        // Counted with the same "send resolved" semantics as
+        // pump.frameCount(): a base64 payload is ASCII, so its char length is
+        // its byte length.
+        framesSent += 1
+        bytesSent += data.length
+        if (firstFrameMs === undefined) {
+          firstFrameMs = Date.now() - startedAt
+          // The phone now has a picture to draw on. If the agent left a field
+          // focused — the usual case, it got stuck on a login form — the human
+          // sees the ring on the first frame rather than after their first tap.
+          refreshFocus()
+        }
+      })
+    }
   } catch (error) {
     firstError = String(error)
     logger.error("live_view_start_failed", { error: firstError })
@@ -317,6 +389,7 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   const event: HandoffEvent = {
     handoffId: run.handoffId,
     outcome: finalOutcome,
+    mode,
     reason: options.reason,
     timeoutMs,
     durationMs,
@@ -352,15 +425,17 @@ export async function raiseHand(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   // Throwing here is allowed and correct: no URL exists yet, so no human has
   // been asked for anything and the caller can retry or give up cleanly.
+  const mode: HandoffMode = options.mode ?? "takeover"
   const relay = await startRelay(
     options.baseUrl
       ? {
           apiKey,
+          mode,
           timeoutMs: timeoutMs + RELAY_SLACK_MS,
           baseUrl: options.baseUrl,
           logger,
         }
-      : { apiKey, timeoutMs: timeoutMs + RELAY_SLACK_MS, logger },
+      : { apiKey, mode, timeoutMs: timeoutMs + RELAY_SLACK_MS, logger },
   )
 
   const startedAt = Date.now()
@@ -374,7 +449,13 @@ export async function raiseHand(
     } catch (error) {
       logger.warn("on_url_threw", { error: String(error) })
     }
-    if (options.qr !== false) printHandoffQr(relay.humanUrl, options.reason)
+    // In approval mode the action is the decision, so the terminal line the
+    // operator reads carries it next to the reason.
+    const headline =
+      options.mode === "approval"
+        ? `${options.reason} — ${options.action}`
+        : options.reason
+    if (options.qr !== false) printHandoffQr(relay.humanUrl, headline)
     if (options.webhookUrl) {
       // Deliberately not awaited: the human may already be scanning the QR
       // code while a slow Slack endpoint is still thinking.

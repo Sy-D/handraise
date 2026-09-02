@@ -9,6 +9,16 @@
  *   })
  *   if (result.outcome !== "resolved") throw new Error("nobody helped")
  *
+ * Or ask instead of hand over, when the agent is not stuck but is about to do
+ * something it may not decide alone:
+ *
+ *   const ok = await raiseHand(page, {
+ *     mode: "approval",
+ *     reason: "The agent may not move money without a human",
+ *     action: "Submit $12,430 vendor payment to Acme GmbH",
+ *   })
+ *   if (ok.outcome !== "approved") return
+ *
  * Needs `SOLARI_API_KEY` in the environment: the handoff page is served from a
  * Solari sandbox that handraise creates and destroys around the call.
  */
@@ -30,10 +40,14 @@ export {
   needHumanToolSpec,
 } from "./tool"
 export type {
+  ApprovalOptions,
+  HandoffMode,
+  HandoffOptions,
   HandoffOutcome,
   HandoffResult,
   RaiseHand,
   RaiseHandOptions,
   StorageState,
+  TakeoverOptions,
 } from "./types"
 export type { WebhookPayload } from "./webhook"

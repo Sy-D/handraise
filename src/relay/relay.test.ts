@@ -14,7 +14,7 @@ import { connect as netConnect, type Socket } from "node:net"
 import type { Readable } from "node:stream"
 import { fileURLToPath } from "node:url"
 import WebSocket from "ws"
-
+import type { HandoffMode } from "../types"
 import { GUEST_SERVER_JS } from "./guest-source"
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -59,13 +59,21 @@ function parse(raw: string): RelayMessage {
 /** Processes spawned by an individual test; torn down in afterEach. */
 const extraProcesses: ChildProcessByStdio<null, Readable, Readable>[] = []
 
-/** Start the real server on an OS-assigned port and read the port back out of its log. */
-function startRelayProcess(agentKey?: string): Promise<Relay> {
-  const args = agentKey ? [SERVER_PATH, "0", agentKey] : [SERVER_PATH, "0"]
+/**
+ * Start the real server on an OS-assigned port and read the port back out of
+ * its log. `mode` is argv and not a message: what the human may send is fixed
+ * when the relay boots, so it cannot be talked out of it afterwards.
+ */
+function startRelayProcess(
+  agentKey?: string,
+  mode?: HandoffMode,
+): Promise<Relay> {
+  const args = [SERVER_PATH, "0", agentKey ?? ""]
+  if (mode) args.push(mode)
   const child = spawn(process.execPath, args, {
     stdio: ["ignore", "pipe", "pipe"],
   })
-  if (agentKey) extraProcesses.push(child)
+  if (agentKey || mode) extraProcesses.push(child)
   return new Promise<Relay>((resolve, reject) => {
     const timer = setTimeout(() => {
       child.kill("SIGKILL")
@@ -453,4 +461,60 @@ test("a replaced agent can no longer inject messages", async () => {
   expect(reasons).toContain("legit")
   expect(reasons).not.toContain("injected")
   stale.socket.destroy()
+})
+
+test("approval mode drops every takeover message the human sends", async () => {
+  const approval = await startRelayProcess("", "approval")
+  const agent = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  // Hiding the controls is not enough: the human's socket is reachable from
+  // any HTTP client, so the refusal has to be the relay's, not the page's.
+  human.send({ type: "tap", fx: 10, fy: 10 })
+  human.send({ type: "char", ch: "a" })
+  human.send({ type: "key", key: "Enter" })
+  human.send({ type: "clear" })
+  human.send({ type: "scroll", fdy: 40 })
+  human.send({ type: "handback" })
+  human.send({ type: "abort" })
+  // Only this one is in the approval vocabulary, and it arrives after all of
+  // them, so receiving it proves the others were dropped and not merely slow.
+  human.send({ type: "approve" })
+
+  expect(await agent.next()).toEqual({ type: "approve" })
+})
+
+test("takeover mode drops the approval answers", async () => {
+  const agent = await connect(relay.port, "agent")
+  const human = await connect(relay.port, "human")
+
+  human.send({ type: "approve" })
+  human.send({ type: "deny" })
+  human.send({ type: "handback" })
+
+  expect(await agent.next()).toEqual({ type: "handback" })
+})
+
+test("an approval relay serves the page in approval mode", async () => {
+  const approval = await startRelayProcess("", "approval")
+
+  const page = await fetch(`http://127.0.0.1:${approval.port}/`)
+  const html = await page.text()
+  expect(html).toContain('data-mode="approval"')
+  // The same file serves both modes, so an approval page that still offered
+  // the keyboard would render controls the relay refuses to route.
+  expect(html).toContain("Hold to approve")
+})
+
+test("a deny reaches an agent that reconnects after the human sent it", async () => {
+  const approval = await startRelayProcess("", "approval")
+  const first = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  first.socket.close()
+  await first.closed
+  human.send({ type: "deny" })
+
+  const second = await connect(approval.port, "agent")
+  expect(await second.next()).toEqual({ type: "deny" })
 })

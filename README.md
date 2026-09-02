@@ -43,9 +43,33 @@ Measured against the live API, method and raw data in
 - **30/30 handoffs resolved** in the latency benchmark.
 - **3.5 s median** from raise to live on the phone.
 
+## Approval mode
+
+Sometimes the agent is not stuck — it is about to do something it may not
+decide alone. That needs no takeover: the human sees a screenshot, the reason
+and the exact step, and answers.
+
+```ts
+const answer = await raiseHand(page, {
+  mode: "approval",
+  reason: "The agent may not move money without a human",
+  action: "Submit $12,430 vendor payment to Acme GmbH",
+})
+if (answer.outcome !== "approved") return   // "denied", "timeout", "disconnected"
+```
+
+One screenshot, no live stream, and nothing is injected into the page: the
+agent still owns the session and carries out the action itself. On the phone,
+**Deny is one tap** and **Approve takes a 700ms hold** — the reverse of
+takeover mode, because here the answer that cannot be taken back is yes. The
+relay enforces it too: an approval relay routes `approve` and `deny` and drops
+every takeover message, so the restriction is not just a hidden button
+([`docs/adr/0006`](docs/adr/0006-approval-mode.md)).
+
 Runnable without writing any code: [`demo/try.ts`](demo/try.ts) raises a hand
-immediately so you can drive it; [`demo/github-2fa.ts`](demo/github-2fa.ts)
-does the real 2FA wall and keeps the session the handoff earned.
+immediately so you can drive it; [`demo/approval.ts`](demo/approval.ts) asks
+you to approve a payment; [`demo/github-2fa.ts`](demo/github-2fa.ts) does the
+real 2FA wall and keeps the session the handoff earned.
 
 ## What this actually is
 
@@ -77,16 +101,23 @@ const tools = {
 
 The tool returns `{ outcome, summary, durationMs }`, where `summary` is a
 sentence the model can act on ("A human fixed the problem and handed the
-browser back. Re-read the page and continue.").
+browser back. Re-read the page and continue.", or "The human refused the
+action. Do not carry it out and do not ask again for the same step.").
+
+The model also chooses the mode: it passes `mode: "approval"` plus an `action`
+when it could do the step but must not decide alone, and the tool refuses an
+approval that names no action rather than quietly handing the browser over.
 
 [`demo/agent.ts`](demo/agent.ts) is a real agent loop where the model itself
 decides to call `needHuman` when it hits the 2FA wall — run it with
 `DEMO_SIM=1` for the scripted version.
 
 **Two classes of interrupt, one call.** A *capability gap* — 2FA, a captcha, an
-unfamiliar UI — is the agent admitting it cannot. An *authority boundary* —
-approval before an irreversible step — is the agent choosing not to. Both are
-the same call today with a different `reason`.
+unfamiliar UI — is the agent admitting it cannot: `mode: "takeover"`, the
+default. An *authority boundary* — a yes before an irreversible step — is the
+agent not being allowed to: `mode: "approval"`. The model picks, by passing
+`mode` and `action` to the same tool; the tool description says which is
+which.
 
 ## How it works
 
@@ -134,6 +165,13 @@ primary. The dot in the header shows the connection: white is live, pulsing
 grey is reconnecting (your input is queued and sent in order once it is back),
 red means the handoff has ended.
 
+**In approval mode the same page has a different job.** One screenshot instead
+of the stream, the action in the largest type on the screen, and no keyboard,
+key bar or input row — nothing there can reach the remote page. Pinch, drag and
+double-tap still zoom and pan the screenshot, because an amount you cannot read
+is an approval you cannot give. **Deny** is one tap and **Hold to approve**
+takes the 700ms; the ending says which one happened.
+
 ## Getting notified
 
 Three ways, no vendor lock-in:
@@ -159,6 +197,8 @@ await raiseHand(page, {
 | Option | Type | Default | |
 |---|---|---|---|
 | `reason` | `string` | *required* | Shown to the human on the handoff page. |
+| `mode` | `"takeover"` \| `"approval"` | `"takeover"` | `takeover` hands the live browser over; `approval` shows one screenshot and asks for a yes or a no. |
+| `action` | `string` | *required in approval mode* | The exact step being decided, e.g. "Submit $12,430 vendor payment to Acme GmbH". A type error if `mode` is `"approval"` and it is missing. |
 | `timeoutMs` | `number` | 5 minutes | How long to wait for the human. |
 | `webhookUrl` | `string` | — | Generic JSON POST when the link is ready. |
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
@@ -172,10 +212,19 @@ await raiseHand(page, {
 
 | Field | |
 |---|---|
-| `outcome` | `"resolved"` \| `"aborted"` \| `"timeout"` \| `"disconnected"` |
+| `outcome` | See below. |
 | `durationMs` | Wall-clock time the human took. |
 | `url` | The handoff URL. |
-| `storageState` | Cookies + localStorage captured right after a successful handback — persist it (e.g. to a Solari profile) and the human's work survives even if the session dies later. |
+| `storageState` | Cookies + localStorage captured right after a successful handback — persist it (e.g. to a Solari profile) and the human's work survives even if the session dies later. Takeover mode only: an approval changes nothing on the page. |
+
+| `outcome` | Mode | Means |
+|---|---|---|
+| `resolved` | takeover | The human handed the browser back. |
+| `aborted` | takeover | The human looked and could not solve it. Do not retry the same step. |
+| `approved` | approval | Carry out the action. |
+| `denied` | approval | Do not carry out the action. |
+| `timeout` | both | Nobody answered within `timeoutMs`. |
+| `disconnected` | both | The browser session died mid-handoff. |
 
 ## What happens when things die
 
@@ -275,6 +324,9 @@ with `isTrusted: true`.
   protocol change.)
 - Solari's $20 plan allows 2 concurrent sandboxes; each active handoff uses
   one. Two simultaneous handoffs is the plan-tier ceiling.
+- An approval shows the page as it was when the agent asked. If the page
+  changes underneath (a session expiring, a redirect), the human is deciding on
+  a stale picture — the frame is not refreshed.
 - TypeScript/Node only for now.
 
 ## Contributing

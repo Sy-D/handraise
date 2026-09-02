@@ -24,6 +24,7 @@
 import { Solari } from "@solarisdk/browser"
 import type { Page } from "playwright-core"
 
+import type { HandoffEvent } from "../src/events"
 import { raiseHand } from "../src/index"
 import { startTestApp } from "../test-app/deploy"
 import { msUntilNextStep, totp } from "../test-app/totp"
@@ -230,6 +231,89 @@ try {
     `the relay sandbox is gone (${relayGone.status})`,
   )
   await relayGone.text()
+
+  // --- Approval: the human answers a question, and drives nothing --------
+  //
+  // The other half of the product. No screencast, no input path: one
+  // screenshot, the action in words, and a yes or a no.
+  const APPROVAL_ACTION = "Transfer EUR 12,430.00 to Acme GmbH"
+
+  async function askApproval(answer: "approve" | "deny"): Promise<void> {
+    const askedAt = Date.now()
+    let approvalUrl = ""
+    let event: HandoffEvent | undefined
+    const asking = raiseHand(page, {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: APPROVAL_ACTION,
+      qr: false,
+      timeoutMs: 60_000,
+      onUrl: (url) => {
+        approvalUrl = url
+      },
+      onEvent: (raised) => {
+        event = raised
+      },
+    })
+    pending = asking
+
+    while (approvalUrl === "") await Bun.sleep(50)
+    const human = await openHandoffPage(approvalUrl)
+    await human.waitForFrame()
+    check(
+      human.action() === APPROVAL_ACTION,
+      `the phone shows the action verbatim (${answer})`,
+    )
+    check(
+      human.reason() === "The agent may not move money without a human",
+      `the phone shows the reason (${answer})`,
+    )
+
+    // Approval injects nothing. A tap from the same socket the answer comes
+    // from must not reach the page, and the relay is the one refusing it.
+    const before = page.url()
+    await human.tap(10, 10)
+    await human.type("9", 0)
+    await Bun.sleep(500)
+
+    if (answer === "approve") await human.approve()
+    else await human.deny()
+
+    const result = await asking
+    pending = null
+    timings[`approval${answer}Ms`] = Date.now() - askedAt
+    log("approval_done", {
+      answer,
+      outcome: result.outcome,
+      durationMs: result.durationMs,
+      frames: human.frameCount(),
+      ms: timings[`approval${answer}Ms`],
+    })
+
+    const expected = answer === "approve" ? "approved" : "denied"
+    check(
+      result.outcome === expected,
+      `an approval answered with ${answer} reports ${expected}`,
+    )
+    check(page.url() === before, "nothing the human sent moved the page")
+    check(
+      human.frameCount() === 1,
+      `exactly one screenshot was sent (saw ${human.frameCount()})`,
+    )
+    check(result.storageState === undefined, "an approval captures no cookies")
+    check(event?.mode === "approval", "the wide event carries the mode")
+    check(event?.inputsApplied === 0, "no input was applied to the page")
+    check(event?.framesSent === 1, "the wide event counts the one frame")
+    check(human.ending() === expected, "the phone was told how it ended")
+    await human.close()
+
+    const gone = await fetch(approvalUrl, { cache: "no-store" })
+    await gone.text()
+    check(gone.status !== 200, `the approval relay is gone (${gone.status})`)
+  }
+
+  await askApproval("approve")
+  await askApproval("deny")
 
   // --- The cheap second case: nobody comes -------------------------------
   const timeoutAt = Date.now()

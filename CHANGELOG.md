@@ -5,6 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.4.0
+
+Approval mode. A capability gap ("I can't do this": 2FA, a captcha) and an
+authority boundary ("I may not do this": submit the payment) were the same call
+with a different `reason`, and the outcome could not tell them apart. They are
+now two modes of `raiseHand`, and an approval needs no takeover at all: one
+screenshot, the action in words, yes or no. Additive — existing code compiles
+and behaves exactly as before.
+
+### Added
+
+- **`mode: "approval"`.** `raiseHand(page, { mode: "approval", reason, action })`
+  shows the human one screenshot and the concrete step, and resolves with
+  `approved` or `denied`. `action` is required in that mode and the types
+  enforce it; `raiseHand(page, { reason })` is unchanged and still a takeover.
+  `HandoffOutcome` grows by `approved` and `denied`, and `HandoffEvent` carries
+  `mode`, which is what makes `framesSent: 1` and `inputsApplied: 0` readable.
+- **Approval injects nothing.** No screencast, no CDP input, no focus probe, no
+  `storageState` capture, and no CDP session at all: the page the human decides
+  on is the page the agent stays on. One JPEG instead of 23–80 KB/s.
+- **The relay enforces the mode.** It is started as a takeover relay or an
+  approval relay and routes only that mode's human messages — `approve` and
+  `deny` in approval, the takeover set in takeover. Hiding a button is not a
+  restriction; the human's socket is reachable from any HTTP client.
+- **Deny is one tap, approve takes the 700ms hold** — the inversion of takeover
+  mode, where handing back is the tap and giving up is the hold. Here the
+  answer that cannot be taken back is yes, so the cost sits on that side.
+  Reasoning in [`docs/adr/0006`](docs/adr/0006-approval-mode.md).
+- **The LLM tool chooses the mode.** `needHumanToolSpec` takes optional `mode`
+  and `action`, its description explains "I can't" versus "I may not", and the
+  summary sentence covers the two new outcomes. An approval without an action
+  is refused rather than quietly downgraded to a takeover.
+- [`demo/approval.ts`](demo/approval.ts): a payment the agent has filled in and
+  will not submit without a yes.
+
+### Changed
+
+- The phone page serves both modes from one file, switched by a `data-mode` on
+  the body. In approval mode the input row, key bar and hand-back controls are
+  not on the page; pinch, drag and double-tap still zoom and pan the
+  screenshot, because an amount you cannot read is an approval you cannot give.
+- The relay no longer forwards non-text frames or unknown message types from
+  the human side. Both were previously relayed and then ignored by the agent,
+  so the closed message set is now closed at the relay rather than downstream.
+
 ## [0.3.0] - 2026-09-02
 
 The phone UI, rebuilt from a design-engineering audit
@@ -141,6 +186,7 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   so two simultaneous handoffs is the plan-tier ceiling.
 - TypeScript/Node only.
 
+[Unreleased]: https://github.com/Sy-D/handraise/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/Sy-D/handraise/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Sy-D/handraise/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Sy-D/handraise/releases/tag/v0.1.0

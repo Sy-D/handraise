@@ -1,7 +1,14 @@
 /**
  * Wire protocol between the agent process, the relay (in a Solari sandbox),
- * and the human's phone. The relay is a dumb router: it forwards agent→human
- * and human→agent messages verbatim and never inspects payloads.
+ * and the human's phone. The relay forwards agent→human and human→agent
+ * messages verbatim; it reads their `type` and never their payload.
+ *
+ * It reads the type for one reason beyond replay: the handoff's mode is
+ * enforced there. The relay is started with the mode as an argument and routes
+ * only the human messages that mode allows — the takeover set below in
+ * takeover mode, `approve` and `deny` in approval mode. Hiding a control on
+ * the phone is not a restriction; the human's socket is reachable from any
+ * HTTP client.
  *
  * Both sides connect to `wss://<preview>/ws?role=agent|human`. Coordinates in
  * human messages are frame pixels (the JPEG the phone displays); the agent
@@ -10,7 +17,13 @@
  * scale by deviceWidth / jpegWidth, never add scroll offsets).
  */
 
-/** Screencast frame metadata, passed through from CDP unmodified. */
+import type { HandoffOutcome } from "../types"
+
+/**
+ * Screencast frame metadata, passed through from CDP unmodified. In approval
+ * mode there is one frame and it is a screenshot, but it carries the same
+ * metadata so the phone's letterbox maths does not care which it is.
+ */
 export interface FrameMeta {
   /** CSS viewport width of the remote page (unscaled, from CDP metadata). */
   deviceWidth: number
@@ -46,7 +59,11 @@ export type FocusKind = "otp" | "password" | "text"
 
 export type AgentToHuman =
   | { type: "frame"; data: string; meta: FrameMeta }
-  | { type: "state"; reason: string }
+  /**
+   * Why the human is here. `action` is sent in approval mode only and carries
+   * the step being decided; the phone shows it as the largest text on screen.
+   */
+  | { type: "state"; reason: string; action?: string }
   /**
    * Where the human's typing currently lands. `rect: null` means nothing is
    * focused; `label` is a human-readable field name taken from the remote
@@ -62,10 +79,7 @@ export type AgentToHuman =
       label: string | null
       kind?: FocusKind
     }
-  | {
-      type: "ended"
-      outcome: "resolved" | "aborted" | "timeout" | "disconnected"
-    }
+  | { type: "ended"; outcome: HandoffOutcome }
 
 export type HumanToAgent =
   | { type: "tap"; fx: number; fy: number }
@@ -81,6 +95,13 @@ export type HumanToAgent =
   | { type: "scroll"; fdy: number }
   | { type: "handback" }
   | { type: "abort" }
+  /**
+   * The two approval answers, and the only human messages an approval relay
+   * routes. `deny` is one tap on the phone and `approve` takes a hold: in this
+   * mode the irreversible side is yes.
+   */
+  | { type: "approve" }
+  | { type: "deny" }
 
 /**
  * Either side may ping; the receiver answers pong. Required: the preview

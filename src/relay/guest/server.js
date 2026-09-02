@@ -12,10 +12,13 @@
  *   - The preview proxy kills a silent WebSocket after exactly 60s (close 1006),
  *     hence the 20s server-side ping below and the client's own 20s heartbeat.
  *
- * Routing contract (src/relay/protocol.ts): this is a dumb router. Everything
- * an agent sends goes to the human and vice versa, byte for byte. The only two
- * exceptions are answering `{"type":"ping"}` with `{"type":"pong"}` and keeping
- * the last `frame`/`state` so a human who joins late sees something instantly.
+ * Routing contract (src/relay/protocol.ts): everything an agent sends goes to
+ * the human and vice versa, byte for byte. The exceptions are answering
+ * `{"type":"ping"}` with `{"type":"pong"}`, keeping the last `frame`/`state` so
+ * a human who joins late sees something instantly, and the mode: this process
+ * is started as a takeover relay or an approval relay and routes only the human
+ * messages that mode has. A hidden button is not a restriction — the human's
+ * socket is reachable from any HTTP client.
  */
 import { createHash } from "node:crypto"
 import { createServer } from "node:http"
@@ -30,6 +33,29 @@ const PORT = Number(process.argv[2] || process.env.HANDRAISE_RELAY_PORT || 3000)
  * local tests; the real deploy always sets one.
  */
 const AGENT_KEY = process.argv[3] || process.env.HANDRAISE_AGENT_KEY || ""
+
+/**
+ * What this handoff asks of the human: `takeover` (drive the page) or
+ * `approval` (answer one question about one screenshot). It arrives as argv
+ * and never as a message, so no client can talk the relay into the other set.
+ */
+const MODE =
+  (process.argv[4] || process.env.HANDRAISE_MODE) === "approval"
+    ? "approval"
+    : "takeover"
+
+/** The human messages this relay forwards. Everything else from that side is dropped. */
+const HUMAN_MESSAGES = new Set(
+  MODE === "approval"
+    ? ["approve", "deny"]
+    : ["tap", "char", "key", "clear", "scroll", "handback", "abort"],
+)
+
+/**
+ * The human messages that end a handoff, in either mode. They are held for an
+ * agent that is not connected at the moment, and they stop the frame replay.
+ */
+const TERMINAL_HUMAN = new Set(["handback", "abort", "approve", "deny"])
 
 /** Must equal HEARTBEAT_INTERVAL_MS in src/relay/protocol.ts (asserted in relay.test.ts). */
 const HEARTBEAT_INTERVAL_MS = 20000
@@ -221,40 +247,71 @@ function messageType(payload) {
   return type === undefined ? null : type
 }
 
+/** Keep what a human who joins late has to be shown, and drop what they must not. */
+function rememberFromAgent(type, payload) {
+  if (type === "frame") lastFrame = payload
+  else if (type === "state") lastState = payload
+  else if (type === "focus") lastFocus = payload
+  else if (type === "ended") {
+    // Terminal: keep the ending for a late human, drop everything that could
+    // show the logged-in page to whoever opens the link next.
+    lastEnded = payload
+    lastFrame = null
+    lastState = null
+    lastFocus = null
+    pendingForAgent = null
+  }
+}
+
+/** One line per handoff at most: a hostile client must not be able to fill the log. */
+let dropLogged = false
+
+/**
+ * Whether a human message may be forwarded at all, and the bookkeeping the
+ * terminal ones need. This is where the mode is actually enforced: a `tap` on
+ * an approval relay dies here, not on the phone that never offered it.
+ */
+function acceptFromHuman(type, payload) {
+  if (!HUMAN_MESSAGES.has(type)) {
+    if (!dropLogged) {
+      dropLogged = true
+      log("human message dropped", {
+        type: String(type).slice(0, 32),
+        mode: MODE,
+      })
+    }
+    return false
+  }
+  if (TERMINAL_HUMAN.has(type)) {
+    // The human is done. Buffer this for an agent that is mid-reconnect, and
+    // stop replaying the last (logged-in) frame to a late human.
+    pendingForAgent = payload
+    lastFrame = null
+    lastState = null
+    lastFocus = null
+  }
+  return true
+}
+
 function route(peer, payload, opcode) {
   // A peer that has been closed or replaced (its role now points at a newer
   // socket) must not route anything, even if its reader fires one more time.
   if (!peer.open || peers.get(peer.role) !== peer) return
   const other = peers.get(peer.role === "agent" ? "human" : "agent")
-  let type = null
-  if (opcode === OP_TEXT) {
-    type = messageType(payload)
-    if (type === "ping") {
-      sendText(peer, PONG)
-      return
-    }
-    if (peer.role === "agent") {
-      if (type === "frame") lastFrame = payload
-      else if (type === "state") lastState = payload
-      else if (type === "focus") lastFocus = payload
-      else if (type === "ended") {
-        // Terminal: keep the ending for a late human, drop everything that
-        // could show the logged-in page to whoever opens the link next.
-        lastEnded = payload
-        lastFrame = null
-        lastState = null
-        lastFocus = null
-        pendingForAgent = null
-      }
-    } else if (type === "handback" || type === "abort") {
-      // The human is done. Buffer this for an agent that is mid-reconnect, and
-      // stop replaying the last (logged-in) frame to a late human.
-      pendingForAgent = payload
-      lastFrame = null
-      lastState = null
-      lastFocus = null
-    }
+  if (opcode !== OP_TEXT) {
+    // The human's whole vocabulary is JSON text; binary from that side is not
+    // in it. The agent's frames are text too, but it owns the channel.
+    if (peer.role === "human") return
+    write(other, payload, opcode)
+    return
   }
+  const type = messageType(payload)
+  if (type === "ping") {
+    sendText(peer, PONG)
+    return
+  }
+  if (peer.role === "agent") rememberFromAgent(type, payload)
+  else if (!acceptFromHuman(type, payload)) return
   // Newest frame wins: drop a frame bound for a backpressured receiver rather
   // than queue it in memory. Control and terminal messages are never dropped.
   if (type === "frame" && other?.backpressure) return
@@ -288,7 +345,9 @@ const server = createServer((req, res) => {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
     })
-    res.end(PAGE)
+    // MODE is one of two literals, so this substitution can only produce the
+    // two pages this file was written for.
+    res.end(PAGE.replace("__HANDRAISE_MODE__", MODE))
     return
   }
   res.writeHead(404, {
@@ -397,7 +456,7 @@ server.listen(PORT, "0.0.0.0", () => {
   // Report the bound port, not the requested one: port 0 asks the OS to pick a
   // free one, which is how the local test suite avoids fighting for 3000.
   const bound = server.address()
-  log("relay listening", { port: bound?.port ?? PORT })
+  log("relay listening", { port: bound?.port ?? PORT, mode: MODE })
 })
 
 const PAGE = `<!doctype html>
@@ -792,12 +851,35 @@ const PAGE = `<!doctype html>
   #overlay[hidden] { display: none; }
   #overlay h1 { margin: 0; font-size: 20px; letter-spacing: -0.02em; }
   #overlay p { margin: 0; color: var(--muted); font-size: 14px; }
+  /* One page, two jobs. The relay bakes the mode into the body, and the
+     controls belonging to the other job are gone rather than disabled: the
+     relay refuses to route what they would have sent anyway. */
+  body[data-mode="approval"] .takeover-only,
+  body[data-mode="takeover"] .approval-only { display: none; }
+  /* The sentence being decided. Larger than the reason in the header, because
+     the reason says why someone was asked and this is what they answer. */
+  .ask { display: flex; flex-direction: column; gap: 3px; margin: 2px 0 14px; }
+  .ask-label { font-size: 11px; letter-spacing: 0.02em; color: var(--muted); }
+  #action {
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.02em;
+    overflow-wrap: anywhere;
+  }
+  /* Approval inverts the takeover's risk: here the answer that cannot be taken
+     back is yes, so yes is the one that costs a hold. The fill stays
+     monochrome — the red in this interface means destructive, and approving
+     something the human just chose is not that. */
+  #approve::before { background: oklch(0.985 0 0 / 0.16); }
+  #approve[data-holding] { border-color: var(--field); }
   @media (prefers-reduced-motion: reduce) {
     button { transition: none; }
     /* Keep the safety, drop the motion: the hold still takes its 700ms, it
        just does not animate getting there. */
     .ghost::before { display: none; }
     .ghost[data-holding] { background: oklch(0.65 0.2 25 / 0.14); }
+    #approve[data-holding] { background: oklch(0.985 0 0 / 0.12); }
     #overlay { transition: opacity 150ms linear; }
     @starting-style {
       #overlay { opacity: 0; transform: none; }
@@ -805,11 +887,11 @@ const PAGE = `<!doctype html>
   }
 </style>
 </head>
-<body>
+<body data-mode="__HANDRAISE_MODE__">
   <header>
     <span id="dot" class="dot"></span>
     <div class="head-copy">
-      <span class="eyebrow"><span class="mark">handraise</span> · an agent asked for your help</span>
+      <span class="eyebrow"><span class="mark">handraise</span> · <span id="eyebrow-note">an agent asked for your help</span></span>
       <span id="reason">Connecting to the browser…</span>
     </div>
   </header>
@@ -823,7 +905,7 @@ const PAGE = `<!doctype html>
     <p id="placeholder">Waiting for the first frame…</p>
   </main>
   <footer>
-    <div class="bar">
+    <div class="bar takeover-only">
       <input id="kbd" type="text" autocomplete="off" autocapitalize="off" autocorrect="off"
         spellcheck="false" enterkeyhint="enter" placeholder="Type here">
       <div class="keys">
@@ -833,10 +915,18 @@ const PAGE = `<!doctype html>
         <button id="key-clear" class="key" type="button" aria-label="Clear the field" disabled>Clear</button>
       </div>
     </div>
+    <p class="ask approval-only">
+      <span class="ask-label">The agent is asking to</span>
+      <span id="action"></span>
+    </p>
     <p class="hint" id="hint">Typing goes straight to the browser</p>
-    <div class="row">
+    <div class="row takeover-only">
       <button id="handback" class="primary" type="button">&#9995; Hand back</button>
       <button id="abort" class="ghost" type="button"><span class="ghost-label">I can't do this</span></button>
+    </div>
+    <div class="row approval-only">
+      <button id="deny" class="primary" type="button">Deny</button>
+      <button id="approve" class="ghost" type="button"><span class="ghost-label">Hold to approve</span></button>
     </div>
   </footer>
   <div id="overlay" hidden>
@@ -859,6 +949,18 @@ const PAGE = `<!doctype html>
   var overlay = document.getElementById("overlay")
   var overlayTitle = document.getElementById("overlay-title")
   var overlayNote = document.getElementById("overlay-note")
+  var actionEl = document.getElementById("action")
+
+  /**
+   * Takeover or approval, decided by the relay that served this page. In
+   * approval mode the human is answering a question about one screenshot, not
+   * driving anything: the input row and the key bar are not on the page, and
+   * the two messages below are the only ones this side can produce.
+   */
+  var APPROVAL = document.body.dataset.mode === "approval"
+  var SENDABLE = APPROVAL
+    ? { approve: 1, deny: 1, ping: 1 }
+    : { tap: 1, char: 1, key: 1, clear: 1, scroll: 1, handback: 1, abort: 1, ping: 1 }
 
   var ws = null
   var retries = 0
@@ -878,10 +980,14 @@ const PAGE = `<!doctype html>
   // needed to place the ring, and they arrive in separate messages.
   var meta = null
   var focus = null
-  var HINT_DEFAULT = "Typing goes straight to the browser"
+  var HINT_DEFAULT = APPROVAL
+    ? "Approve needs a hold. Deny is one tap."
+    : "Typing goes straight to the browser"
   /** Long enough that a stray thumb cannot reach it, short enough to not annoy. */
   var HOLD_MS = 700
-  var HOLD_HINT = "Hold the button to stop the agent"
+  var HOLD_HINT = APPROVAL
+    ? "Hold the button to approve"
+    : "Hold the button to stop the agent"
   var QUEUE_HINT = "Reconnecting — your input is queued"
   var QUEUE_FULL_HINT = "Reconnecting — queue full, the oldest input was dropped"
   var hintTimer = null
@@ -924,6 +1030,9 @@ const PAGE = `<!doctype html>
   var dropped = 0
 
   function send(message) {
+    // The mode's vocabulary, enforced here as well as at the relay: a control
+    // that is not on this page cannot have its message leave it either.
+    if (!SENDABLE[message.type]) return
     if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify(message))
       return
@@ -1334,9 +1443,28 @@ const PAGE = `<!doctype html>
     )
   }
 
-  function dragScroll(e) {
+  /**
+   * One finger on an approval pans the screenshot. There is no remote page to
+   * scroll — the frame is a still — and a magnified still you cannot move is
+   * a picture of the middle of the page.
+   */
+  function dragPan(e) {
+    var dx = e.clientX - press.lastX
+    var dy = e.clientY - press.lastY
+    press.lastX = e.clientX
+    press.lastY = e.clientY
+    setView(view.scale, view.tx + dx, view.ty + dy, false)
+  }
+
+  /** One finger: a scroll of the remote page, or a pan of the screenshot. */
+  function dragMove(e) {
     press.travel = Math.max(press.travel, Math.hypot(e.clientX - press.x, e.clientY - press.y))
-    if (press.travel < TAP_SLOP_PX || !box.h) return
+    if (press.travel < TAP_SLOP_PX) return
+    if (APPROVAL) {
+      dragPan(e)
+      return
+    }
+    if (!box.h) return
     var now = Date.now()
     if (now - press.sentAt < 60) return
     var stepped = e.clientY - press.lastY
@@ -1360,7 +1488,7 @@ const PAGE = `<!doctype html>
       beginPinch()
       return
     }
-    press = { x: e.clientX, y: e.clientY, lastY: e.clientY, travel: 0, sentAt: 0 }
+    press = { x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, travel: 0, sentAt: 0 }
   })
   canvas.addEventListener("pointermove", function (e) {
     var point = pointers.get(e.pointerId)
@@ -1372,7 +1500,7 @@ const PAGE = `<!doctype html>
       updatePinch()
       return
     }
-    if (press) dragScroll(e)
+    if (press) dragMove(e)
   })
   /** Acknowledge the tap where the finger landed, inside the same frame. */
   function markTap(clientX, clientY) {
@@ -1437,6 +1565,9 @@ const PAGE = `<!doctype html>
       return
     }
     lastTap = { at: now, x: e.clientX, y: e.clientY }
+    // A single tap on an approval does nothing, and says so by doing nothing:
+    // an acknowledgement ripple would promise the remote page had seen it.
+    if (APPROVAL) return
     var point = toFrame(e.clientX, e.clientY)
     if (!point) return
     send({ type: "tap", fx: point.x, fy: point.y })
@@ -1565,75 +1696,96 @@ const PAGE = `<!doctype html>
     if (ws && !stillSending()) ws.close()
   }
 
-  // The expected ending, and the only one whose worst case is recoverable in
-  // spirit: the agent looks, fails and asks again. Confirming the happy path is
-  // the classic mistake, so this stays a single tap.
-  document.getElementById("handback").addEventListener("click", function () {
-    send({ type: "handback" })
-    finish(ENDINGS.resolved[0], ENDINGS.resolved[1])
-  })
-
-  /**
-   * Giving up ends the handoff for good and there is nothing to undo — the
-   * message leaves the socket and the agent settles on it immediately. So the
-   * gesture costs more than a tap instead of a confirm dialog costing a screen.
-   *
-   * Pointer events only: they cover mouse, touch and pen with one stream, so
-   * the hold cannot start twice from one finger.
-   */
-  var abortButton = document.getElementById("abort")
-  var holdTimer = null
-  var holdFired = false
-
   function flashHint(text) {
     hint.textContent = text
     if (hintTimer) clearTimeout(hintTimer)
     hintTimer = setTimeout(function () { hintTimer = null; setHint() }, 2200)
   }
 
-  function startHold() {
-    if (holdTimer || finished) return
-    abortButton.dataset.holding = ""
-    holdTimer = setTimeout(function () {
-      holdTimer = null
-      holdFired = true
-      delete abortButton.dataset.holding
-      if (navigator.vibrate) navigator.vibrate(20)
-      send({ type: "abort" })
-      finish("Thanks for looking", "The agent knows it can't be done here and will stop. You can close this tab.")
-    }, HOLD_MS)
-  }
+  /**
+   * Press-and-hold, for the one answer in each mode that cannot be taken back:
+   * giving up in a takeover, approving in an approval. The message leaves the
+   * socket and the agent settles on it immediately, so the gesture costs more
+   * than a tap instead of a confirm dialog costing a screen.
+   *
+   * Pointer events only: they cover mouse, touch and pen with one stream, so
+   * the hold cannot start twice from one finger.
+   */
+  function holdButton(button, run) {
+    var holdTimer = null
+    var holdFired = false
 
-  function cancelHold() {
-    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null }
-    delete abortButton.dataset.holding
-  }
+    function startHold() {
+      if (holdTimer || finished) return
+      button.dataset.holding = ""
+      holdTimer = setTimeout(function () {
+        holdTimer = null
+        holdFired = true
+        delete button.dataset.holding
+        if (navigator.vibrate) navigator.vibrate(20)
+        run()
+      }, HOLD_MS)
+    }
 
-  abortButton.addEventListener("pointerdown", startHold)
-  abortButton.addEventListener("pointerup", cancelHold)
-  abortButton.addEventListener("pointercancel", cancelHold)
-  abortButton.addEventListener("pointerleave", cancelHold)
-  // A keyboard has no press-and-hold of its own, so held Space or Enter is the
-  // same contract. Without this the button is unreachable without a pointer.
-  abortButton.addEventListener("keydown", function (e) {
-    if (e.key !== " " && e.key !== "Enter") return
-    e.preventDefault()
-    if (!e.repeat) startHold()
-  })
-  abortButton.addEventListener("keyup", cancelHold)
-  // A release always fires a click. After a completed hold that click is the
-  // same gesture arriving twice; before 700ms it is a tap that did nothing, and
-  // a tap that does nothing has to say why or the human thinks it is broken.
-  abortButton.addEventListener("click", function () {
-    if (holdFired) { holdFired = false; return }
-    flashHint(HOLD_HINT)
-  })
+    function cancelHold() {
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = null }
+      delete button.dataset.holding
+    }
+
+    button.addEventListener("pointerdown", startHold)
+    button.addEventListener("pointerup", cancelHold)
+    button.addEventListener("pointercancel", cancelHold)
+    button.addEventListener("pointerleave", cancelHold)
+    // A keyboard has no press-and-hold of its own, so held Space or Enter is
+    // the same contract. Without this the button needs a pointer to reach.
+    button.addEventListener("keydown", function (e) {
+      if (e.key !== " " && e.key !== "Enter") return
+      e.preventDefault()
+      if (!e.repeat) startHold()
+    })
+    button.addEventListener("keyup", cancelHold)
+    // A release always fires a click. After a completed hold that click is the
+    // same gesture arriving twice; before 700ms it is a tap that did nothing,
+    // and a tap that does nothing has to say why or it reads as broken.
+    button.addEventListener("click", function () {
+      if (holdFired) { holdFired = false; return }
+      flashHint(HOLD_HINT)
+    })
+  }
 
   var ENDINGS = {
     resolved: ["Thanks — that unblocked it", "The agent is driving again. You can close this tab."],
     aborted: ["Handoff ended", "You couldn't solve it here. Nothing more to do — you can close this tab."],
+    approved: ["Approved", "The agent has your approval and is continuing. You can close this tab."],
+    denied: ["Denied", "The agent has been told not to do it. You can close this tab."],
     timeout: ["Too late", "The agent gave up waiting. Nothing you can do here now."],
     disconnected: ["Connection ended", "The remote browser closed. The agent has been told — this wasn't anything you did."]
+  }
+
+  if (APPROVAL) {
+    // Deny is a single tap because it is the answer that keeps the world as it
+    // is; approve is the hold, because it is the one that cannot be undone.
+    // That is the takeover's rule with the sides swapped, for the same reason.
+    document.getElementById("deny").addEventListener("click", function () {
+      send({ type: "deny" })
+      finish(ENDINGS.denied[0], ENDINGS.denied[1])
+    })
+    holdButton(document.getElementById("approve"), function () {
+      send({ type: "approve" })
+      finish(ENDINGS.approved[0], ENDINGS.approved[1])
+    })
+  } else {
+    // The expected ending, and the only one whose worst case is recoverable in
+    // spirit: the agent looks, fails and asks again. Confirming the happy path
+    // is the classic mistake, so this stays a single tap.
+    document.getElementById("handback").addEventListener("click", function () {
+      send({ type: "handback" })
+      finish(ENDINGS.resolved[0], ENDINGS.resolved[1])
+    })
+    holdButton(document.getElementById("abort"), function () {
+      send({ type: "abort" })
+      finish("Thanks for looking", "The agent knows it can't be done here and will stop. You can close this tab.")
+    })
   }
 
   function handle(raw) {
@@ -1641,7 +1793,12 @@ const PAGE = `<!doctype html>
     try { message = JSON.parse(raw) } catch (err) { return }
     if (!message) return
     if (message.type === "frame") showFrame(message.data, message.meta)
-    else if (message.type === "state") reason.textContent = message.reason
+    else if (message.type === "state") {
+      reason.textContent = message.reason
+      // textContent, never innerHTML: the action is the agent's own sentence,
+      // and it goes on the screen a decision is made from.
+      if (message.action) actionEl.textContent = message.action
+    }
     else if (message.type === "focus") {
       focus = readFocus(message)
       applyKind(focus.rect ? focus.kind : "text")
@@ -1699,6 +1856,13 @@ const PAGE = `<!doctype html>
     sock.onerror = function () { if (mine === generation) sock.close() }
   }
 
+  if (APPROVAL) {
+    // The page arrives phrased for a takeover, because that is what it is most
+    // of the time. These three lines are the rest of the difference.
+    document.getElementById("eyebrow-note").textContent = "an agent needs your approval"
+    placeholder.textContent = "Waiting for the screenshot…"
+    setHint()
+  }
   applyTransform(false)
   setInterval(function () { send({ type: "ping" }) }, 20000)
   window.addEventListener("resize", render)

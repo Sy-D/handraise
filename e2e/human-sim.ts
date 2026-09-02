@@ -18,6 +18,7 @@ import {
   HEARTBEAT_INTERVAL_MS,
   type HumanToAgent,
 } from "../src/relay/protocol"
+import type { HandoffOutcome } from "../src/types"
 
 export interface ReceivedFrame {
   /** Base64 JPEG, exactly as CDP produced it. */
@@ -31,8 +32,10 @@ export interface SimulatedHuman {
   frameCount(): number
   /** The `reason` currently shown in the header. */
   reason(): string
+  /** The `action` the agent asked approval for, empty in takeover mode. */
+  action(): string
   /** How the agent said the handoff ended, if it has. */
-  ending(): "resolved" | "aborted" | "timeout" | "disconnected" | null
+  ending(): HandoffOutcome | null
   waitForFrame(timeoutMs?: number): Promise<ReceivedFrame>
   tap(fx: number, fy: number): Promise<void>
   /** Type one character per message, the way the mobile UI does. */
@@ -41,6 +44,9 @@ export interface SimulatedHuman {
   scroll(fdy: number): Promise<void>
   handback(): Promise<void>
   abort(): Promise<void>
+  /** Approval mode only; the relay drops these in takeover mode. */
+  approve(): Promise<void>
+  deny(): Promise<void>
   close(): Promise<void>
 }
 
@@ -86,7 +92,8 @@ export async function openHandoffPage(
   let frame: ReceivedFrame | null = null
   let frames = 0
   let reason = ""
-  let ending: "resolved" | "aborted" | "timeout" | "disconnected" | null = null
+  let action = ""
+  let ending: HandoffOutcome | null = null
   const waiters: (() => void)[] = []
 
   socket.on("message", (data: Buffer) => {
@@ -98,7 +105,10 @@ export async function openHandoffPage(
       while (waiters.length > 0) waiters.pop()?.()
       return
     }
-    if (message.type === "state") reason = message.reason
+    if (message.type === "state") {
+      reason = message.reason
+      action = message.action ?? ""
+    }
     if (message.type === "ended") ending = message.outcome
   })
 
@@ -125,6 +135,7 @@ export async function openHandoffPage(
     lastFrame: () => frame,
     frameCount: () => frames,
     reason: () => reason,
+    action: () => action,
     ending: () => ending,
 
     async waitForFrame(timeoutMs = 30_000) {
@@ -157,6 +168,8 @@ export async function openHandoffPage(
     scroll: (fdy) => send({ type: "scroll", fdy }),
     handback: () => send({ type: "handback" }),
     abort: () => send({ type: "abort" }),
+    approve: () => send({ type: "approve" }),
+    deny: () => send({ type: "deny" }),
 
     close() {
       clearInterval(heartbeat)
