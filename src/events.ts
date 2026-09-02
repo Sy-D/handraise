@@ -4,7 +4,7 @@
  * handraise emits exactly one of these at the end of every handoff — on the
  * resolved, aborted, timeout and disconnected paths alike — through the
  * caller's `onEvent` callback and as a `logger.info("handoff", …)` line. It is
- * deliberately wide and high-cardinality (see spikes/s1–s4): one row per
+ * deliberately wide and high-cardinality (see docs/measurements/): one row per
  * handoff carries enough to answer "why did this one take 40 s and send
  * 900 frames" without stitching narrow log lines together.
  *

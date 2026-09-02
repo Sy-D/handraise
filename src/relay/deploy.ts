@@ -27,14 +27,14 @@ const GUEST_LOG = "/var/log/relay.log"
 const DEFAULT_TIMEOUT_MS = 20 * 60_000
 
 /**
- * The preview `pt_token` lives one hour (spikes/s1-report.md §3). A sandbox
+ * The preview `pt_token` lives one hour (docs/measurements/01-preview-transport.md §3). A sandbox
  * that outlives its token would hand the phone and the agent an unannounced
  * 401 mid-handoff, so cap the idle window below that. A cleaner fix is to
  * re-mint the token via `previewUrl()`; for v1 the cap is enough.
  */
 const MAX_TIMEOUT_MS = 55 * 60_000
 
-/** Cold start measured at ~2.9s (spikes/s1-report.md); 30s is a generous ceiling. */
+/** Cold start measured at ~2.9s (docs/measurements/01-preview-transport.md); 30s is a generous ceiling. */
 const READY_TIMEOUT_MS = 30_000
 const READY_POLL_MS = 250
 
@@ -78,7 +78,7 @@ const sleep = (ms: number): Promise<void> =>
 /**
  * Put a path (and optionally a role) on the preview URL while keeping its query
  * string. `new URL(path, previewUrl)` drops `?pt_token=` and earns a 401 — the
- * single easiest way to lose an hour here (spikes/s1-report.md §4.3).
+ * single easiest way to lose an hour here (docs/measurements/01-preview-transport.md §4.3).
  */
 function relayUrl(
   previewUrl: string,
@@ -109,7 +109,7 @@ async function createSandbox(
         template: "base",
         timeoutMs,
         // Idle-timeout must destroy the relay, not pause it. A paused sandbox
-        // keeps holding one of the plan's two slots (spikes/s4-report.md §4);
+        // keeps holding one of the plan's two slots (docs/measurements/04-browser-session-lifetime.md §4);
         // the relay holds no recoverable state, so killing it is correct.
         lifecycle: { onTimeout: "kill" },
       })

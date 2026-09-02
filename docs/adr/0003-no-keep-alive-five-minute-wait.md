@@ -9,7 +9,7 @@ A human handoff is a pause. The obvious fear is that the browser session dies
 while the human is looking away, so the first instinct is to keep the session
 warm with periodic no-op calls and to allow a generous wait.
 
-Spike S4 measured this directly against the real API, and the instinct is wrong.
+[Measurement 04](../measurements/04-browser-session-lifetime.md) measured this directly against the real API, and the instinct is wrong.
 On the test plan, browser sessions die hard **~10 minutes after creation** — five
 of six runs landed in a 604–617 s band, one died early at 319 s. The mode of
 activity made no difference: an idle session (zero bytes), a session pinged every
@@ -36,7 +36,7 @@ plus `isConnected()` — never from the control plane.
 
 ## Alternatives
 
-- **A keep-alive pinger** (no-op CDP calls on a timer). Rejected: S4 proved it is
+- **A keep-alive pinger** (no-op CDP calls on a timer). Rejected: measurement 04 proved it is
   measurably useless — it extends nothing and hides the coming death. Deleting it
   removes a component, a config option and a class of bugs.
 - **A long default wait** (e.g. 10+ minutes). Rejected: it runs the common path
@@ -57,7 +57,7 @@ plus `isConnected()` — never from the control plane.
   the platform's hard cap into a "we hold your place" feature. It is absent when
   the session was already gone.
 - Follow-up: for waits that must exceed 5 minutes, the durable design is
-  rotate-not-wait (save state, close, relaunch on the human's arrival). A spike on
+  rotate-not-wait (save state, close, relaunch on the human's arrival). An experiment on
   how faithfully `profileId` restores a half-finished login is still open.
 - The ~10-minute cap is a measured plan-tier observation, not a documented Solari
   guarantee; claims are phrased as "we measured ~10 min on our plan".

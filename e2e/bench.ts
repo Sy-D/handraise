@@ -27,13 +27,13 @@
  *
  * - ONE browser session is reused across runs and relaunched proactively after
  *   4 minutes. Solari browser sessions die hard about 10 minutes after
- *   creation, one measured at 319 s (spikes/s4-report.md), and the sessions API
+ *   creation, one measured at 319 s (docs/measurements/04-browser-session-lifetime.md), and the sessions API
  *   still calls the corpse "active" — so age, `isConnected()` and a
  *   `disconnected` outcome are the three relaunch triggers.
  * - The target page animates. Chromium emits screencast frames only on repaint
- *   (spikes/s2-report.md); a static page would make firstFrame unmeasurable.
+ *   (docs/measurements/02-cdp-screencast.md); a static page would make firstFrame unmeasurable.
  * - One sandbox at a time (the relay). Check with
- *   `bun --env-file=.env spikes/s1/cleanup.ts` before and after.
+ *   `bun --env-file=.env scripts/cleanup-sandboxes.ts` before and after.
  * - A failed run is recorded and the bench continues. Percentiles are over the
  *   successes; the failure rate is reported separately, because for p99 honesty
  *   a run that never finished is worse than a slow one.
@@ -69,7 +69,10 @@ const RTT_SAMPLES = 5
 const BROWSER_MAX_AGE_MS = 3 * 60_000
 /** Breather between runs so a just-killed relay sandbox is off the books. */
 const COOLDOWN_MS = 1_500
-const RESULTS_PATH = new URL("../spikes/bench-results.json", import.meta.url)
+const RESULTS_PATH = new URL(
+  "../benchmarks/handoff-latency.json",
+  import.meta.url,
+)
 
 const apiKey = process.env.SOLARI_API_KEY ?? ""
 if (apiKey === "") {

@@ -36,6 +36,13 @@ returns. Set `SOLARI_API_KEY`; handraise uses it to create the relay sandbox.
 - **No server to host.** The handoff UI runs on a Solari sandbox that handraise
   creates and destroys around the call.
 
+Measured against the live API, method and raw data in
+[`benchmarks/`](benchmarks/README.md):
+
+- **19/20 blocked workflows rescued** (baseline 0/20).
+- **30/30 handoffs resolved** in the latency benchmark.
+- **3.5 s median** from raise to live on the phone.
+
 Runnable without writing any code: [`demo/try.ts`](demo/try.ts) raises a hand
 immediately so you can drive it; [`demo/github-2fa.ts`](demo/github-2fa.ts)
 does the real 2FA wall and keeps the session the handoff earned.
@@ -172,8 +179,8 @@ await raiseHand(page, {
 
 ## What happens when things die
 
-This is the part we sweated, because a handoff tool that loses your session at
-the worst moment is worse than no tool.
+A handoff tool that loses your session at the worst moment is worse than no
+tool, so every row here is measured rather than hoped for.
 
 | Failure | Outcome |
 |---|---|
@@ -183,75 +190,43 @@ the worst moment is worse than no tool.
 | Agent process killed | Sandbox lifecycle kill, no orphaned URL |
 | Link holder tries the agent role | `401`, roles are separate credentials |
 
-- **Human never shows up** → `outcome: "timeout"` after `timeoutMs`; **Human
-  hits Abort** → `outcome: "aborted"`. Either way the relay sandbox is
-  destroyed and the agent keeps its browser and decides what's next.
-- **The browser session dies mid-handoff** → `outcome: "disconnected"`, not an
-  exception. We measured Solari browser sessions dying ~10 minutes after
-  creation regardless of activity (no keep-alive extends it, and the sessions
-  API keeps reporting them as `active` after death — liveness comes from the
-  connection, never the control plane). That's why the default wait is 5
-  minutes, why there is deliberately no keep-alive pinger, and why
-  `storageState` exists on the result.
-- **The agent process is killed mid-handoff** → the relay sandbox is created
-  with `lifecycle: { onTimeout: "kill" }` and a bounded idle window, so it
-  destroys itself; no zombie infrastructure, no orphaned public URL.
-- **The relay WebSocket drops** → Solari's preview proxy kills idle sockets
-  after exactly 60s, so both ends heartbeat every 20s and treat close code
-  1006 as "reconnect", not "failed". The relay replays the last frame to a
-  late-joining phone — and stops replaying it the moment the handoff ends, so
-  whoever opens the link afterward sees the ending, not the logged-in page.
-- **After every outcome** — including errors — the relay sandbox is destroyed
-  before `raiseHand` returns, with the deletion confirmed and retried on
-  transient failure. One handoff, one sandbox.
+The load-bearing fact is the platform's: Solari browser sessions die ~10
+minutes after creation whatever you do, and the sessions API still calls a dead
+one `active` ([we measured
+it](docs/measurements/04-browser-session-lifetime.md)) — hence the 5-minute
+default, no keep-alive pinger, and `storageState` on the result. Every exit
+path, errors included, destroys the relay sandbox before `raiseHand` returns:
+one handoff, one sandbox. The rejected alternatives are in
+[`docs/adr/`](docs/adr/).
 
 ## How this compares
 
-Human-in-the-loop for cloud browsers isn't new — that's the point. The demand is
-proven, and handraise brings the same escape hatch to a runtime that doesn't have
-one yet.
-
-- **Browserbase Live View, Cloudflare Browser Run, Scrapfly, AuthLoop** are
-  platform features of their own clouds — a live-view panel or a session-takeover
-  flow baked into the service that runs your browser. They're hosted, mature, and
-  supported by the vendor. If you already run on one of those, use theirs.
-- **handraise** brings the same handoff to **Solari** browsers, which have no
-  native live view (Solari's VNC is desktop-only) — as a small, self-contained,
-  open-source library rather than a platform feature.
-
-The honest trade-off: the platform solutions are more polished and fully hosted;
-handraise is lightweight and portable, and it works where those don't. Its scope
-is deliberately narrow — the handoff muscle, not wall detection (see
-[`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
+Human-in-the-loop for cloud browsers isn't new — that's the point, the demand is
+proven. Browserbase Live View, Cloudflare Browser Run, Scrapfly and AuthLoop are
+hosted platform features of their own clouds; if you run on one, use theirs.
+handraise brings the same handoff to Solari browsers, which have no native live
+view (Solari's VNC is desktop-only), as a portable library instead — less
+polished, and it works where those don't. Its scope stops at the handoff, not
+wall detection ([`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
 
 ## Security
 
-- The handoff URL contains a Solari preview token scoped to that one sandbox
-  and port, with a 1-hour lifetime. When the handoff ends, the sandbox — and
-  with it the URL — is destroyed.
-- **The agent role is a separate credential, not the handoff link.** Anyone
-  with the phone link can view and solve; only a client holding a per-handoff
-  secret (minted by `startRelay`, appended only to the agent's own URL) may
-  connect as the agent that reads keystrokes and drives the browser. A foreign
-  `Origin` is refused, so the preview cookie can't be ridden from another page.
-- **The relay is a dumb router with a closed message set.** The human side can
-  send taps, characters, a few named keys, scroll, hand-back and abort — and
-  nothing else; there is no path from the link to arbitrary browser control.
-  Inputs are length- and rate-bounded.
-- **No frame or keystroke data is stored or persisted.** The relay keeps only
-  the latest frame in memory to paint a late-joining phone, and drops it when
-  the handoff ends. It logs connection events (not their contents) inside the
-  sandbox, which is destroyed at the end.
-- Your Solari API key never leaves the agent process. The phone only ever
-  sees the preview URL.
+- **The handoff link is a bearer URL scoped to one relay:** a preview token for
+  that one sandbox and port, 1-hour lifetime, destroyed with the sandbox.
+- **The agent role is a separate secret**, never in the link. Only its holder
+  can read keystrokes and drive the browser; a foreign `Origin` is refused.
+- **Frames and keystrokes are never persisted**, and the human side speaks a
+  closed, length- and rate-bounded message set — there is no path from the link
+  to arbitrary browser control. Your API key never leaves the agent process.
+
+Threat model, scope and reporting: [`SECURITY.md`](SECURITY.md).
 
 ## Measured
 
-Benchmarked with the shipped harness (`bun run bench`): 30 consecutive real
-handoffs against the live API on the $20 Solari plan, one fresh relay sandbox
-each, a scripted human on the public WebSocket, measured from Germany against
-the default (us-west) endpoint. **30/30 resolved, zero reconnects, zero
-leaked sandboxes.** Raw per-run data: [`spikes/bench-results.json`](spikes/bench-results.json).
+`bun run bench`: 30 consecutive real handoffs against the live API on the $20
+Solari plan, one fresh relay sandbox each, a scripted human on the public
+WebSocket, measured from Germany against the default (us-west) endpoint.
+**30/30 resolved, zero reconnects, zero leaked sandboxes.**
 
 | | p50 | p75 | worst of 30 |
 |---|---|---|---|
@@ -259,43 +234,39 @@ leaked sandboxes.** Raw per-run data: [`spikes/bench-results.json`](spikes/bench
 | — of which: relay sandbox cold start | 2.7s | 2.7s | 2.9s |
 | Input round trip through the relay (150 samples) | 186ms | 191ms | 286ms |
 
-And the number that matters more than any latency — what handraise does to
-workflows that would otherwise fail. 40 runs against a live portal with a real
-TOTP wall, interleaved arms, same completion test on both:
+The number that matters more than any latency is what handraise does to
+workflows that would otherwise fail. `bun run bench:rescue`: 40 runs against a
+live portal with a real TOTP wall, interleaved arms, one completion test:
 
 | | completed | median human time |
 |---|---|---|
 | baseline agent (no human available) | 0/20 | — |
 | with handraise | **19/20** | 5.5s |
 
-Of 20 workflows blocked on a human-only wall, handraise rescued 19. The 0/20
-baseline is the design fact, not a crippled agent: it tried, and a machine
-cannot know a TOTP code. The 5.5s is a scripted human — the machine floor of
-the handoff, not human reading speed. The one failure was the platform's ~10min
-session death landing mid-handoff; handraise reported `disconnected` instead of
-claiming success. Raw data: [`spikes/rescue-results.json`](spikes/rescue-results.json).
+The 0/20 baseline is the design fact, not a crippled agent: it tried, and a
+machine cannot know a TOTP code. The 5.5s is a scripted human — the machine
+floor of a handoff, not reading speed. The one failure was the platform's
+~10min session death landing mid-handoff; handraise reported `disconnected`
+instead of claiming success.
 
 At N=30 the right-hand column is the worst observation, not a fitted p99 — we
 say what we measured. The input round trip sits on the network RTT floor from
-Germany to the us-west edge; the relay itself adds nothing measurable (pass
-`baseUrl` to co-locate the relay with your region). Cold start is ~75% of
-time-to-visible, which is why a warm-relay option is the roadmap's next
-performance lever.
-
-Additional context: live-view bandwidth while a human solves a 2FA runs
-23–80 KB/s; the full e2e — sign-in wall, handoff, a scripted human typing a
-TOTP code, signed-in assertion — completes in ~6s; each handoff consumes one
-sandbox, destroyed when it ends.
+Germany to the us-west edge (pass `baseUrl` to co-locate the relay with your
+region), and cold start is ~75% of time-to-visible, which is why a warm relay
+is the next performance lever. Live view costs 23–80 KB/s while a human solves
+a 2FA, and each handoff consumes one sandbox, destroyed when it ends.
 
 ## Verified how
 
-Every claim above comes from measurements against the real API — the spike
-reports with raw numbers are in [`spikes/`](spikes/). The e2e test drives the
-whole loop with no mocks: a Solari browser signs into a TOTP-protected demo
-app ([`test-app/`](test-app/), deployed into a sandbox), hits the 2FA wall,
-raises its hand, a scripted "human" types the code through the real handoff
-UI, and the test asserts the signed-in page. Injected events arrive with
-`isTrusted: true`.
+Benchmark method and raw data: [`benchmarks/`](benchmarks/README.md). The four
+platform measurements the design rests on — transport, screencast, input
+injection, session lifetime — are in
+[`docs/measurements/`](docs/measurements/README.md). The e2e test drives the
+whole loop with no mocks: a Solari browser signs into a TOTP-protected demo app
+([`test-app/`](test-app/), deployed into a sandbox), hits the 2FA wall, raises
+its hand, a scripted "human" types the code through the real handoff UI, and
+the test asserts the signed-in page — ~6s end to end. Injected events arrive
+with `isTrusted: true`.
 
 ## Limitations (v1)
 

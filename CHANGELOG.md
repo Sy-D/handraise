@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.0] - 2026-09-02
 
-The phone UI, rebuilt from a design-engineering audit (`spikes/emil-ui-audit.md`).
+The phone UI, rebuilt from a design-engineering audit
+([`docs/design/phone-ui-audit.md`](docs/design/phone-ui-audit.md)).
 The headline finding: the human could not read the page they were operating —
 a 1280×800 frame letterboxed to 29% on a 390px phone, ~1mm glyphs, with zoom
 blocked. Remote 16px text now renders at 10.4 CSS px instead of 4.6.
@@ -46,12 +47,13 @@ blocked. Remote 16px text now renders at 10.4 CSS px instead of 4.6.
 
 ## [0.2.0] - 2026-09-01
 
-Everything below shipped after 0.1.0 was published. **0.1.0 is broken and
-deprecated**: its bundle used a namespace import for `qrcode-terminal`, which
-resolves to `{ default: … }` under Node's ESM/CJS interop, so `generate` was
-undefined and the QR code — the whole onboarding path — silently failed to
-render. Bun-driven tests never saw it because bun's interop differs. CI now
-runs the shipped artifact under node after every build.
+0.1.0 is deprecated due to a Node ESM/CJS interoperability bug in QR rendering;
+0.2.0 fixes it and adds a distribution smoke test. The published bundle used a
+namespace import for `qrcode-terminal`, which resolves to `{ default: … }` under
+Node's ESM/CJS interop, so `generate` was undefined and the QR code — the whole
+onboarding path — silently failed to render. Bun-driven tests never saw it
+because bun's interop differs. CI now runs the shipped artifact under node after
+every build.
 
 ### Added
 

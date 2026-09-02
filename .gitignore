@@ -1,7 +1,6 @@
 node_modules/
 .env
 *.log
-spikes/**/out/
 dist/
 demo/.session.json
 demo/.env

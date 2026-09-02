@@ -12,7 +12,7 @@ Everything crosses Solari's port-preview edge (`*.preview.getsolari.com`), so th
 transport had to be one the preview proxy actually forwards — not one that works
 on localhost and dies at the edge.
 
-Spike S1 measured all three plausible options against the real preview URL from a
+[Measurement 01](../measurements/01-preview-transport.md) measured all three plausible options against the real preview URL from a
 laptop in Germany. The network floor to the preview edge was ~185 ms, and every
 transport hit exactly that floor, so the proxy adds no measurable per-message
 overhead.
@@ -26,12 +26,12 @@ socket.
 
 ## Alternatives
 
-- **HTTP polling.** Works and is boringly reliable (S1: 15 sequential polls,
+- **HTTP polling.** Works and is boringly reliable (measurement 01: 15 sequential polls,
   median 185 ms, no rate limiting). Rejected for frames because frame age =
   latency + poll interval, and it burns one request per frame. Kept only as the
   coarse "is the handoff still open" check.
 - **Server-Sent Events (SSE).** A genuine, non-buffered stream through the proxy
-  (S1: median 248 ms tick fidelity preserved, `transfer-encoding: chunked`).
+  (measurement 01: median 248 ms tick fidelity preserved, `transfer-encoding: chunked`).
   Rejected as the default because it is one-directional — the human's clicks need
   a second channel (a `POST` back) — so it doubles the moving parts for no
   latency win. Retained as a documented fallback for networks that block `wss://`.
@@ -41,7 +41,7 @@ carrying 100 KB frames without the proxy buffering server→client push.
 
 ## Consequences
 
-- **The 60 s idle cut must be designed around.** S1 measured the preview proxy
+- **The 60 s idle cut must be designed around.** Measurement 01 recorded the preview proxy
   killing a silent WebSocket at 59 993 ms with close code 1006 (abnormal, no
   close frame). A live view pushing frames never notices this — but a paused,
   fully-loaded handoff page (exactly the state while a human reads a code off

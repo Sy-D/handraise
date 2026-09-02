@@ -18,9 +18,9 @@ import {
   startFramePump,
 } from "./screencast"
 
-/** A real 800x500 q60 screencast frame of the GitHub login page (spike S2). */
+/** A real 800x500 q60 screencast frame of the GitHub login page (measurement 02). */
 const SAMPLE_JPEG = fileURLToPath(
-  new URL("../../spikes/s2/sample-frame.jpg", import.meta.url),
+  new URL("./fixtures/sample-frame.jpg", import.meta.url),
 )
 
 /** The Page.* parameters the pump sends. */

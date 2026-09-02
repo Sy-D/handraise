@@ -10,7 +10,7 @@ wall (view the screen, type the 2FA code, tap through a dialog). But the relay h
 two roles on it: the **human**, who may send input, and the **agent**, who reads
 the human's keystrokes and drives the browser. The keystrokes include OTP codes.
 
-The preview token authorizes *any path* on the sandbox (S1). So if the only
+The preview token authorizes *any path* on the sandbox ([measurement 01](../measurements/01-preview-transport.md)). So if the only
 protection is the preview token, anyone holding the human link can also connect as
 `role=agent`. The security review flagged exactly this as a blocker: a link holder
 could claim the agent role, evict the real agent, read another helper's OTP and

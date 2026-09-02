@@ -1,8 +1,10 @@
-VERDICT: MOUSE=yes TEXT=yes KEYS=yes TOUCH=yes
+# 03 — CDP input injection on a Solari cloud browser
 
-Bonus: SCROLL=yes, DRAG=yes (same primitive), MODIFIERS=yes, `isTrusted=true` on every injected event.
-
-# S3 — CDP input injection on a Solari cloud browser
+**What was measured, and why.** The screencast is only half of a handoff; the
+human's taps and keystrokes have to reach the page. This document establishes
+that the return channel works on a Solari cloud browser, that injected events
+carry `isTrusted: true`, and that the phone-to-page coordinate mapping is
+exact. Measured 2026-09-01.
 
 **Answer: yes, the full input return channel works.** Raw CDP
 `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` / `Input.insertText` /
@@ -40,9 +42,9 @@ values, URL after navigation) — never by "no error was thrown".
 | Wheel scroll | `deltaY: 300` → `scrollTop = 300` (1:1) |
 | Coordinate math | Simulated phone tap on a 360px-wide view of a 640px downscaled frame of a page scrolled to y=800 → **0.000 px** mapping error, click landed |
 
-Scripts: `spikes/s3/input-injection.ts`, `spikes/s3/input-injection-v2.ts`,
-`spikes/s3/verify-inject.ts`.
-Copy-paste-ready module (typechecks, verified live): `spikes/s3/inject.ts`.
+Measured with three throwaway injection scripts plus a copy-paste-ready module
+that typechecked and was verified live. They are not carried in the tree; the
+repository history has them. The shipped implementation is `src/core/input.ts`.
 
 ---
 
@@ -230,7 +232,7 @@ const y = (fy - meta.offsetTop * k) / scale
 // 3. send {x, y} straight to Input.dispatchMouseEvent
 ```
 
-Implemented as `frameToViewport()` in `spikes/s3/inject.ts`.
+This is `frameToPage()` in `src/core/input.ts`.
 
 **Verified end-to-end:** page scrolled to `scrollY = 800`, screencast requested
 at `maxWidth: 640` (so `k = 0.5`), frame displayed at 360 px wide. A tap
@@ -325,14 +327,14 @@ the reason handraise can solve a captcha where an in-page script cannot.
 
 ---
 
-## What is still open (not blocking S3)
+## What is still open
 
 - **Latency.** Not measured here. Round-trip tap → screencast frame showing the
-  result is the number that decides whether the phone UI feels usable. Belongs
-  to the screencast spike.
+  result is the number that decides whether the phone UI feels usable. It is
+  measured end-to-end in [`benchmarks/`](../../benchmarks/README.md).
 - **Concurrency.** Whether the agent's Playwright actions and the human's CDP
   input can interleave safely, or whether the agent must be parked while a
   handoff is open. Recommend parking it — the human's mental model is "I have
   the wheel now".
 - **File upload.** `DOM.setFileInputFiles` was not tested. A human on a phone
-  may need to upload an ID photo. Separate spike if the use case needs it.
+  may need to upload an ID photo. A separate experiment if the use case needs it.

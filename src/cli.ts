@@ -52,7 +52,7 @@ const PORTAL_DIR = "/opt/portal"
 const PORTAL_LOG = "/var/log/portal.log"
 /** Comfortably longer than the handoff budget; `onTimeout: kill` frees the slot. */
 const PORTAL_SANDBOX_TIMEOUT_MS = 15 * 60_000
-/** Cold start measured at ~3s (spikes/s1-report.md); this is a generous ceiling. */
+/** Cold start measured at ~3s (docs/measurements/01-preview-transport.md); this is a generous ceiling. */
 const PORTAL_READY_TIMEOUT_MS = 45_000
 const PORTAL_POLL_MS = 250
 /** The plan allows two concurrent sandboxes, so a busy account is a queue. */
@@ -142,7 +142,7 @@ interface Portal {
 /**
  * Put a path on the preview URL while keeping its query string.
  * `new URL(path, previewUrl)` drops `?pt_token=` and earns a 401
- * (spikes/s1-report.md §4.3) — the single easiest hour to lose here.
+ * (docs/measurements/01-preview-transport.md §4.3) — the single easiest hour to lose here.
  */
 function previewPath(previewUrl: string, pathname: string): string {
   const url = new URL(previewUrl)
@@ -157,7 +157,7 @@ async function createSandbox(client: SolariClient): Promise<Sandbox> {
         template: "base",
         timeoutMs: PORTAL_SANDBOX_TIMEOUT_MS,
         // Kill, not pause: a paused sandbox keeps holding one of the two slots
-        // (spikes/s4-report.md §4), and the portal holds nothing worth keeping.
+        // (docs/measurements/04-browser-session-lifetime.md §4), and the portal holds nothing worth keeping.
         lifecycle: { onTimeout: "kill" },
       })
     } catch (error) {

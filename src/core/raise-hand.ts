@@ -35,7 +35,7 @@ import { connectRelay, type RelayConnection } from "./socket"
 
 /**
  * Five minutes. Solari browser sessions die about ten minutes after creation
- * and one measured session died at 319 s (spikes/s4-report.md), so a longer
+ * and one measured session died at 319 s (docs/measurements/04-browser-session-lifetime.md), so a longer
  * default would put the common path on top of the platform's hard limit.
  */
 const DEFAULT_TIMEOUT_MS = 5 * 60_000
@@ -92,7 +92,7 @@ function endedMessage(outcome: HandoffOutcome): AgentToHuman {
 
 /**
  * A dead Solari browser session has no error code and no status — the only
- * stable marker is this substring (spikes/s4-report.md §3). It is a fallback:
+ * stable marker is this substring (docs/measurements/04-browser-session-lifetime.md §3). It is a fallback:
  * the `disconnected` event usually fires first.
  */
 function isBrowserGone(error: Error): boolean {
@@ -293,7 +293,7 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       logger.warn("storage_state_capture_failed", { error: String(error) })
     }
     // Handback can win the promise by milliseconds just as the session hits its
-    // ~10-min hard death (spikes/s4-report.md). If the page is gone the caller
+    // ~10-min hard death (docs/measurements/04-browser-session-lifetime.md). If the page is gone the caller
     // cannot continue, so report that truthfully instead of a dead "resolved".
     if (browser && !browser.isConnected()) {
       finalOutcome = "disconnected"

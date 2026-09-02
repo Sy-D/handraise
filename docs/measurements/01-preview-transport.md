@@ -1,8 +1,13 @@
-VERDICT: WS=yes SSE=yes POLLING=yes
+# 01 — Preview transport: WebSocket, SSE, polling
 
-# S1 — Transport through `*.preview.getsolari.com`
+**What was measured, and why.** The handoff UI is served from a Solari sandbox
+through the port-preview proxy. Before anything could be built on it, the proxy
+had to be characterised: which transports survive it, what they cost, when it
+kills an idle socket, and how its token auth behaves. The answers are the
+foundation of [ADR 0001](../adr/0001-websocket-live-view-transport.md) and
+[ADR 0002](../adr/0002-relay-in-solari-sandbox.md).
 
-Spike date: 2026-09-01. SDK `@solarisdk/sdk@0.1.2`, template `base`, region as
+Measured 2026-09-01. SDK `@solarisdk/sdk@0.1.2`, template `base`, region as
 served by `api.getsolari.com` default. All numbers measured from a laptop in
 Germany; the RTT floor to the preview edge was ~185 ms and every transport hit
 exactly that floor, so treat 185 ms as "network", not "proxy overhead".
@@ -100,7 +105,7 @@ OS: Debian GNU/Linux 12 (bookworm), kernel 6.6.30, x86_64, running as **root**.
 Node 18 is present, so the in-guest relay needs **no install step** — write one
 `.js` file and run it. Do not add an `npm install ws`: a raw RFC6455 server is
 ~70 lines of stdlib and removes a network dependency from the critical path.
-The working implementation is `spikes/s1/server.js`.
+The probe server used here was exactly that.
 
 ---
 
@@ -145,7 +150,7 @@ is carried by the cookie. No token plumbing inside the page is required.
 
 ### 4.1 In-guest server — WS + SSE + HTTP on one port
 
-Full file: `spikes/s1/server.js` (Node 18, stdlib only, no deps). It serves
+The probe server (Node 18, stdlib only, no deps) serves
 `/ws`, `/sse`, `/sse-big`, `/ping` on a single port. The parts that matter:
 
 ```js
@@ -261,14 +266,14 @@ That is the single easiest way to waste an hour on this.
    the whole handoff.
 
 7. **Concurrency limit is 2 sandboxes on the test plan**, and it is enforced with
-   `429 ConcurrencyLimitError: Too many concurrent sessions`. Parallel spike
-   agents *will* collide with each other. Retry on 429 with a short backoff, and
+   `429 ConcurrencyLimitError: Too many concurrent sessions`. Parallel runs
+   *will* collide with each other. Retry on 429 with a short backoff, and
    always `await sandbox.kill()` in a `finally` — `close()` only drops the local
    control channel and leaves the VM running and billing.
-   `spikes/s1/cleanup.ts` lists and kills strays; note `sandboxes.listAll()`
-   yields objects keyed `sandboxId`, **not** `id`. In this spike a sibling agent
-   held both slots for ~7 minutes and the follow-up run sat in a retry loop the
-   whole time — budget for that when spikes run in parallel.
+   `scripts/cleanup-sandboxes.ts` lists and kills strays; note `sandboxes.listAll()`
+   yields objects keyed `sandboxId`, **not** `id`. During this measurement another
+   run held both slots for ~7 minutes and the follow-up sat in a retry loop the
+   whole time — budget for that when runs overlap.
 
 8. **`ws` client and `unexpected-response`.** If the proxy ever rejects an
    upgrade, the `ws` package reports it on the `unexpected-response` event, not
@@ -276,17 +281,15 @@ That is the single easiest way to waste an hour on this.
 
 ---
 
-## 6. Files
+## 6. How this was run
 
-| Path | What it is |
-|---|---|
-| `spikes/s1/probe.ts` | template inventory + `previewUrl` smoke test |
-| `spikes/s1/server.js` | in-guest WS/SSE/HTTP echo server, Node 18 stdlib only |
-| `spikes/s1/transport-test.ts` | the measurement run behind §1 |
-| `spikes/s1/session-test.ts` | auth-propagation and idle-timeout follow-up (§3, §7) |
-| `spikes/s1/cleanup.ts` | list/kill stray sandboxes (`--kill`) |
-
-Run any of them with `bun --env-file=.env spikes/s1/<file>.ts`.
+Five throwaway scripts: a template inventory and `previewUrl` smoke test, the
+in-guest WS/SSE/HTTP echo server (Node 18, stdlib only), the measurement run
+behind §1, an auth-propagation and idle-timeout follow-up (§3, §7), and a
+sandbox janitor. They were experiments, not product, and they are not carried
+in the tree — the repository history has them. The janitor was the one that
+kept earning its keep and now lives at
+[`scripts/cleanup-sandboxes.ts`](../../scripts/cleanup-sandboxes.ts).
 
 ---
 

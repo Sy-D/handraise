@@ -1,6 +1,9 @@
-VERDICT: SCREENCAST=yes CDP_PATH=`await page.context().newCDPSession(page)` (standard Playwright API, passed straight through by `@solarisdk/browser`)
+# 02 — CDP screencast on a Solari cloud browser
 
-# Spike S2 — CDP screencast on a Solari cloud browser
+**What was measured, and why.** The live view is a CDP screencast. This
+document establishes that the screencast works through the Solari SDK at all,
+and what it costs in framerate, payload size and bandwidth — the numbers the
+README quotes for live-view bandwidth. Measured 2026-09-01.
 
 **Question.** Does `Page.startScreencast` work over the Solari SDK's Playwright-compatible
 connection, and at what framerate and payload size?
@@ -49,7 +52,7 @@ every frame**, never a delta, so bitrate tracks resolution and quality, not how 
 the page actually changed.
 
 A 800x500 q60 frame of the GitHub login page is 11.6 KB and fully legible, including the
-form labels and footer links (`spikes/s2/sample-frame.jpg`). q60 at 800px is comfortable;
+form labels and footer links. q60 at 800px is comfortable;
 there is room to go lower.
 
 ### The realistic HITL number
@@ -117,7 +120,7 @@ try {
 ```
 
 TypeScript note: `patchright-core` types are not re-exported by `@solarisdk/browser`, so
-the `page` and `cdp` objects come back loosely typed. In the spikes they were narrowed to
+the `page` and `cdp` objects come back loosely typed. In these probes they were narrowed to
 a hand-written `CdpSession` interface (`{ send, on, off }`) rather than `any`. Do the same
 in `src/` — do not widen to `any`.
 
@@ -143,11 +146,11 @@ This is the recommended pump design for handraise.
 which is not the thing that limits you here. Do not use it for rate control. Use ack pacing
 (trap 2) or lower `maxWidth` / `quality`.
 
-**4. Measure only on a page that actually repaints.** The first spike run measured a static
+**4. Measure only on a page that actually repaints.** The first run measured a static
 GitHub login page and reported 2.06 fps / 11 KB — meaningless numbers, because Chromium
 only emits a frame on repaint. The tell was that min and max frame size were nearly
 identical (9.09 vs 11.38 KB) and `scrollOffsetY` stayed 0. Any benchmark of this API needs
-forced motion; the spike drives a `requestAnimationFrame` scroll loop via `page.evaluate`.
+forced motion; these runs drive a `requestAnimationFrame` scroll loop via `page.evaluate`.
 
 **5. Idle is not zero, and idle is not stable.** Scenario E measured 1.86 fps with only
 **two distinct frame sizes** — that is the text caret blinking in the focused input. A
@@ -157,7 +160,7 @@ or a carousel will idle far higher. Do not assume an idle viewer is free.
 **6. The frame is scaled; the metadata is not.** With viewport 1280x800 and `maxWidth: 800`,
 the JPEG is **800x500** (scaled by `maxWidth / viewportWidth` = 0.625), but
 `metadata.deviceWidth` / `deviceHeight` still report **1280x800** — the CSS viewport, not
-the image. For input forwarding (S3), map viewer coordinates as:
+the image. For input forwarding ([measurement 03](03-cdp-input-injection.md)), map viewer coordinates as:
 
 ```
 pageX = imgX * (metadata.deviceWidth  / jpegWidth)
@@ -188,7 +191,7 @@ is not enough. Both belong in `finally`.
 identifies the screencast frame sequence. It has nothing to do with the Solari session id
 or the CDP session id. Ack with exactly the value from the frame.
 
-**11. `Page.enable` before `startScreencast`.** Every spike run sent it first and every run
+**11. `Page.enable` before `startScreencast`.** Every run sent it first and every run
 worked. It was not tested without, so it is unverified whether it is strictly required —
 keep it, it costs one round trip.
 
@@ -209,17 +212,15 @@ keep it, it costs one round trip.
 
 ---
 
-## 5. Files
+## 5. How this was run
 
-- `spikes/s2/screencast.ts` — run 1. First CDP path probe. Its *numbers* are invalid (static
-  page, see trap 4); kept because it documents the failure mode.
-- `spikes/s2/screencast2.ts` — run 2. Scenarios B, C, D (motion desktop, motion mobile,
-  no-ack control).
-- `spikes/s2/screencast3.ts` — run 3. Scenarios A, E, F (typing, idle, `everyNthFrame: 2`).
-  Writes `results-run3.json`.
-- `spikes/s2/screencast4.ts` — run 4. JPEG pixel dimensions and navigation survival.
-  Writes `results-run4.json` and `sample-frame.jpg`.
-- `spikes/s2/results-run3.json`, `spikes/s2/results-run4.json` — raw measurements.
-- `spikes/s2/sample-frame.jpg` — 800x500 q60 frame, 11.6 KB, GitHub login page.
-
-Run any of them with `bun --env-file=.env spikes/s2/<file>.ts`.
+Four throwaway scripts against three browser sessions. Run 1 was the first CDP
+path probe; its *numbers* are invalid (static page, see trap 4) but its failure
+mode is the reason trap 4 is written down. Run 2 covered scenarios B, C and D
+(motion desktop, motion mobile, no-ack control), run 3 covered A, E and F
+(typing, idle, `everyNthFrame: 2`), and run 4 measured JPEG pixel dimensions
+and navigation survival. The scripts and their raw JSON output were experiments
+rather than product and are not carried in the tree; the repository history has
+them. One artefact did stay: the 800x500 q60 sample frame of the GitHub login
+page, 11.6 KB, which is now the fixture behind
+`src/core/screencast.test.ts`.

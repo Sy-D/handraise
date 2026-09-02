@@ -1,7 +1,7 @@
 /**
  * The coordinate maths is pure, so it is tested as maths. The CDP dispatch is
  * tested by recording what would go on the wire — the exact event shapes were
- * verified against a live browser in spikes/s3-report.md, and this file exists
+ * verified against a live browser in docs/measurements/03-cdp-input-injection.md, and this file exists
  * to stop them drifting.
  *
  *   bun test src/core/
@@ -33,7 +33,7 @@ interface CdpParams {
   code?: string
   text?: string
   unmodifiedText?: string
-  /** Alt 1, Ctrl 2, Meta 4, Shift 8 (spikes/s3-report.md). */
+  /** Alt 1, Ctrl 2, Meta 4, Shift 8 (docs/measurements/03-cdp-input-injection.md). */
   modifiers?: number
   windowsVirtualKeyCode?: number
   nativeVirtualKeyCode?: number
@@ -81,7 +81,7 @@ test("a tap in the middle of the frame lands in the middle of the viewport", () 
 })
 
 test("the frame is scaled and the metadata is not", () => {
-  // The trap from spikes/s2-report.md: deviceWidth still says 1280 while the
+  // The trap from docs/measurements/02-cdp-screencast.md: deviceWidth still says 1280 while the
   // JPEG is 800 wide. Dividing by the ratio of the two is the whole mapping.
   expect(frameToPage(800, 500, META)).toEqual({ x: 1280, y: 800 })
   expect(frameToPage(0, 0, META)).toEqual({ x: 0, y: 0 })

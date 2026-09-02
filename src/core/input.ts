@@ -3,7 +3,7 @@
  * remote page as real CDP input events.
  *
  * Everything here was verified against a live Solari cloud browser in
- * spikes/s3-report.md. The three findings that shape this file:
+ * docs/measurements/03-cdp-input-injection.md. The three findings that shape this file:
  *
  * 1. Mouse, not touch. `Input.dispatchMouseEvent` produces `isTrusted: true`
  *    events and a compat click; touch events need the page to expect them.
@@ -41,7 +41,7 @@ interface FrameScale {
 /**
  * Chromium clamps the screencast to `maxWidth`/`maxHeight` and preserves the
  * aspect ratio, so both factors are normally the same number — but the frame
- * is scaled and the metadata is not (spikes/s2-report.md trap 6), so the ratio
+ * is scaled and the metadata is not (docs/measurements/02-cdp-screencast.md trap 6), so the ratio
  * has to come from the actual JPEG, never from the requested maximum.
  */
 function frameScale(meta: FrameMeta): FrameScale {
@@ -100,7 +100,7 @@ interface KeyDefinition {
  * implicit form submission from the `keypress` handler, and `rawKeyDown`
  * produces no `keypress`. An Enter without `text` fires `keydown`, looks
  * correct in a listener log, and never submits the form. Verified in
- * spikes/s3-report.md; it also inserts no character.
+ * docs/measurements/03-cdp-input-injection.md; it also inserts no character.
  */
 const KEY_TABLE = {
   Enter: { code: "Enter", keyCode: 13, text: "\r" },
@@ -135,7 +135,7 @@ async function dispatchKey(
 }
 
 /**
- * Modifier bitmask (spikes/s3-report.md): Alt 1, Ctrl 2, Meta 4, Shift 8. The
+ * Modifier bitmask (docs/measurements/03-cdp-input-injection.md): Alt 1, Ctrl 2, Meta 4, Shift 8. The
  * remote page runs on Linux Chromium, so select-all is Ctrl+A, never Meta+A.
  */
 const CTRL = 2
@@ -145,7 +145,7 @@ const CTRL = 2
  *
  * `rawKeyDown` with no `text`, because any modifier other than Shift has to
  * suppress `text` — a `keyDown` carrying "a" here types an "a" into the field
- * instead of selecting its contents (verified in spikes/s3-report.md).
+ * instead of selecting its contents (verified in docs/measurements/03-cdp-input-injection.md).
  */
 async function selectAll(cdp: CdpChannel): Promise<void> {
   const shared = {

@@ -7,7 +7,7 @@
  * `fetch` has no cookie jar and does not carry cookies across redirects, so the
  * jar and the redirect chain are both handled by hand — and every URL keeps its
  * `?pt_token=`, because a non-browser client never gets the `__pt_preview`
- * cookie granted to it (spikes/s1-report.md §5.2).
+ * cookie granted to it (docs/measurements/01-preview-transport.md §5.2).
  *
  * Prints one JSON line of timings and exits non-zero if any step is wrong.
  */

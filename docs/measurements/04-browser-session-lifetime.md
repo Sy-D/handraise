@@ -1,6 +1,12 @@
-VERDICT: KEEPALIVE=no MIN_CALL=none-for-browser(no-op-calls-change-nothing);sandboxes.get()-or-setTimeout()-for-sandbox DEFAULT_TIMEOUT=browser≈600s-hard-cap(expiresAt=+5h-is-not-real);sandbox=timeoutMs-rolling-idle(default-30min,-configurable)
+# 04 — Browser session lifetime under a human pause
 
-# S4 — Survives a Solari browser session a multi-minute human pause?
+**What was measured, and why.** A handoff asks a human to spend minutes on a
+page while the agent's browser session sits there. Whether that session
+survives is the single fact the whole failure model rests on. It is why the
+default wait is five minutes, why there is deliberately no keep-alive pinger,
+why `disconnected` is an outcome instead of an exception, and why
+`storageState` is captured on handback — see
+[ADR 0003](../adr/0003-no-keep-alive-five-minute-wait.md). Measured 2026-09-01.
 
 **Short answer: no, and no-op keep-alive calls make no difference.**
 Browser sessions on this plan die ~10 minutes after creation whether they are
@@ -81,7 +87,7 @@ Method. Liveness was polled every 5 s with `browser.isConnected()` plus a
 state, send zero bytes, and therefore cannot themselves reset any server-side
 window. `GET /sessions/:id` was called only once at t=0 and once after death.
 
-Scripts: `spikes/s4/browser-idle.ts`, raw logs `spikes/s4/log-browser-*.jsonl`.
+The probe script and its raw JSONL logs are in the repository history.
 
 | Run | Activity during the wait | Created (UTC) | Died (UTC) | Lifetime |
 |---|---|---|---|---|
@@ -162,7 +168,7 @@ Never use it as a liveness check.
 ## 4. Measurement protocol — sandboxes (where `timeoutMs` is real)
 
 All runs: `sandboxes.create({ template: "base", timeoutMs: 60_000 })`, i.e. a
-deliberately short 60 s window. Script `spikes/s4/sandbox-idle.ts`.
+deliberately short 60 s window.
 
 | Run | What touched the session | Result |
 |---|---|---|
@@ -206,7 +212,7 @@ so sandboxes and desktops share one pool and therefore one cap.
 
 ---
 
-## 5. Answers to the spike questions
+## 5. Answers to the questions this run had to settle
 
 **Does a browser session survive a multi-minute pause if kept awake with
 periodic no-op calls?**
@@ -253,7 +259,7 @@ patchright `TargetClosedError` whose only stable marker is the message substring
    that survives the cap: save `storageState` into a profile, `close()` the
    browser, and re-`launch({ profileId })` when the human arrives. This turns an
    unavoidable platform limit into a feature ("we hold your place"). Worth a
-   follow-up spike on how faithfully `profileId` restores a half-finished login.
+   follow-up experiment on how faithfully `profileId` restores a half-finished login.
 6. **For the relay sandbox, set `timeoutMs` explicitly** to the full handoff
    budget (e.g. 15 min) and refresh with `setTimeout()` at `timeoutMs / 3`.
    Recommended keep-alive interval: **20 s for a 60 s window, or generally

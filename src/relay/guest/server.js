@@ -5,7 +5,7 @@
  * `src/relay/guest-source.ts`; never edit the generated copy.
  *
  * Constraints that shape every line below:
- *   - Node v18.20.4, template `base`, ZERO dependencies (see spikes/s1-report.md).
+ *   - Node v18.20.4, template `base`, ZERO dependencies (see docs/measurements/01-preview-transport.md).
  *   - One port for everything. Each preview port is its own subdomain with its
  *     own token and its own cookie grant, so a second port would double the
  *     auth surface for no gain.

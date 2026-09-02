@@ -38,10 +38,10 @@
  *   model's mood is not part of it.
  * - ONE test-app sandbox is held for the whole bench. Each handoff takes the
  *   second sandbox slot the plan allows, so nothing else may run alongside.
- *   Check with `bun --env-file=.env spikes/s1/cleanup.ts` before and after.
+ *   Check with `bun --env-file=.env scripts/cleanup-sandboxes.ts` before and after.
  * - ONE browser session is reused and relaunched after 3 minutes, because
  *   Solari browser sessions die hard around 10 minutes and the sessions API
- *   still calls the corpse "active" (spikes/s4-report.md).
+ *   still calls the corpse "active" (docs/measurements/04-browser-session-lifetime.md).
  * - Every run gets a fresh page and a cookie-free context, so no run inherits
  *   the session a previous rescue earned.
  * - A failed rescue is recorded as a failed rescue. It is never dropped, and
@@ -82,7 +82,7 @@ const BROWSER_MAX_AGE_MS = 3 * 60_000
 const COOLDOWN_MS = 1_000
 /** Consecutive rescue failures that mean the infrastructure is down, not the claim. */
 const ABORT_AFTER_CONSECUTIVE_FAILURES = 5
-const RESULTS_PATH = new URL("../spikes/rescue-results.json", import.meta.url)
+const RESULTS_PATH = new URL("../benchmarks/rescue-rate.json", import.meta.url)
 
 const apiKey = process.env.SOLARI_API_KEY ?? ""
 if (apiKey === "") {

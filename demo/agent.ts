@@ -30,7 +30,7 @@
  * e.g. `DEMO_MODEL=anthropic/claude-sonnet-4.5`.
  *
  * Costs two Solari sandboxes (the test app and the handoff relay), which is the
- * whole plan allowance — check `bun --env-file=.env spikes/s1/cleanup.ts` first.
+ * whole plan allowance — check `bun --env-file=.env scripts/cleanup-sandboxes.ts` first.
  */
 import { anthropic } from "@ai-sdk/anthropic"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"

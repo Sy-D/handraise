@@ -58,7 +58,7 @@ function sleep(ms: number): Promise<void> {
  * Build a URL on the preview host while keeping `?pt_token=`.
  *
  * `new URL("/healthz", previewUrl)` drops the query string and earns a 401.
- * See spikes/s1-report.md §5.1.
+ * See docs/measurements/01-preview-transport.md §5.1.
  */
 export function previewPath(previewUrl: string, pathname: string): string {
   const url = new URL(previewUrl)

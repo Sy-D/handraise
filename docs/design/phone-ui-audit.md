@@ -1,17 +1,23 @@
 # Design-engineering audit — the phone UI
 
-Read-only audit of the inline mobile UI in `src/relay/guest/server.js` (the
-`PAGE` template, from ~line 403). Nothing in this document has been
-implemented; `server.js` is untouched.
+This is the audit that produced the 0.3.0 phone UI, kept as a case study
+because the reasoning is more useful than the diff. It was written against the
+0.2.0 UI, before any of it was changed; every fix below has since shipped (see
+the [0.3.0 entry in the changelog](../../CHANGELOG.md)). Read it as a record of
+what was wrong and why, not as a to-do list.
+
+The headline finding was not a matter of taste. On a 390px phone the 1280×800
+remote page was letterboxed to 28.9% with zoom blocked, so remote 16px text
+rendered at ~4.6 CSS px — roughly a millimetre of glyph. The human was being
+asked to operate a page they could not read.
 
 Method: the real page, served by the real relay on port 3999, driven in
 Playwright Chromium at 390×844 / dpr 3 and 320×568, with a `role=agent`
 WebSocket client standing in for the agent (a rendered 1280×800 "Acme Bank 2FA"
-page as the frame). Screenshots in `/tmp/hr-ui-audit/*.png` — eleven states:
-initial, frame, focus ring, typing, long label, long reason, handback overlay,
-abort overlay, reconnecting, 320px, session lost. Measurements taken from the
-live DOM, contrast ratios computed from the actual rendered pixels of the
-oklch tokens.
+page as the frame). Eleven states were captured: initial, frame, focus ring,
+typing, long label, long reason, handback overlay, abort overlay, reconnecting,
+320px, session lost. Measurements taken from the live DOM, contrast ratios
+computed from the actual rendered pixels of the oklch tokens.
 
 Lens: Emil Kowalski's design engineering — clarity of the primary action,
 details you feel rather than notice, touch ergonomics, feedback for every
@@ -73,7 +79,7 @@ feels.
 
 **5. At 320px the primary wraps to two lines.** Measured: `#handback` becomes
 176.4×**68**, `#abort` stays 49. A 19px height mismatch and a two-line label
-that reads "Hand back to / agent". See `/tmp/hr-ui-audit/10-narrow-320.png`.
+that reads "Hand back to / agent".
 
 **6. "Can't help" understates its own consequence.** It reads like "not me,
 ask someone else" — low stakes, deferrable. It actually means *terminate the
@@ -192,7 +198,7 @@ into **370×231** — a 28.9% scale. Remote 14px body text lands at ~4 CSS px,
 about a millimetre of glyph height. 414 of 625 stage pixels (66%) are black
 bars. `canvas { touch-action: none }` means the human cannot pinch to zoom
 either, and `maximum-scale=1` in the viewport meta blocks browser zoom on
-Android. See `/tmp/hr-ui-audit/03-focus-ring.png`.
+Android.
 
 **Why.** Everything else in this UI is craft applied to an interaction the
 human cannot perform, because they cannot read the thing they are tapping. It
@@ -292,8 +298,7 @@ nothing. Effort: **S**.
 **What.** `send()` is `if (ws && ws.readyState === 1) ws.send(...)`. During a
 reconnect the header reads "Reconnecting…" but the canvas stays fully bright
 and fully interactive. Every tap and every character typed in that window is
-dropped with no trace. See `/tmp/hr-ui-audit/09-reconnecting.png` — nothing
-about the stage suggests it is not live.
+dropped with no trace, and nothing about the stage suggests it is not live.
 
 **Why.** Silent failure is the one thing an interface may never do. Worse here
 than usual: the human will assume the *remote page* ignored them and will retry
@@ -380,8 +385,9 @@ html, body { height: 100%; }
 minimum is a *target*, not a height.
 
 **Why.** These four buttons exist precisely because the soft keyboard is
-unreliable (`spikes/keybar-report.md`). They are the fallback, so they have to
-be the most reliable controls on the page.
+unreliable — Android virtual keyboards report `keyCode 229` instead of a real
+key, so deletion riding on `keydown` never arrives. They are the fallback, so
+they have to be the most reliable controls on the page.
 
 **Fix.** 44px wide is 4×44 + 3×6 = 194px of the 358px row, leaving 156px for
 the field — still enough for a 6-digit code but tight for an email. Better:
@@ -484,7 +490,7 @@ legible. Effort: **S**.
 
 **What.** `#reason` is `white-space: nowrap; text-overflow: ellipsis`. A real
 reason truncates to "Blocked on two-factor authentication at login.a…"
-(`/tmp/hr-ui-audit/06-long-reason.png`). This is the only sentence that tells
+in the captured state. This is the only sentence that tells
 the human why they are here.
 
 **Why.** Truncation is right for a label and wrong for the primary
@@ -540,7 +546,7 @@ Effort: **S**.
 **What.** `--bg` is `#040404`, `--surface` is `#0a0a0a` — **1.04:1**. The
 divider `--line` is **1.2:1** against it. The header, the stage and the footer
 read as one continuous black rectangle; the bottom bar is not perceived as a
-bar (`/tmp/hr-ui-audit/01-initial-waiting.png`). The key and input borders,
+bar. The key and input borders,
 `--field` on `--surface`, measure **1.28:1** — WCAG 1.4.11 wants 3:1 for
 control boundaries, and by eye the four keys are ghosts.
 
@@ -894,6 +900,3 @@ work:
 | M7 | ⌫ and ✕ are 6px apart; one deletes everything. | S |
 | S1–S13 | Glyph legibility, invisible disabled state, truncated reason, no page identity, chrome at 1.04:1, stale mirror on focus change, no password/OTP input types, third-person copy with no thanks, overlay with no transition, a pulse in the idle state, iOS press states, no press scale, an invisible 5-minute deadline. | S (S7, S13: M) |
 | N1–N8 | Duplicate waiting copy, `aria-live`, `inert`, input label, typography, ring transitions layout, horizontal drags, value not cleared on teardown. | S |
-
-Screenshots: `/tmp/hr-ui-audit/01-initial-waiting.png` …
-`11-session-lost.png`. Nothing in `src/` was modified.

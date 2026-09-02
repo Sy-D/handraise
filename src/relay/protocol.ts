@@ -6,7 +6,7 @@
  * Both sides connect to `wss://<preview>/ws?role=agent|human`. Coordinates in
  * human messages are frame pixels (the JPEG the phone displays); the agent
  * side owns the conversion to page coordinates, because only it has the
- * screencast metadata (see spikes/s2-report.md and spikes/s3-report.md:
+ * screencast metadata (see docs/measurements/02-cdp-screencast.md and docs/measurements/03-cdp-input-injection.md:
  * scale by deviceWidth / jpegWidth, never add scroll offsets).
  */
 
@@ -85,7 +85,7 @@ export type HumanToAgent =
 /**
  * Either side may ping; the receiver answers pong. Required: the preview
  * proxy kills WebSockets after exactly 60s of silence (close 1006, see
- * spikes/s1-report.md). Send a ping at least every 25s; treat 1006 as
+ * docs/measurements/01-preview-transport.md). Send a ping at least every 25s; treat 1006 as
  * "reconnect", not "failed".
  */
 export type Heartbeat = { type: "ping" } | { type: "pong" }

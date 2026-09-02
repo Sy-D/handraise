@@ -1,8 +1,8 @@
 /**
  * The agent's side of the relay WebSocket.
  *
- * Three behaviours from spikes/s1-report.md and spikes/a-report.md, none of
- * them optional:
+ * Three behaviours from docs/measurements/01-preview-transport.md and from the
+ * relay integration run, none of them optional:
  *
  * 1. The preview proxy kills a silent WebSocket after exactly 60 s with close
  *    code 1006. A ping every 20 s keeps it warm.

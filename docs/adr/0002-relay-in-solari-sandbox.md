@@ -12,7 +12,7 @@ second account to create. Whatever serves the handoff UI has to appear on demand
 and disappear when the handoff ends.
 
 Solari already gives every sandbox a public, tokenized port preview
-(`*.preview.getsolari.com`). Spike S1 confirmed the preview proxy forwards
+(`*.preview.getsolari.com`). [Measurement 01](../measurements/01-preview-transport.md) confirmed the preview proxy forwards
 WebSockets, that cold start from `create()` to a 200 through the public URL is
 ~2.9 s, and that the `base` template ships Node 18 — so the relay needs no install
 step, just one `.js` file written and run.
@@ -40,11 +40,11 @@ the agent's browser runs the escape hatch. The handoff UI itself runs on Solari.
 
 ## Consequences
 
-- **A handoff consumes one of the plan's two sandbox slots** (S1/S4: the sandbox
+- **A handoff consumes one of the plan's two sandbox slots** (measurements 01/04: the sandbox
   pool cap on the test plan is 2, enforced with HTTP 429
   `ConcurrencyLimitExceeded`). Two concurrent handoffs is the plan-tier ceiling;
   handraise creates and destroys one sandbox per handoff.
-- **Cold start is ~3 s** from "agent is stuck" to "phone can load the page" (S1:
+- **Cold start is ~3 s** from "agent is stuck" to "phone can load the page" (measurement 01:
   2925 ms `create()` → first 200; the first poll already returned 200). The
   transport is not the bottleneck — the human looking at their phone is.
 - **The relay ships as a string constant, no npm install on the critical path.**

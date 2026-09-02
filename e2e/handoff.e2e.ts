@@ -15,7 +15,7 @@
  *
  * Costs two sandboxes (the test app and the relay) and one browser session.
  * That is the whole plan allowance, so nothing else may run at the same time —
- * check with `bun --env-file=.env spikes/s1/cleanup.ts` first.
+ * check with `bun --env-file=.env scripts/cleanup-sandboxes.ts` first.
  *
  * Set HANDRAISE_E2E_FAULT=wrong-code to make the human type a wrong code. The
  * run must then fail on the "signed in" assertion; that is how the assertion
@@ -78,7 +78,7 @@ try {
   await opened.setViewportSize(VIEWPORT)
   // SAFETY: `@solarisdk/browser` returns patchright-core's Page. patchright is
   // a Playwright fork whose runtime surface is the one handraise uses — goto,
-  // context(), newCDPSession — and spikes S2 and S3 drove exactly this object.
+  // context(), newCDPSession — and measurements 02 and 03 drove exactly this object.
   // The two type declarations differ only in optional-property variance.
   const page = opened as Page
   timings.browserLaunchMs = Date.now() - launchedAt

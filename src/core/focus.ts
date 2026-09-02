@@ -6,7 +6,7 @@
  * mobile UI needs — *where* is the focused field, and *what is it called* — so
  * it can draw a ring around it and label the keyboard bar.
  *
- * Two platform facts shape the implementation (spikes/s3-report.md):
+ * Two platform facts shape the implementation (docs/measurements/03-cdp-input-injection.md):
  *
  * 1. `page.evaluate` runs in an **isolated world**. Page globals are not
  *    readable, but the DOM is shared, so `document.activeElement` and

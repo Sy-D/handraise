@@ -2,7 +2,7 @@
  * The forward channel: CDP screencast frames out of the remote page and down
  * to the phone.
  *
- * The design comes from spikes/s2-report.md. Two facts do all the work:
+ * The design comes from docs/measurements/02-cdp-screencast.md. Two facts do all the work:
  *
  * 1. `Page.screencastFrameAck` is mandatory *and* it is the only flow control
  *    the API has. Chromium allows a couple of unacknowledged frames and then
