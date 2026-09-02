@@ -32,6 +32,20 @@ import type {
   HumanToAgent,
   RelayMessage,
 } from "../src/relay/protocol"
+import type { HandoffMode } from "../src/types"
+
+/**
+ * The browser's WebSocket. This file imports `ws` under the same name for the
+ * agent side, and the two types are not interchangeable.
+ */
+type BrowserSocket = InstanceType<typeof globalThis.WebSocket>
+
+declare global {
+  interface Window {
+    /** Only present when a test installed `captureSockets` before the page. */
+    handraiseSockets?: BrowserSocket[]
+  }
+}
 
 const SERVER_PATH = fileURLToPath(
   new URL("../src/relay/guest/server.js", import.meta.url),
@@ -96,9 +110,13 @@ function parseMessage(raw: string): RelayMessage {
   return JSON.parse(raw) as RelayMessage
 }
 
-/** Start the real guest server on an OS-assigned port; read the port from its log. */
-function startRelay(): Promise<Relay> {
-  const child = spawn(process.execPath, [SERVER_PATH, "0", AGENT_KEY], {
+/**
+ * Start the real guest server on an OS-assigned port; read the port from its
+ * log. The mode is an argument and not a message: the relay decides what the
+ * human may send, so a test for approval mode has to boot its own relay.
+ */
+function startRelay(mode: HandoffMode = "takeover"): Promise<Relay> {
+  const child = spawn(process.execPath, [SERVER_PATH, "0", AGENT_KEY, mode], {
     stdio: ["ignore", "pipe", "pipe"],
   })
   const logs: string[] = []
@@ -239,8 +257,35 @@ afterAll(async () => {
   await browser.close()
 })
 
-beforeEach(async () => {
-  relay = await startRelay()
+/**
+ * Keep every WebSocket the page opens, so a test can put one into CLOSING —
+ * the state where an answer is queued while the page has already finished.
+ * Installed before the page script runs, and only where a test asks for it.
+ */
+function captureSockets(): void {
+  const Native = window.WebSocket
+  const sockets: BrowserSocket[] = []
+  window.handraiseSockets = sockets
+  window.WebSocket = class extends Native {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols)
+      sockets.push(this)
+    }
+  }
+}
+
+/**
+ * A relay in `mode`, an agent on it, and the real page in a phone viewport.
+ * `capture` records every WebSocket the page opens; `clock` freezes the page's
+ * timers so a test drives the reconnect backoff itself instead of waiting on
+ * it. Both are installed before the page script runs.
+ */
+async function openFixture(
+  mode: HandoffMode,
+  capture = false,
+  clock = false,
+): Promise<void> {
+  relay = await startRelay(mode)
   agent = await connectAgent(relay.port)
   consoleErrors = []
   page = await browser.newPage({
@@ -251,7 +296,42 @@ beforeEach(async () => {
     if (message.type() === "error") consoleErrors.push(message.text())
   })
   page.on("pageerror", (error) => consoleErrors.push(error.message))
+  // Fake time only touches the page, not Playwright's own waits, so a network
+  // close still fires for real while a reconnect timer waits for fastForward.
+  if (clock) await page.clock.install()
+  if (capture) await page.addInitScript(captureSockets)
   await page.goto(`http://127.0.0.1:${relay.port}/`)
+}
+
+/** Throw the current fixture away and come back up in `mode`. */
+async function reopenFixture(
+  mode: HandoffMode,
+  capture = false,
+  clock = false,
+): Promise<void> {
+  await page.close()
+  agent.close()
+  relay.process.kill("SIGKILL")
+  await openFixture(mode, capture, clock)
+}
+
+/**
+ * Close the page's socket and answer in the same breath, so the answer is made
+ * while the socket is CLOSING rather than after it is gone. Returns the socket
+ * state the click actually saw.
+ */
+function answerWhileClosing(buttonId: string): Promise<number> {
+  return page.evaluate((id: string) => {
+    const live = window.handraiseSockets?.at(-1)
+    if (!live) throw new Error("no socket was captured")
+    live.close()
+    document.getElementById(id)?.click()
+    return live.readyState
+  }, buttonId)
+}
+
+beforeEach(async () => {
+  await openFixture("takeover")
 })
 
 afterEach(async () => {
@@ -1032,4 +1112,278 @@ test("the page reconnects after its socket drops, with a single live human", asy
   // Exactly one human is connected: no overlapping sockets survived.
   expect(openHumans(relay)).toBe(1)
   expect(consoleErrors).toEqual([])
+}, 20000)
+
+// --- Approval mode --------------------------------------------------------
+//
+// A different job on the same page: the human is not driving the browser, they
+// are answering one question about one screenshot. The tests below assert the
+// two halves of that — the screen says what is about to happen, and nothing the
+// human touches can reach the remote page.
+
+const APPROVAL_REASON = "Agent wants to submit this payment"
+const APPROVAL_ACTION = "Submit $12,430 vendor payment to Acme GmbH"
+const APPROVAL_HINT = "Approve needs a hold. Deny is one tap."
+const APPROVAL_HOLD_HINT = "Hold the button to approve"
+
+/** Put the page in approval mode and give it the agent's ask. */
+async function showApproval(capture = false): Promise<void> {
+  await reopenFixture("approval", capture)
+  agent.send({
+    type: "state",
+    reason: APPROVAL_REASON,
+    action: APPROVAL_ACTION,
+  })
+  await page.waitForFunction(
+    (action: string) =>
+      document.getElementById("action")?.textContent === action,
+    APPROVAL_ACTION,
+  )
+}
+
+test("approval mode states the action and offers no way to type", async () => {
+  await showApproval()
+
+  expect(await page.locator("#reason").textContent()).toBe(APPROVAL_REASON)
+  expect(await page.locator(".eyebrow").textContent()).toBe(
+    "handraise · an agent needs your approval",
+  )
+  // The action is the sentence the decision is made on, so it is the largest
+  // type on the page — larger than the reason above it.
+  const sizes = await page.evaluate(() => {
+    const size = (id: string): number => {
+      const node = document.getElementById(id)
+      if (!node) throw new Error(`no #${id}`)
+      return Number.parseFloat(getComputedStyle(node).fontSize)
+    }
+    return { action: size("action"), reason: size("reason") }
+  })
+  expect(sizes.action).toBeGreaterThan(sizes.reason)
+
+  // No keyboard, no key bar: there is nothing on this screen to type into.
+  expect(await page.locator("#kbd").isVisible()).toBe(false)
+  expect(await page.locator(".keys").isVisible()).toBe(false)
+  expect(await page.locator("#hint").textContent()).toBe(APPROVAL_HINT)
+
+  for (const id of ["#deny", "#approve"]) {
+    const box = await page.locator(id).boundingBox()
+    if (!box) throw new Error(`${id} has no bounding box`)
+    expect(box.height).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
+    expect(box.width).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
+  }
+
+  // Peers, down to the pixel: the accent marks the action the interface wants,
+  // and an approval has none. Only the gesture differs.
+  const paint = await page.evaluate(() => {
+    const of = (id: string) => {
+      const node = document.getElementById(id)
+      if (!node) throw new Error(`no #${id}`)
+      const style = getComputedStyle(node)
+      return {
+        background: style.backgroundColor,
+        color: style.color,
+        border: style.border,
+        fontWeight: style.fontWeight,
+      }
+    }
+    return { deny: of("deny"), approve: of("approve") }
+  })
+  expect(paint.deny).toEqual(paint.approve)
+  expect(consoleErrors).toEqual([])
+})
+
+test("deny is one tap and says so on the way out", async () => {
+  await showApproval()
+
+  await page.locator("#deny").click()
+  expect(await agent.next()).toEqual({ type: "deny" })
+
+  await waitForOverlay(page)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Denied")
+  expect(await page.locator("#overlay-note").textContent()).toBe(
+    "The agent has been told not to do it. You can close this tab.",
+  )
+  await page.waitForTimeout(300)
+  expect(countOf("deny")).toBe(1)
+  expect(consoleErrors).toEqual([])
+})
+
+test("approve takes the hold, and a short press only explains", async () => {
+  await showApproval()
+
+  // The inversion of takeover mode: here the irreversible answer is yes, so
+  // yes is the one that costs a hold.
+  await pressAndHold("#approve", 300)
+  await page.waitForTimeout(400)
+  expect(countOf("approve")).toBe(0)
+  expect(await page.locator("#overlay").isHidden()).toBe(true)
+  expect(await page.locator("#hint").textContent()).toBe(APPROVAL_HOLD_HINT)
+
+  await pressAndHold("#approve", 900)
+  expect(await agent.next()).toEqual({ type: "approve" })
+  await waitForOverlay(page)
+  await page.waitForTimeout(400)
+  expect(countOf("approve")).toBe(1)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Approved")
+  expect(consoleErrors).toEqual([])
+})
+
+test("the screenshot zooms but nothing the human touches reaches the page", async () => {
+  await showApproval()
+  await showFrame()
+
+  const box = await page.locator("#view").boundingBox()
+  if (!box) throw new Error("canvas has no bounding box")
+  const centre = { x: box.width / 2, y: box.height / 2 }
+
+  await page.locator("#view").click({ position: centre })
+  await page.mouse.wheel(0, 200)
+  await page.waitForTimeout(300)
+  // Approval injects no input at all — not a tap, not a scroll, not a key.
+  expect(agent.received).toEqual([])
+
+  // It is still a screenshot of a page nobody can read at 29%, so the zoom
+  // gestures stay: a double tap magnifies it.
+  await page.locator("#view").dblclick({ position: centre })
+  await page.waitForTimeout(300)
+  expect((await zoomTransform(page)).scale).toBeGreaterThan(1.5)
+  expect(agent.received).toEqual([])
+  expect(consoleErrors).toEqual([])
+})
+
+test("an approval ending shows the matching terminal overlay", async () => {
+  await showApproval()
+
+  agent.send({ type: "ended", outcome: "approved" })
+
+  await waitForOverlay(page)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Approved")
+  expect(await page.locator("#overlay-note").textContent()).toBe(
+    "The agent has your approval and is continuing. You can close this tab.",
+  )
+  expect(consoleErrors).toEqual([])
+})
+
+test("an approval answered while the socket is closing still reaches the agent", async () => {
+  await showApproval(true)
+
+  // The gap this closes: `send` queues the answer because the socket is not
+  // open, `finish` marks the page done, and the socket's own close handler
+  // then used to stop reconnecting — with the answer still in the queue. The
+  // human saw "Denied" and the agent waited out its timeout.
+  const state = await answerWhileClosing("deny")
+  expect(state).toBe(WebSocket.CLOSING)
+
+  await waitForOverlay(page)
+  expect(await page.locator("#overlay-title").textContent()).toBe("Denied")
+  expect(await agent.next()).toEqual({ type: "deny" })
+  expect(consoleErrors).toEqual([])
+}, 20000)
+
+test("a hand back given while the socket is closing still reaches the agent", async () => {
+  // The same hole, on the mode that has had it since 0.3.0.
+  await reopenFixture("takeover", true)
+  await showFrame()
+
+  const state = await answerWhileClosing("handback")
+  expect(state).toBe(WebSocket.CLOSING)
+
+  await waitForOverlay(page)
+  expect(await agent.next()).toEqual({ type: "handback" })
+  expect(consoleErrors).toEqual([])
+}, 20000)
+
+test("one finger pans the approval screenshot and still sends nothing", async () => {
+  await showApproval()
+  await showFrame()
+
+  // At fit there is nowhere to pan to, so zoom in first.
+  const box = await page.locator("#view").boundingBox()
+  if (!box) throw new Error("canvas has no bounding box")
+  const centre = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+  await page.mouse.dblclick(centre.x, centre.y)
+  await page.waitForTimeout(300)
+  const before = await zoomTransform(page)
+  expect(before.scale).toBeGreaterThan(1.5)
+
+  // The one gesture that was re-purposed rather than disabled: in a takeover
+  // this drag scrolls the remote page, and here it may only move the picture.
+  await page.mouse.move(centre.x, centre.y)
+  await page.mouse.down()
+  await page.mouse.move(centre.x + 60, centre.y + 60, { steps: 6 })
+  await page.mouse.up()
+  await page.waitForTimeout(200)
+
+  const after = await zoomTransform(page)
+  expect(after.tx !== before.tx || after.ty !== before.ty).toBe(true)
+  expect(agent.received).toEqual([])
+  expect(consoleErrors).toEqual([])
+})
+
+/** The FLUSH_DEADLINE_MS the page uses, restated so a change to one is a red test. */
+const FLUSH_DEADLINE_MS = 30_000
+
+/** How many WebSockets the page has opened since it loaded (captureSockets). */
+function socketCount(target: Page): Promise<number> {
+  return target.evaluate(() => window.handraiseSockets?.length ?? 0)
+}
+
+test("the reconnect loop gives up flushing once its deadline passes", async () => {
+  // A finished page with a queued answer keeps reconnecting to deliver it. The
+  // backoff caps the wait between attempts, not their number, so against a
+  // relay the agent has already timed out and killed, the tab used to retry a
+  // dead host every 8s forever. The deadline caps the attempts.
+  //
+  // Deterministic, not a 30s wait: the page's clock is frozen, so every
+  // reconnect timer fires only when this test fast-forwards it, and the socket
+  // count is the attempt count.
+  await reopenFixture("takeover", true, true)
+  await showFrame()
+
+  // Kill the relay so every reconnect from here on fails, then wait for the
+  // page to notice its own socket drop (a network event, real even under the
+  // fake clock).
+  agent.close()
+  relay.process.kill("SIGKILL")
+  await page.waitForFunction(() => {
+    const dot = document.getElementById("dot")
+    return dot ? dot.className.includes("waiting") : false
+  })
+
+  // Answer while the socket is down: the message queues, and finish() starts
+  // the flush deadline. One socket has been opened so far — the initial one,
+  // now dead — and no reconnect has fired because its timer is frozen.
+  await page.locator("#handback").click()
+  await waitForOverlay(page)
+  const baseline = await socketCount(page)
+  expect(baseline).toBe(1)
+
+  // Well within the deadline: advance past the first backoff so a reconnect
+  // actually fires. It is the attempt that would flush the answer against a
+  // relay that had come back — proof the loop is still trying.
+  await page.clock.fastForward(2_000)
+  await page.waitForTimeout(150)
+  const during = await socketCount(page)
+  expect(during).toBeGreaterThan(baseline)
+
+  // Cross the deadline. The pending reconnect timer still fires, but connect()
+  // and onclose now see `finished && !stillSending()` and stop.
+  await page.clock.fastForward(FLUSH_DEADLINE_MS)
+  await page.waitForTimeout(150)
+  const atStop = await socketCount(page)
+
+  // Keep advancing: a dead host is no longer retried. The socket count is
+  // frozen — the loop has actually stopped, not merely slowed.
+  await page.clock.fastForward(60_000)
+  await page.waitForTimeout(200)
+  const after = await socketCount(page)
+  expect(after).toBe(atStop)
+
+  // The only console noise here is the browser's own "connection refused" for
+  // each reconnect against the relay this test deliberately killed — the page
+  // handles it (onerror closes the socket). Anything else is a real error.
+  const unexpected = consoleErrors.filter(
+    (line) => !line.includes("net::ERR_CONNECTION_REFUSED"),
+  )
+  expect(unexpected).toEqual([])
 }, 20000)

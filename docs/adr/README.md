@@ -13,6 +13,7 @@ pre-publish security review — they document the history, they do not invent it
 | [0003](0003-no-keep-alive-five-minute-wait.md) | No browser keep-alive, 5-minute default wait, storageState capture | accepted | [Measurement 04](../measurements/04-browser-session-lifetime.md) |
 | [0004](0004-separate-agent-secret-closed-message-set.md) | Agent role via a separate secret, and a closed human message set | accepted | Security review |
 | [0005](0005-handoff-not-wall-detection.md) | handraise is the handoff mechanism, not the wall detection | accepted | Scope decision |
+| [0006](0006-approval-mode.md) | Approval mode: one screenshot, a hold on yes | accepted | Scope decision |
 
 ## Format
 

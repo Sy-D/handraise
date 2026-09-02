@@ -14,7 +14,7 @@ import { connect as netConnect, type Socket } from "node:net"
 import type { Readable } from "node:stream"
 import { fileURLToPath } from "node:url"
 import WebSocket from "ws"
-
+import type { HandoffMode } from "../types"
 import { GUEST_SERVER_JS } from "./guest-source"
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -59,13 +59,21 @@ function parse(raw: string): RelayMessage {
 /** Processes spawned by an individual test; torn down in afterEach. */
 const extraProcesses: ChildProcessByStdio<null, Readable, Readable>[] = []
 
-/** Start the real server on an OS-assigned port and read the port back out of its log. */
-function startRelayProcess(agentKey?: string): Promise<Relay> {
-  const args = agentKey ? [SERVER_PATH, "0", agentKey] : [SERVER_PATH, "0"]
+/**
+ * Start the real server on an OS-assigned port and read the port back out of
+ * its log. `mode` is argv and not a message: what the human may send is fixed
+ * when the relay boots, so it cannot be talked out of it afterwards.
+ */
+function startRelayProcess(
+  agentKey?: string,
+  mode?: HandoffMode,
+): Promise<Relay> {
+  const args = [SERVER_PATH, "0", agentKey ?? ""]
+  if (mode) args.push(mode)
   const child = spawn(process.execPath, args, {
     stdio: ["ignore", "pipe", "pipe"],
   })
-  if (agentKey) extraProcesses.push(child)
+  if (agentKey || mode) extraProcesses.push(child)
   return new Promise<Relay>((resolve, reject) => {
     const timer = setTimeout(() => {
       child.kill("SIGKILL")
@@ -137,6 +145,49 @@ async function connect(port: number, role: "agent" | "human"): Promise<Client> {
       })
     },
   }
+}
+
+/**
+ * Resolve when the relay logs a given event with the given fields. The relay
+ * writes one JSON line per event to stdout; this reads them. Arm it before the
+ * action that causes the event, so the line cannot land before we are looking.
+ *
+ * `agent.closed` only tells us the client's socket is down — the server may not
+ * have run its close handler yet. When a test's next step depends on that
+ * handler having run (a scrubbed buffer, a freed role), wait for its log line
+ * instead of the client close, or the two race.
+ */
+function waitForLog(
+  relay: Relay,
+  event: string,
+  fields: Record<string, string>,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let buffered = ""
+    const onData = (chunk: Buffer): void => {
+      buffered += chunk.toString("utf8")
+      for (const line of buffered.split("\n")) {
+        if (!line.includes(`"event":"${event}"`)) continue
+        const all = Object.entries(fields).every(([key, value]) =>
+          line.includes(`"${key}":"${value}"`),
+        )
+        if (all) {
+          cleanup()
+          resolve()
+          return
+        }
+      }
+    }
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`no ${event} log within ${MESSAGE_TIMEOUT_MS}ms`))
+    }, MESSAGE_TIMEOUT_MS)
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      relay.process.stdout.removeListener("data", onData)
+    }
+    relay.process.stdout.on("data", onData)
+  })
 }
 
 let relay: Relay
@@ -453,4 +504,151 @@ test("a replaced agent can no longer inject messages", async () => {
   expect(reasons).toContain("legit")
   expect(reasons).not.toContain("injected")
   stale.socket.destroy()
+})
+
+test("approval mode drops every takeover message the human sends", async () => {
+  const approval = await startRelayProcess("", "approval")
+  const agent = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  // Hiding the controls is not enough: the human's socket is reachable from
+  // any HTTP client, so the refusal has to be the relay's, not the page's.
+  human.send({ type: "tap", fx: 10, fy: 10 })
+  human.send({ type: "char", ch: "a" })
+  human.send({ type: "key", key: "Enter" })
+  human.send({ type: "clear" })
+  human.send({ type: "scroll", fdy: 40 })
+  human.send({ type: "handback" })
+  human.send({ type: "abort" })
+  // Only this one is in the approval vocabulary, and it arrives after all of
+  // them, so receiving it proves the others were dropped and not merely slow.
+  human.send({ type: "approve" })
+
+  expect(await agent.next()).toEqual({ type: "approve" })
+})
+
+test("takeover mode drops the approval answers", async () => {
+  const agent = await connect(relay.port, "agent")
+  const human = await connect(relay.port, "human")
+
+  human.send({ type: "approve" })
+  human.send({ type: "deny" })
+  human.send({ type: "handback" })
+
+  expect(await agent.next()).toEqual({ type: "handback" })
+})
+
+test("an approval relay serves the page in approval mode", async () => {
+  const approval = await startRelayProcess("", "approval")
+
+  const page = await fetch(`http://127.0.0.1:${approval.port}/`)
+  const html = await page.text()
+  expect(html).toContain('data-mode="approval"')
+  // The same file serves both modes, so an approval page that still offered
+  // the keyboard would render controls the relay refuses to route.
+  expect(html).toContain("Hold to approve")
+})
+
+test("a deny reaches an agent that reconnects after the human sent it", async () => {
+  const approval = await startRelayProcess("", "approval")
+  const first = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  first.socket.close()
+  await first.closed
+  human.send({ type: "deny" })
+
+  const second = await connect(approval.port, "agent")
+  expect(await second.next()).toEqual({ type: "deny" })
+})
+
+test("the first terminal answer wins, and a second holder cannot overturn it", async () => {
+  // The handoff link is a bearer URL and may be shared. Two people can hold it
+  // at once, and the relay hands the agent whichever answer arrived while it
+  // was away — so the second one must not be able to overwrite a denial with
+  // an approval.
+  const approval = await startRelayProcess("", "approval")
+  const first = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  first.socket.close()
+  await first.closed
+  human.send({ type: "deny" })
+  human.send({ type: "approve" })
+
+  const second = await connect(approval.port, "agent")
+  expect(await second.next()).toEqual({ type: "deny" })
+  // And nothing else: the approval was dropped, not queued behind it.
+  await expect(second.next()).rejects.toThrow(/no message/)
+})
+
+test("a takeover answer is terminal too: an abort cannot follow a handback", async () => {
+  const agent = await connect(relay.port, "agent")
+  const human = await connect(relay.port, "human")
+
+  human.send({ type: "handback" })
+  human.send({ type: "abort" })
+  human.send({ type: "tap", fx: 1, fy: 2 })
+
+  expect(await agent.next()).toEqual({ type: "handback" })
+  await expect(agent.next()).rejects.toThrow(/no message/)
+})
+
+test("an agent frame after the human answered is not replayed to a late human", async () => {
+  const approval = await startRelayProcess("", "approval")
+  const agent = await connect(approval.port, "agent")
+  const human = await connect(approval.port, "human")
+
+  agent.send({ type: "state", reason: "may I pay this invoice?" })
+  agent.send({ type: "frame", data: "c2NyZWVuc2hvdA==", meta: META })
+  expect(await human.next()).toEqual({
+    type: "state",
+    reason: "may I pay this invoice?",
+  })
+  human.send({ type: "deny" })
+  expect(await agent.next()).toEqual({ type: "deny" })
+
+  // A reconnecting agent re-sends what it has. The handoff is over, so none of
+  // it may go back into the replay buffer the next visitor is served from.
+  agent.send({ type: "state", reason: "may I pay this invoice?" })
+  agent.send({ type: "frame", data: "c2NyZWVuc2hvdA==", meta: META })
+  await Bun.sleep(150)
+
+  const late = await connect(approval.port, "human")
+  await expect(late.next()).rejects.toThrow(/no message/)
+})
+
+test("the replay buffer is dropped when the agent disconnects, and restored when it returns", async () => {
+  // If the agent dies without delivering its `ended` — a timeout during an
+  // outage, a killed process — the relay would otherwise keep serving the
+  // page's last frame to anyone holding the link until the sandbox idles out.
+  const agent = await connect(relay.port, "agent")
+  agent.send({ type: "state", reason: "Aurora Bank is asking for a code" })
+  agent.send({ type: "frame", data: "Zmlyc3QtZnJhbWU=", meta: META })
+  const human = await connect(relay.port, "human")
+  expect(await human.next()).toEqual({
+    type: "state",
+    reason: "Aurora Bank is asking for a code",
+  })
+
+  // Arm the wait before the close so the log line cannot slip past us, then
+  // wait for the server to have run its close handler — not just the client
+  // socket to be down — before a late human can prove the buffer is gone.
+  const scrubbed = waitForLog(relay, "peer closed", { role: "agent" })
+  agent.socket.close()
+  await agent.closed
+  await scrubbed
+  const late = await connect(relay.port, "human")
+  await expect(late.next()).rejects.toThrow(/no message/)
+
+  // A handoff that is still running recovers on its own: the agent reconnects
+  // and re-sends its state, and the next visitor sees it again.
+  const back = await connect(relay.port, "agent")
+  back.send({ type: "state", reason: "Aurora Bank is asking for a code" })
+  await Bun.sleep(150)
+  const later = await connect(relay.port, "human")
+  expect(await later.next()).toEqual({
+    type: "state",
+    reason: "Aurora Bank is asking for a code",
+  })
 })

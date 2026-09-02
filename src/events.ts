@@ -11,13 +11,19 @@
  * It never carries a secret: no `pt_token`, no API key, no frame bytes, no
  * characters the human typed.
  */
-import type { HandoffOutcome } from "./types"
+import type { HandoffMode, HandoffOutcome } from "./types"
 
 export interface HandoffEvent {
   /** Correlates the event with the relay's own logs (the preview subdomain). */
   handoffId: string
   /** How the handoff ended. */
   outcome: HandoffOutcome
+  /**
+   * What the human was asked for: `takeover` (drive the browser) or
+   * `approval` (answer yes or no about one screenshot). Which outcomes,
+   * frame counts and input counts are possible follows from it.
+   */
+  mode: HandoffMode
   /** The `reason` the agent gave, verbatim — this is shown to the human too. */
   reason: string
   /** The wait budget that was in force, in ms. */
@@ -28,11 +34,18 @@ export interface HandoffEvent {
   relayColdStartMs: number
   /** Time from handoff start until the first frame was sent, in ms. */
   firstFrameMs?: number
-  /** Frames handed to the relay over the handoff. */
+  /**
+   * Frames handed to the relay over the handoff. In approval mode this is the
+   * one screenshot, sent once per connection because a reconnecting agent has
+   * to put it back on the wire: `1 + reconnects`.
+   */
   framesSent: number
   /** Sum of the base64 frame-payload lengths sent, in bytes. */
   bytesSent: number
-  /** Taps, characters, keys and scrolls the human applied to the page. */
+  /**
+   * Taps, characters, keys and scrolls the human applied to the page. Always 0
+   * in approval mode, which injects nothing.
+   */
   inputsApplied: number
   /** Agent-socket reconnects during the handoff (the 60 s idle cut, drops). */
   reconnects: number

@@ -16,6 +16,7 @@ import {
 } from "@solarisdk/sdk"
 
 import { type Logger, quietLogger } from "../logger"
+import type { HandoffMode } from "../types"
 import { GUEST_SERVER_JS } from "./guest-source"
 import { RELAY_PORT } from "./protocol"
 
@@ -50,6 +51,12 @@ const KILL_ATTEMPTS = 4
 
 export interface StartRelayOptions {
   apiKey: string
+  /**
+   * What the relay lets the human do: drive the browser (`takeover`, the
+   * default) or answer one question (`approval`). It is baked into the guest
+   * process at boot, so the human's socket cannot talk it into the other set.
+   */
+  mode?: HandoffMode
   /** Sandbox idle window in ms. Default: 20 minutes. */
   timeoutMs?: number
   /** Gateway base URL. Defaults to the SDK's `https://api.getsolari.com`. */
@@ -172,6 +179,16 @@ export async function startRelay(
   // to `agentWsUrl` alone, never to the human's link, so possession of the
   // handoff URL cannot be used to read the human's keystrokes.
   const agentKey = randomUUID()
+  // Fixed at boot, never taken from a message: the relay's whole job in
+  // approval mode is to refuse what the takeover UI would have sent.
+  //
+  // Constructed here rather than passed through, because it is interpolated
+  // into the `sh -c` line below. `raiseHand` already rejects anything that is
+  // not one of these two words, and TypeScript closes it for its own callers,
+  // but this package ships as JavaScript: the value that reaches a shell is
+  // one of two literals written in this file, whatever the caller supplied.
+  const mode: HandoffMode =
+    options.mode === "approval" ? "approval" : "takeover"
   const sandbox = await createSandbox(client, timeoutMs)
 
   let killed = false
@@ -211,7 +228,7 @@ export async function startRelay(
     await sandbox.commands.run("sh", {
       args: [
         "-c",
-        `nohup node ${GUEST_PATH} ${RELAY_PORT} ${agentKey} >${GUEST_LOG} 2>&1 & sleep 0.2; echo started`,
+        `nohup node ${GUEST_PATH} ${RELAY_PORT} ${agentKey} ${mode} >${GUEST_LOG} 2>&1 & sleep 0.2; echo started`,
       ],
     })
 

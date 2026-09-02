@@ -24,10 +24,22 @@
 import { Solari } from "@solarisdk/browser"
 import type { Page } from "playwright-core"
 
+import type { HandoffEvent } from "../src/events"
 import { raiseHand } from "../src/index"
 import { startTestApp } from "../test-app/deploy"
 import { msUntilNextStep, totp } from "../test-app/totp"
 import { openHandoffPage } from "./human-sim"
+
+declare global {
+  interface Window {
+    /** Installed by the approval cases; see `watchForInput` below. */
+    handraiseInputCounts?: {
+      pointerdown: number
+      keydown: number
+      input: number
+    }
+  }
+}
 
 const FAULT = process.env.HANDRAISE_E2E_FAULT ?? ""
 const VIEWPORT = { width: 1280, height: 800 }
@@ -230,6 +242,131 @@ try {
     `the relay sandbox is gone (${relayGone.status})`,
   )
   await relayGone.text()
+
+  // --- Approval: the human answers a question, and drives nothing --------
+  //
+  // The other half of the product. No screencast, no input path: one
+  // screenshot, the action in words, and a yes or a no.
+  const APPROVAL_ACTION = "Transfer EUR 12,430.00 to Acme GmbH"
+
+  async function askApproval(answer: "approve" | "deny"): Promise<void> {
+    const askedAt = Date.now()
+    let approvalUrl = ""
+    let event: HandoffEvent | undefined
+    const asking = raiseHand(page, {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: APPROVAL_ACTION,
+      qr: false,
+      timeoutMs: 60_000,
+      onUrl: (url) => {
+        approvalUrl = url
+      },
+      onEvent: (raised) => {
+        event = raised
+      },
+    })
+    pending = asking
+
+    while (approvalUrl === "") await Bun.sleep(50)
+    const human = await openHandoffPage(approvalUrl)
+    await human.waitForFrame()
+    check(
+      human.action() === APPROVAL_ACTION,
+      `the phone shows the action verbatim (${answer})`,
+    )
+    check(
+      human.reason() === "The agent may not move money without a human",
+      `the phone shows the reason (${answer})`,
+    )
+
+    // Approval injects nothing, and this is the only place that can be proven
+    // against the real page: count what the page itself would see if a tap or
+    // a keystroke ever landed on it. `inputsApplied` cannot fail — there is no
+    // input target in approval mode — but these listeners can.
+    await page.evaluate(() => {
+      const counts = { pointerdown: 0, keydown: 0, input: 0 }
+      window.handraiseInputCounts = counts
+      document.addEventListener(
+        "pointerdown",
+        () => {
+          counts.pointerdown += 1
+        },
+        true,
+      )
+      document.addEventListener(
+        "keydown",
+        () => {
+          counts.keydown += 1
+        },
+        true,
+      )
+      document.addEventListener(
+        "input",
+        () => {
+          counts.input += 1
+        },
+        true,
+      )
+    })
+    await human.tap(10, 10)
+    await human.type("9", 0)
+    await Bun.sleep(500)
+
+    if (answer === "approve") await human.approve()
+    else await human.deny()
+
+    const result = await asking
+    pending = null
+    timings[`approval${answer}Ms`] = Date.now() - askedAt
+    log("approval_done", {
+      answer,
+      outcome: result.outcome,
+      durationMs: result.durationMs,
+      frames: human.frameCount(),
+      ms: timings[`approval${answer}Ms`],
+    })
+
+    const expected = answer === "approve" ? "approved" : "denied"
+    check(
+      result.outcome === expected,
+      `an approval answered with ${answer} reports ${expected}`,
+    )
+    const counts = await page.evaluate(() => window.handraiseInputCounts)
+    check(
+      counts?.pointerdown === 0 && counts?.keydown === 0 && counts?.input === 0,
+      `the page saw no pointer, key or input event (${JSON.stringify(counts)})`,
+    )
+    check(
+      human.frameCount() === 1 + (event?.reconnects ?? 0),
+      `the phone got the screenshot once per connection (${human.frameCount()} frames, ${event?.reconnects} reconnects)`,
+    )
+    check(result.storageState === undefined, "an approval captures no cookies")
+    check(event?.mode === "approval", "the wide event carries the mode")
+    check(event?.inputsApplied === 0, "the wide event reports no input applied")
+    check(
+      event?.framesSent === 1 + (event?.reconnects ?? 0),
+      `the wide event counts one frame per connection (${event?.framesSent} frames, ${event?.reconnects} reconnects)`,
+    )
+    // Deliberately observed and not asserted. The ending is relayed while the
+    // relay sandbox is already being destroyed, and an approval tears down in
+    // milliseconds — there is no storageState capture to hold the door open,
+    // as there is in the takeover case above, which does assert it. A phone
+    // that answered does not depend on this message: it shows its own ending
+    // the moment the human taps. A second viewer of the link does, and that
+    // path is covered offline, where the relay is not being killed underneath
+    // it: relay.test.ts "a human who joins after the handoff ended sees the
+    // ending, not the frame" and the ui.spec terminal-overlay tests.
+    log("phone_ending", { seen: human.ending() ?? "none", expected })
+    await human.close()
+
+    const gone = await fetch(approvalUrl, { cache: "no-store" })
+    await gone.text()
+    check(gone.status !== 200, `the approval relay is gone (${gone.status})`)
+  }
+
+  await askApproval("approve")
+  await askApproval("deny")
 
   // --- The cheap second case: nobody comes -------------------------------
   const timeoutAt = Date.now()
