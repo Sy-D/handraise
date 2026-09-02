@@ -15,12 +15,19 @@
 import { readFileSync, writeFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
-const SOURCE = fileURLToPath(new URL("../src/relay/guest/server.js", import.meta.url))
-const TARGET = fileURLToPath(new URL("../src/relay/guest-source.ts", import.meta.url))
+const SOURCE = fileURLToPath(
+  new URL("../src/relay/guest/server.js", import.meta.url),
+)
+const TARGET = fileURLToPath(
+  new URL("../src/relay/guest-source.ts", import.meta.url),
+)
 
 /** Make the file safe to sit inside a TypeScript template literal. */
 function escapeForTemplate(source: string): string {
-  return source.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${")
+  return source
+    .replace(/\\/g, "\\\\")
+    .replace(/`/g, "\\`")
+    .replace(/\$\{/g, "\\${")
 }
 
 function render(source: string): string {

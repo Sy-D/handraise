@@ -11,6 +11,8 @@
       "e2e/**",
       "test-app/**",
       "demo/**",
+      "tsup.config.ts",
+      "scripts/**",
       "*.json",
       "!demo/.session.json"
     ]

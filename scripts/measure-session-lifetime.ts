@@ -15,7 +15,8 @@ if (!apiKey) throw new Error("SOLARI_API_KEY is not set")
 
 const solari = new Solari({ apiKey })
 const t0 = Date.now()
-const log = (m: string) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s] ${m}`)
+const log = (m: string) =>
+  console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s] ${m}`)
 
 const status = async (id: string, label: string) => {
   const res = await solari.request("GET", `/sessions/${encodeURIComponent(id)}`)
