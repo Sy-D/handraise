@@ -304,6 +304,13 @@ try {
     check(event?.mode === "approval", "the wide event carries the mode")
     check(event?.inputsApplied === 0, "no input was applied to the page")
     check(event?.framesSent === 1, "the wide event counts the one frame")
+    // The `ended` message is written as the handoff settles, so it can still
+    // be in flight when raiseHand returns — an approval tears down in
+    // milliseconds. Wait for it rather than race it.
+    const endingDeadline = Date.now() + 5_000
+    while (human.ending() === null && Date.now() < endingDeadline) {
+      await Bun.sleep(50)
+    }
     check(human.ending() === expected, "the phone was told how it ended")
     await human.close()
 
