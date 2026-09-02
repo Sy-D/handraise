@@ -44,27 +44,72 @@ const PORT = Number(process.argv[2] || process.env.HANDRAISE_RELAY_PORT || 3000)
 const AGENT_KEY = process.argv[3] || process.env.HANDRAISE_AGENT_KEY || ""
 
 /**
+ * Every message type on the wire, in both directions, named once.
+ *
+ * This file is plain JavaScript, so comparing a message against a bare quoted
+ * string is unchecked: a typo is not a compile error, it is a message that is
+ * silently never matched. The literal unions in src/relay/protocol.ts do that
+ * work for the rest of the codebase; these constants are their counterpart
+ * here, and \`relay.test.ts\` asserts the two sets against each other so neither
+ * can grow a member alone.
+ *
+ * The mobile page below gets this same object injected at serve time — one
+ * definition for the relay and the page it serves, never two that can drift.
+ */
+const MSG = {
+  // agent -> human
+  FRAME: "frame",
+  STATE: "state",
+  FOCUS: "focus",
+  ENDED: "ended",
+  // human -> agent
+  TAP: "tap",
+  CHAR: "char",
+  KEY: "key",
+  CLEAR: "clear",
+  SCROLL: "scroll",
+  HANDBACK: "handback",
+  ABORT: "abort",
+  APPROVE: "approve",
+  DENY: "deny",
+  // either direction
+  PING: "ping",
+  PONG: "pong",
+}
+
+/** The two things a handoff can ask of a human. */
+const MODE = { TAKEOVER: "takeover", APPROVAL: "approval" }
+
+/**
  * What this handoff asks of the human: \`takeover\` (drive the page) or
  * \`approval\` (answer one question about one screenshot). It arrives as argv
  * and never as a message, so no client can talk the relay into the other set.
  */
-const MODE =
-  (process.argv[4] || process.env.HANDRAISE_MODE) === "approval"
-    ? "approval"
-    : "takeover"
+const HANDOFF_MODE =
+  (process.argv[4] || process.env.HANDRAISE_MODE) === MODE.APPROVAL
+    ? MODE.APPROVAL
+    : MODE.TAKEOVER
 
 /** The human messages this relay forwards. Everything else from that side is dropped. */
 const HUMAN_MESSAGES = new Set(
-  MODE === "approval"
-    ? ["approve", "deny"]
-    : ["tap", "char", "key", "clear", "scroll", "handback", "abort"],
+  HANDOFF_MODE === MODE.APPROVAL
+    ? [MSG.APPROVE, MSG.DENY]
+    : [
+        MSG.TAP,
+        MSG.CHAR,
+        MSG.KEY,
+        MSG.CLEAR,
+        MSG.SCROLL,
+        MSG.HANDBACK,
+        MSG.ABORT,
+      ],
 )
 
 /**
  * The human messages that end a handoff, in either mode. They are held for an
  * agent that is not connected at the moment, and they stop the frame replay.
  */
-const TERMINAL_HUMAN = new Set(["handback", "abort", "approve", "deny"])
+const TERMINAL_HUMAN = new Set([MSG.HANDBACK, MSG.ABORT, MSG.APPROVE, MSG.DENY])
 
 /** Must equal HEARTBEAT_INTERVAL_MS in src/relay/protocol.ts (asserted in relay.test.ts). */
 const HEARTBEAT_INTERVAL_MS = 20000
@@ -82,7 +127,7 @@ const MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 /** Grace before a replaced/closed socket is force-destroyed if it hangs on. */
 const CLOSE_GRACE_MS = 1000
 
-const PONG = JSON.stringify({ type: "pong" })
+const PONG = JSON.stringify({ type: MSG.PONG })
 
 /** role -> peer. At most one connection per role; a new one replaces the old. */
 const peers = new Map()
@@ -288,7 +333,7 @@ function messageType(payload) {
 
 /** Keep what a human who joins late has to be shown, and drop what they must not. */
 function rememberFromAgent(type, payload) {
-  if (type === "ended") {
+  if (type === MSG.ENDED) {
     // Terminal: keep the ending for a late human, drop everything that could
     // show the logged-in page to whoever opens the link next.
     lastEnded = payload
@@ -301,9 +346,9 @@ function rememberFromAgent(type, payload) {
   // Forwarding that is harmless; storing it would put the page back in front
   // of the next visitor after this relay decided to drop it.
   if (humanEnded) return
-  if (type === "frame") lastFrame = payload
-  else if (type === "state") lastState = payload
-  else if (type === "focus") lastFocus = payload
+  if (type === MSG.FRAME) lastFrame = payload
+  else if (type === MSG.STATE) lastState = payload
+  else if (type === MSG.FOCUS) lastFocus = payload
 }
 
 /** One line per relay at most: a hostile client must not be able to fill the log. */
@@ -314,7 +359,7 @@ function logDrop(type) {
   dropLogged = true
   log("human message dropped", {
     type: String(type).slice(0, 32),
-    mode: MODE,
+    mode: HANDOFF_MODE,
     ended: humanEnded,
   })
 }
@@ -353,7 +398,7 @@ function route(peer, payload, opcode) {
     return
   }
   const type = messageType(payload)
-  if (type === "ping") {
+  if (type === MSG.PING) {
     sendText(peer, PONG)
     return
   }
@@ -361,7 +406,7 @@ function route(peer, payload, opcode) {
   else if (!acceptFromHuman(type, payload)) return
   // Newest frame wins: drop a frame bound for a backpressured receiver rather
   // than queue it in memory. Control and terminal messages are never dropped.
-  if (type === "frame" && other?.backpressure) return
+  if (type === MSG.FRAME && other?.backpressure) return
   write(other, payload, opcode)
 }
 
@@ -374,6 +419,19 @@ function log(event, detail) {
       human: peers.has("human"),
       ...detail,
     }),
+  )
+}
+
+/**
+ * The mobile page, with this relay's two facts substituted in: which mode it
+ * is serving, and the wire vocabulary. The page never spells a message type
+ * itself — it reads \`MSG\` out of the same object the router above uses, so a
+ * type that is renamed in one place cannot survive in the other.
+ */
+function renderPage() {
+  return PAGE.replace("__HANDRAISE_MODE__", HANDOFF_MODE).replace(
+    "__HANDRAISE_VOCAB__",
+    JSON.stringify({ msg: MSG, mode: MODE }),
   )
 }
 
@@ -392,9 +450,9 @@ const server = createServer((req, res) => {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
     })
-    // MODE is one of two literals, so this substitution can only produce the
-    // two pages this file was written for.
-    res.end(PAGE.replace("__HANDRAISE_MODE__", MODE))
+    // HANDOFF_MODE is one of two literals, so this substitution can only
+    // produce the two pages this file was written for.
+    res.end(renderPage())
     return
   }
   res.writeHead(404, {
@@ -503,7 +561,7 @@ server.listen(PORT, "0.0.0.0", () => {
   // Report the bound port, not the requested one: port 0 asks the OS to pick a
   // free one, which is how the local test suite avoids fighting for 3000.
   const bound = server.address()
-  log("relay listening", { port: bound?.port ?? PORT, mode: MODE })
+  log("relay listening", { port: bound?.port ?? PORT, mode: HANDOFF_MODE })
 })
 
 const PAGE = \`<!doctype html>
@@ -1006,15 +1064,36 @@ const PAGE = \`<!doctype html>
   var actionEl = document.getElementById("action")
 
   /**
+   * The wire vocabulary, injected by the relay that served this page from the
+   * one definition at the top of server.js. Not a copy: a message type renamed
+   * up there is renamed here in the same edit, and relay.test.ts asserts both
+   * against the TypeScript protocol.
+   */
+  var VOCAB = __HANDRAISE_VOCAB__
+  var MSG = VOCAB.msg
+  var MODE = VOCAB.mode
+
+  /**
    * Takeover or approval, decided by the relay that served this page. In
    * approval mode the human is answering a question about one screenshot, not
    * driving anything: the input row and the key bar are not on the page, and
    * the two messages below are the only ones this side can produce.
    */
-  var APPROVAL = document.body.dataset.mode === "approval"
-  var SENDABLE = APPROVAL
-    ? { approve: 1, deny: 1, ping: 1 }
-    : { tap: 1, char: 1, key: 1, clear: 1, scroll: 1, handback: 1, abort: 1, ping: 1 }
+  var APPROVAL = document.body.dataset.mode === MODE.APPROVAL
+  var SENDABLE = {}
+  ;(APPROVAL
+    ? [MSG.APPROVE, MSG.DENY, MSG.PING]
+    : [
+        MSG.TAP,
+        MSG.CHAR,
+        MSG.KEY,
+        MSG.CLEAR,
+        MSG.SCROLL,
+        MSG.HANDBACK,
+        MSG.ABORT,
+        MSG.PING
+      ]
+  ).forEach(function (type) { SENDABLE[type] = 1 })
 
   var ws = null
   var retries = 0
@@ -1096,7 +1175,7 @@ const PAGE = \`<!doctype html>
       return
     }
     // A heartbeat is only worth anything now. Replaying it later says nothing.
-    if (message.type === "ping") return
+    if (message.type === MSG.PING) return
     if (outbox.length >= MAX_QUEUED) {
       outbox.shift()
       dropped++
@@ -1544,7 +1623,7 @@ const PAGE = \`<!doctype html>
     // the wheel delta the agent forwards is the inverse of the finger movement.
     // Divided by the zoom, or a magnified page would scroll magnified too.
     var fdy = Math.round((-stepped * frameH) / (box.h * view.scale))
-    if (fdy !== 0) send({ type: "scroll", fdy: fdy })
+    if (fdy !== 0) send({ type: MSG.SCROLL, fdy: fdy })
   }
 
   canvas.addEventListener("pointerdown", function (e) {
@@ -1640,7 +1719,7 @@ const PAGE = \`<!doctype html>
     if (APPROVAL) return
     var point = toFrame(e.clientX, e.clientY)
     if (!point) return
-    send({ type: "tap", fx: point.x, fy: point.y })
+    send({ type: MSG.TAP, fx: point.x, fy: point.y })
     markTap(e.clientX, e.clientY)
   })
   canvas.addEventListener("pointercancel", function (e) {
@@ -1658,8 +1737,8 @@ const PAGE = \`<!doctype html>
     while (shared < mirrored.length && shared < next.length && mirrored[shared] === next[shared]) {
       shared++
     }
-    for (var back = mirrored.length; back > shared; back--) send({ type: "key", key: "Backspace" })
-    for (var i = shared; i < next.length; i++) send({ type: "char", ch: next[i] })
+    for (var back = mirrored.length; back > shared; back--) send({ type: MSG.KEY, key: "Backspace" })
+    for (var i = shared; i < next.length; i++) send({ type: MSG.CHAR, ch: next[i] })
     mirrored = next
   })
   // The mirror and the field are one state: writing kbd.value fires no input
@@ -1672,13 +1751,13 @@ const PAGE = \`<!doctype html>
   kbd.addEventListener("keydown", function (e) {
     if (e.key === "Enter") {
       e.preventDefault()
-      send({ type: "key", key: "Enter" })
+      send({ type: MSG.KEY, key: "Enter" })
       resetMirror()
       return
     }
     // An empty field fires no input event, so this is the only signal that the
     // human wants to delete a character the remote page still holds.
-    if (e.key === "Backspace" && kbd.value === "") send({ type: "key", key: "Backspace" })
+    if (e.key === "Backspace" && kbd.value === "") send({ type: MSG.KEY, key: "Backspace" })
   })
 
   /**
@@ -1721,20 +1800,20 @@ const PAGE = \`<!doctype html>
       kbd.value = kbd.value.slice(0, -1)
       mirrored = kbd.value
     }
-    send({ type: "key", key: "Backspace" })
+    send({ type: MSG.KEY, key: "Backspace" })
   })
   var clearKey = keyButton("key-clear", function () {
-    send({ type: "clear" })
+    send({ type: MSG.CLEAR })
     resetMirror()
   })
   // Tab moves to another field, Enter usually submits: either way what the
   // human types next belongs to a different context than what is mirrored here.
   keyButton("key-tab", function () {
-    send({ type: "key", key: "Tab" })
+    send({ type: MSG.KEY, key: "Tab" })
     resetMirror()
   })
   keyButton("key-enter", function () {
-    send({ type: "key", key: "Enter" })
+    send({ type: MSG.KEY, key: "Enter" })
     resetMirror()
   })
 
@@ -1841,11 +1920,11 @@ const PAGE = \`<!doctype html>
     // is; approve is the hold, because it is the one that cannot be undone.
     // That is the takeover's rule with the sides swapped, for the same reason.
     document.getElementById("deny").addEventListener("click", function () {
-      send({ type: "deny" })
+      send({ type: MSG.DENY })
       finish(ENDINGS.denied[0], ENDINGS.denied[1])
     })
     holdButton(document.getElementById("approve"), function () {
-      send({ type: "approve" })
+      send({ type: MSG.APPROVE })
       finish(ENDINGS.approved[0], ENDINGS.approved[1])
     })
   } else {
@@ -1853,11 +1932,11 @@ const PAGE = \`<!doctype html>
     // spirit: the agent looks, fails and asks again. Confirming the happy path
     // is the classic mistake, so this stays a single tap.
     document.getElementById("handback").addEventListener("click", function () {
-      send({ type: "handback" })
+      send({ type: MSG.HANDBACK })
       finish(ENDINGS.resolved[0], ENDINGS.resolved[1])
     })
     holdButton(document.getElementById("abort"), function () {
-      send({ type: "abort" })
+      send({ type: MSG.ABORT })
       finish("Thanks for looking", "The agent knows it can't be done here and will stop. You can close this tab.")
     })
   }
@@ -1866,14 +1945,14 @@ const PAGE = \`<!doctype html>
     var message
     try { message = JSON.parse(raw) } catch (err) { return }
     if (!message) return
-    if (message.type === "frame") showFrame(message.data, message.meta)
-    else if (message.type === "state") {
+    if (message.type === MSG.FRAME) showFrame(message.data, message.meta)
+    else if (message.type === MSG.STATE) {
       reason.textContent = message.reason
       // textContent, never innerHTML: the action is the agent's own sentence,
       // and it goes on the screen a decision is made from.
       if (message.action) actionEl.textContent = message.action
     }
-    else if (message.type === "focus") {
+    else if (message.type === MSG.FOCUS) {
       focus = readFocus(message)
       applyKind(focus.rect ? focus.kind : "text")
       placeRing()
@@ -1881,7 +1960,7 @@ const PAGE = \`<!doctype html>
       setHint()
       setClearEnabled()
     }
-    else if (message.type === "ended") {
+    else if (message.type === MSG.ENDED) {
       var ending = ENDINGS[message.outcome] || ["Session ended", "You can close this tab."]
       finish(ending[0], ending[1])
     }
@@ -1944,7 +2023,7 @@ const PAGE = \`<!doctype html>
     setHint()
   }
   applyTransform(false)
-  setInterval(function () { send({ type: "ping" }) }, 20000)
+  setInterval(function () { send({ type: MSG.PING }) }, 20000)
   window.addEventListener("resize", render)
   // The stage also changes size without the window doing so: a longer reason
   // takes the header to its second line. The letterbox has to follow.

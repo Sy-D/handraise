@@ -17,7 +17,10 @@ import WebSocket from "ws"
 import type { HandoffMode } from "../types"
 import { GUEST_SERVER_JS } from "./guest-source"
 import {
+  type AgentToHuman,
   HEARTBEAT_INTERVAL_MS,
+  type Heartbeat,
+  type HumanToAgent,
   RELAY_PORT,
   type RelayMessage,
 } from "./protocol"
@@ -382,6 +385,78 @@ test("the guest server honours the protocol constants", () => {
   )
   expect(GUEST_SERVER_JS).toContain(`}, ${HEARTBEAT_INTERVAL_MS})`)
   expect(GUEST_SERVER_JS).toContain(`|| ${RELAY_PORT})`)
+})
+
+// --- the wire vocabulary: one set, three places ----------------------------
+
+/**
+ * The constant name `guest/server.js` must give every message type on the
+ * wire, keyed by the protocol's own unions.
+ *
+ * The annotation is a mapped type over all three, so a member added to
+ * `AgentToHuman`, `HumanToAgent` or `Heartbeat` does not compile here until it
+ * is listed — and does not go green until the relay names it too. That is the
+ * point: the relay is untyped JavaScript, where a mistyped `"framme"` is not a
+ * compile error but a message that is silently never matched.
+ */
+const WIRE_NAMES = {
+  frame: "FRAME",
+  state: "STATE",
+  focus: "FOCUS",
+  ended: "ENDED",
+  tap: "TAP",
+  char: "CHAR",
+  key: "KEY",
+  clear: "CLEAR",
+  scroll: "SCROLL",
+  handback: "HANDBACK",
+  abort: "ABORT",
+  approve: "APPROVE",
+  deny: "DENY",
+  ping: "PING",
+  pong: "PONG",
+} satisfies {
+  [K in AgentToHuman["type"] | HumanToAgent["type"] | Heartbeat["type"]]: string
+}
+
+/** The relay's own `MSG` object, read back out of the source that defines it. */
+function guestVocabulary(): Map<string, string> {
+  const block = /const MSG = \{([\s\S]*?)\n\}/.exec(GUEST_SERVER_JS)?.[1]
+  if (!block) throw new Error("guest/server.js no longer defines MSG")
+  const found = new Map<string, string>()
+  for (const [, name, value] of block.matchAll(/(\w+): "([^"]+)"/g)) {
+    if (name && value) found.set(name, value)
+  }
+  return found
+}
+
+test("the relay names every message type the protocol defines, and no others", () => {
+  const found = guestVocabulary()
+  for (const [type, name] of Object.entries(WIRE_NAMES)) {
+    expect(found.get(name)).toBe(type)
+  }
+  // No extras either: a constant the relay carries but the protocol has never
+  // heard of is a message nobody on the TypeScript side can send or receive.
+  expect([...found.keys()].sort()).toEqual(Object.values(WIRE_NAMES).sort())
+})
+
+test("neither the relay nor the page it serves spells a message type by hand", () => {
+  for (const type of Object.keys(WIRE_NAMES)) {
+    expect(GUEST_SERVER_JS).not.toContain(`type: "${type}"`)
+    expect(GUEST_SERVER_JS).not.toContain(`type === "${type}"`)
+  }
+})
+
+test("the served page carries the relay's own vocabulary, not a copy", async () => {
+  const html = await (await fetch(`http://127.0.0.1:${relay.port}/`)).text()
+
+  // The placeholder is gone, which is the only proof the substitution ran.
+  expect(html).not.toContain("__HANDRAISE_VOCAB__")
+  for (const [name, type] of guestVocabulary()) {
+    expect(html).toContain(`"${name}":"${type}"`)
+  }
+  expect(html).toContain(`"TAKEOVER":"takeover"`)
+  expect(html).toContain(`"APPROVAL":"approval"`)
 })
 
 // --- B3: the agent role is a secret, not a claim ---------------------------
