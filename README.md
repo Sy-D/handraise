@@ -100,12 +100,30 @@ await raiseHand(page, {
 ```
 
 Write your own in about ten lines: `notify(handoff)` gets `handoffId`, `url`,
-`reason`, `mode` and — in approval mode — `action`, `screenshot` (the same
-bytes the phone shows) and `answer("approve" | "deny")`, which returns `false`
-if somebody was faster. `notify` is never awaited and whatever it throws is one
-`channel_failed` warning: a chat API that is down costs you a notification, not
-a browser session. Anyone who can see the channel can answer it
-([`docs/adr/0007`](docs/adr/0007-channels.md)).
+`reason`, `mode`, `settled` and — in approval mode — `action`, `screenshot` (the
+same bytes the phone shows) and `answer("approve" | "deny")`, which returns
+`false` if somebody was faster. `notify` is never awaited and whatever it throws
+is one `channel_failed` warning: a chat API that is down costs you a
+notification, not a browser session. Anyone who can see the channel can answer
+it ([`docs/adr/0007`](docs/adr/0007-channels.md)).
+
+**`settled` is how a channel knows it can stop.** It is a promise that resolves
+with the outcome the moment the handoff ends — however it ended, including on
+the phone or by timeout — and it never rejects:
+
+```ts
+const channel = {
+  notify: async (handoff) => {
+    const message = await post(handoff)
+    const outcome = await Promise.race([waitForReply(message), handoff.settled])
+    await close(message, outcome)
+  },
+}
+```
+
+Without it an adapter that waits for a reply can only stop on its own clock,
+which means holding a connection open — and the process alive — long after
+`raiseHand` has returned.
 
 Runnable without writing any code: [`demo/try.ts`](demo/try.ts) raises a hand
 immediately so you can drive it; [`demo/approval.ts`](demo/approval.ts) asks

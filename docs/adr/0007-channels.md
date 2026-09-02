@@ -110,9 +110,48 @@ tell a decision from a no-op.
   and any of them can press Approve. That is the same trust boundary the bearer
   URL always had, moved somewhere more comfortable — an adapter's README has to
   say so, and `handraise-telegram`'s does.
-- **A channel has no signal that the handoff ended.** `answer()` returning
-  `false` tells an adapter it lost a race; nothing tells it about a timeout or
-  a dead session, so a long-polling adapter has to bound its own wait. A
-  `settled` promise on `ChannelHandoff` is the clean fix and is deliberately
-  not in this ADR: it is worth designing once, when the second adapter shows
-  what it needs, rather than guessing from one.
+- **A channel is told when the handoff ends, by `settled`.** See the amendment
+  below; the first adapter made the case for it before the second one existed.
+
+## Amendment, 2026-09-02: `settled`
+
+The consequence above said a `settled` promise was the clean fix and should
+wait for a second adapter. The first one settled the question by itself.
+
+`handraise-telegram` long-polls Telegram while an approval is open, and with no
+signal that the handoff ended it could only stop on its own clock —
+`maxWaitMs`, six minutes by default. Measured on that package: a handoff
+answered on the phone 500 ms in left the adapter's timer and its in-flight poll
+alive, and the Node process exited **20.5 s later** with `maxWaitMs: 20_000`.
+At the default that is a script that prints its result and then sits there for
+five minutes fifty, holding the bot's single `getUpdates` slot — so a second
+run started inside that window is refused with a 409. Nothing about that is
+specific to Telegram: any adapter that waits for a reply has the same shape.
+
+So `ChannelHandoffBase` gains:
+
+```ts
+settled: Promise<HandoffOutcome>
+```
+
+Resolved once, on every path — an answer from the phone, an answer from a
+channel, the timeout, a dead session, a handback or a give-up in takeover mode.
+It never rejects, so an adapter can await it without a guard, and it stays
+resolved, so awaiting it after the fact returns immediately.
+
+Three details are decisions rather than mechanics:
+
+- **It carries `finalOutcome`, not the outcome the human gave.** A handback
+  that wins the promise while the browser session is dying is reported to the
+  caller as `disconnected`, and a channel that had been told `resolved` would
+  post the wrong ending into a chat that outlives the process.
+- **It resolves before teardown**, at the earliest point the outcome is final.
+  An adapter that stops there releases its connection while the relay sandbox
+  is still shutting down, rather than after.
+- **It is the same promise for every channel of one handoff.** One handoff has
+  one ending; two adapters must not be able to see different ones.
+
+Rejected: an `onSettled` callback (a second failure surface to catch, for
+something that happens once), and resolving it with the whole `HandoffEvent`
+(the event is the caller's, and a channel does not need frame counts to decide
+whether to stop polling).

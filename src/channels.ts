@@ -14,7 +14,7 @@
  * `notify` is not awaited, and a throw or rejection is one `channel_failed`
  * warning ([`docs/adr/0007`](../docs/adr/0007-channels.md)).
  */
-import type { HandoffMode } from "./types"
+import type { HandoffMode, HandoffOutcome } from "./types"
 
 /** The fields every channel gets, whatever the mode. */
 export interface ChannelHandoffBase {
@@ -30,6 +30,21 @@ export interface ChannelHandoffBase {
   reason: string
   /** What the human is being asked for. Discriminates this union. */
   mode: HandoffMode
+  /**
+   * Resolves with the outcome the moment the handoff ends, whatever ended it —
+   * an answer from the phone, an answer from this or another channel, the
+   * timeout, a dead browser session. Never rejects.
+   *
+   * This is the only way a channel learns that it is no longer needed. Without
+   * it an adapter that waits for a reply has nothing to wait on but its own
+   * clock: it keeps a chat message live and a connection open long after the
+   * handoff is over, and a script that has already printed its result sits
+   * there until that clock runs out.
+   *
+   * It is the same promise for every channel of one handoff, and it stays
+   * resolved — awaiting it after the fact returns immediately.
+   */
+  settled: Promise<HandoffOutcome>
 }
 
 /**

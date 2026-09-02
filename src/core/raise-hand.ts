@@ -198,12 +198,16 @@ function emitHandoffEvent(
  * nothing to answer and no one moment worth sending — the human has to drive
  * the browser, which only the handoff page can do.
  */
-function takeoverChannelHandoff(run: HandoffRun): TakeoverChannelHandoff {
+function takeoverChannelHandoff(
+  run: HandoffRun,
+  settled: Promise<HandoffOutcome>,
+): TakeoverChannelHandoff {
   return {
     mode: "takeover",
     handoffId: run.handoffId,
     url: run.url,
     reason: run.options.reason,
+    settled,
   }
 }
 
@@ -221,12 +225,14 @@ function approvalChannelHandoff(
   action: string,
   shot: ApprovalFrame,
   answer: (decision: "approve" | "deny") => boolean,
+  settled: Promise<HandoffOutcome>,
 ): ApprovalChannelHandoff {
   return {
     mode: "approval",
     handoffId: run.handoffId,
     url: run.url,
     reason: run.options.reason,
+    settled,
     action,
     // The same JPEG the phone is looking at. It is held base64 because that is
     // what goes on the wire; this is that exact payload decoded back, not a
@@ -288,6 +294,15 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       over = true
       resolve(outcome)
     }
+  })
+
+  // What every channel of this handoff awaits. Resolved once, with the outcome
+  // the caller is given — after the handback check, so a channel is never told
+  // "resolved" for a session that turned out to be dead. It never rejects, so
+  // an adapter can await it without a guard.
+  let announceSettled: (outcome: HandoffOutcome) => void = () => undefined
+  const settled = new Promise<HandoffOutcome>((resolve) => {
+    announceSettled = resolve
   })
 
   const browser = page.context().browser()
@@ -450,6 +465,7 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
             options.action,
             approvalFrame,
             answerFromChannel,
+            settled,
           ),
         )
       }
@@ -457,7 +473,7 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       // The relay is up — `raiseHand` awaited it — so the link in the message
       // is already open. Sent before the cast starts, because the cast is not
       // what the human needs in order to be told.
-      announce(takeoverChannelHandoff(run))
+      announce(takeoverChannelHandoff(run, settled))
       cdp = await page.context().newCDPSession(page)
       input = createInputTarget(cdp)
       pump = await startTakeoverCast(cdp, connection, (data) => {
@@ -514,6 +530,11 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       storageState = undefined
     }
   }
+
+  // The earliest point at which the outcome is the one the caller will see.
+  // Before teardown on purpose: a channel that stops polling here releases the
+  // chat and the process while the relay is still being shut down.
+  announceSettled(finalOutcome)
 
   clearTimeout(timer)
   browser?.off("disconnected", onGone)

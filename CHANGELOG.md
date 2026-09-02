@@ -43,14 +43,19 @@ Everything here is additive. No existing call, type or outcome changes.
   answered by long polling, no public callback endpoint to host. It is not on
   npm at the time of writing; this release is what it needs in order to be.
 
-### Known gap
+- **`ChannelHandoff.settled`**, a promise that resolves with the outcome the
+  moment the handoff ends — an answer from the phone, an answer from a channel,
+  the timeout, a dead session, a handback. It never rejects, it stays resolved,
+  and it is the same promise for every channel of one handoff. It carries the
+  outcome the *caller* gets: a handback that turns into `disconnected` because
+  the session died during the cookie capture reaches channels as
+  `disconnected`, not `resolved`.
 
-A channel learns that it lost a race (`answer()` returns `false`) but is not
-told when a handoff ends any other way — a timeout, a dead browser session. A
-long-polling adapter therefore has to bound its own wait; `handraise-telegram`
-does, with `maxWaitMs`. A `settled` promise on `ChannelHandoff` is the clean
-fix and is deliberately not in 0.5.0: it is worth designing once the second
-adapter has shown what it needs.
+  This is the signal that lets an adapter stop. Without it one that waits for a
+  reply can only stop on its own clock: measured on `handraise-telegram`, a
+  handoff answered on the phone 500 ms in left the adapter polling and the Node
+  process alive for another 20 s with a 20 s budget — five minutes fifty at its
+  default, holding the bot's single update slot the whole time.
 
 ## [0.4.0] - 2026-09-02
 
