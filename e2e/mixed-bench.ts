@@ -57,6 +57,10 @@
  *   inherits the session or the transfer receipt an earlier run left behind.
  * - A failed run is recorded as a failed run. Percentiles are over the runs
  *   that completed, with the failures shown next to them.
+ * - A run that could not get a relay because a neighbouring job held both
+ *   sandbox slots is not a failed run: the bench stands back for a minute and
+ *   tries that workflow again, up to ten times, and `concurrencyWaits` in the
+ *   JSON says how often that happened.
  *
  * Set MIXED_FAULT=invert-completed to invert the completion test. Both modes
  * must then read 0 of N — that is how the counting is known to be load-bearing
@@ -67,7 +71,7 @@ import type { Page } from "playwright-core"
 
 import type { HandoffEvent } from "../src/events"
 import { raiseHand } from "../src/index"
-import { startTestApp } from "../test-app/deploy"
+import { previewPath, startTestApp } from "../test-app/deploy"
 import { totp } from "../test-app/totp"
 import { openHandoffPage, type SimulatedHuman } from "./human-sim"
 
@@ -93,6 +97,12 @@ const BROWSER_MAX_AGE_MS = 3 * 60_000
 const COOLDOWN_MS = 1_000
 /** Consecutive failures that mean the infrastructure is down, not the claim. */
 const ABORT_AFTER_CONSECUTIVE_FAILURES = 5
+/** How long to stand back when the plan is full, before trying the run again. */
+const CONCURRENCY_WAIT_MS = 60_000
+/** How many times one workflow may wait out a full plan before it is a failure. */
+const CONCURRENCY_WAITS = 10
+/** How many times the test app may be rebuilt when it dies under the bench. */
+const APP_RESTARTS = 3
 const RESULTS_PATH = new URL(
   "../benchmarks/mixed-workload.json",
   import.meta.url,
@@ -140,6 +150,12 @@ interface MixedRun {
    */
   relaySandboxSeconds: number | null
   error: string | null
+  /**
+   * Times this workflow stood back for a full plan before it ran. A neighbour
+   * holding both sandbox slots is queueing, not a result, so it is waited out
+   * and counted here rather than recorded as a failed workflow.
+   */
+  concurrencyWaits: number
   /** Age of the reused browser session when the run started, in ms. */
   browserAgeMs: number
 }
@@ -520,6 +536,7 @@ async function runWorkflow(
     humanActiveMs: null,
     relaySandboxSeconds: null,
     error: null,
+    concurrencyWaits: 0,
     browserAgeMs: Date.now() - lease.launchedAt,
   }
 
@@ -589,6 +606,36 @@ interface ModeSummary {
 
 function isNumber(value: number | null | undefined): value is number {
   return value !== null && value !== undefined && Number.isFinite(value)
+}
+
+/**
+ * Is the test app still answering? A sandbox can go away under a bench — an
+ * expiry, a platform hiccup, a neighbouring job's cleanup — and every run after
+ * that fails at the login form, which says nothing about handraise.
+ */
+async function appIsHealthy(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(previewPath(url, "/healthz"), {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10_000),
+    })
+    await response.text()
+    return response.status === 200
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Did this run fail because the plan was full rather than because handraise
+ * was? A neighbouring job holding both sandbox slots means the relay was never
+ * created, and that is a queue, not a datum.
+ */
+function planWasFull(run: MixedRun): boolean {
+  return (
+    run.relaySandboxSeconds === null &&
+    /too many concurrent|concurrenc|429/i.test(run.error ?? "")
+  )
 }
 
 function summarise(mode: Kind, label: string, runs: MixedRun[]): ModeSummary {
@@ -678,9 +725,11 @@ const benchStartedAt = Date.now()
 const runs: MixedRun[] = []
 let relaunches = 0
 let consecutiveFailures = 0
+let concurrencyWaits = 0
+let appRestarts = 0
 let abortReason: string | null = null
 
-const app = await startTestApp({ apiKey, timeoutMs: APP_TIMEOUT_MS })
+let app = await startTestApp({ apiKey, timeoutMs: APP_TIMEOUT_MS })
 console.log(
   JSON.stringify({
     event: "test_app_ready",
@@ -699,16 +748,57 @@ try {
     const decision: Decision =
       kind === "approval" && approvals % DENY_EVERY === 0 ? "deny" : "approve"
 
-    if (leaseIsStale(lease)) {
-      await releaseBrowser(lease)
-      lease = await leaseBrowser()
-      relaunches += 1
-      console.log(
-        JSON.stringify({ event: "browser_relaunched", before: index }),
-      )
+    const attempt = async (): Promise<MixedRun> => {
+      if (leaseIsStale(lease)) {
+        await releaseBrowser(lease)
+        lease = await leaseBrowser()
+        relaunches += 1
+        console.log(
+          JSON.stringify({ event: "browser_relaunched", before: index }),
+        )
+      }
+      return runWorkflow(index, kind, decision, lease, app)
     }
 
-    const run = await runWorkflow(index, kind, decision, lease, app)
+    let run = await attempt()
+    let waits = 0
+    while (planWasFull(run) && waits < CONCURRENCY_WAITS) {
+      waits += 1
+      concurrencyWaits += 1
+      console.log(
+        JSON.stringify({
+          event: "plan_full",
+          index,
+          waitSeconds: CONCURRENCY_WAIT_MS / 1000,
+          attempt: waits,
+        }),
+      )
+      await Bun.sleep(CONCURRENCY_WAIT_MS)
+      run = await attempt()
+    }
+    run.concurrencyWaits = waits
+
+    // A run that never even reached the interrupt may have found the test app
+    // gone rather than anything about a handoff. Rebuild it and try again;
+    // that is infrastructure, not a datum.
+    while (
+      !run.reachedInterrupt &&
+      appRestarts < APP_RESTARTS &&
+      !(await appIsHealthy(app.url))
+    ) {
+      console.log(JSON.stringify({ event: "test_app_lost", index }))
+      await app.kill().catch(() => undefined)
+      app = await startTestApp({ apiKey, timeoutMs: APP_TIMEOUT_MS })
+      appRestarts += 1
+      console.log(
+        JSON.stringify({
+          event: "test_app_restarted",
+          index,
+          sandbox: app.sandboxId,
+        }),
+      )
+      run = await attempt()
+    }
     runs.push(run)
     console.log(
       JSON.stringify({
@@ -793,6 +883,8 @@ await Bun.write(
         fault: FAULT === "" ? null : FAULT,
         abortReason,
         browserRelaunches: relaunches,
+        concurrencyWaits,
+        testAppRestarts: appRestarts,
         totalMs: Date.now() - benchStartedAt,
         relaySandboxSecondsAllRuns: relaySeconds?.total ?? null,
         bunVersion: Bun.version,
@@ -820,6 +912,8 @@ console.log(
     approvalCompleted: `${summaries[1]?.completed}/${summaries[1]?.attempted}`,
     relaySandboxSecondsAllRuns: relaySeconds?.total ?? null,
     browserRelaunches: relaunches,
+    concurrencyWaits,
+    testAppRestarts: appRestarts,
     totalMs: Date.now() - benchStartedAt,
     results: RESULTS_PATH.pathname,
   }),
