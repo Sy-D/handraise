@@ -118,3 +118,29 @@ test("an unreachable endpoint is a warning, not a throw", async () => {
   await notifyWebhook("http://127.0.0.1:1/hook", APPROVAL, logger)
   expect(warnings).toEqual(["webhook_failed"])
 })
+
+/** A logger over a transport that has gone away: every call throws. */
+function hostileLogger(): Logger {
+  const down = (): never => {
+    throw new Error("logger is down (EPIPE)")
+  }
+  return { debug: down, info: down, warn: down, error: down }
+}
+
+test("a logger that throws cannot make this promise reject", async () => {
+  // `raiseHand` fires this and only awaits it in its `finally`, minutes later.
+  // A rejection would sit unhandled for the whole handoff — node ends the
+  // process for that — and would then throw out of the `finally`, after a
+  // human has already been shown the URL. A caller's `logger` is the last
+  // thing in here that can throw: a pino instance over a closed transport, a
+  // sink that decided a field was unserialisable.
+  const logger = hostileLogger()
+
+  // Both failure paths reach a `warn`: an endpoint that rejects the POST, and
+  // one that cannot be reached at all.
+  const endpoint = await listen(500)
+  expect(await notifyWebhook(endpoint.url, APPROVAL, logger)).toBeUndefined()
+  expect(
+    await notifyWebhook("http://127.0.0.1:1/hook", APPROVAL, logger),
+  ).toBeUndefined()
+})

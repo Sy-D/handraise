@@ -26,7 +26,12 @@ import type {
 import type { HandoffEvent } from "../events"
 import { type Logger, noopLogger } from "../logger"
 import type { RelayMessage } from "../relay/protocol"
-import type { HandoffMode, RaiseHandOptions, StorageState } from "../types"
+import type {
+  HandoffMode,
+  HandoffResult,
+  RaiseHandOptions,
+  StorageState,
+} from "../types"
 import { raiseHand, runHandoff } from "./raise-hand"
 import type { ScreencastFrame } from "./screencast"
 
@@ -224,6 +229,8 @@ function fakePage(
   let page: Page
   const pagePartial: Partial<Page> = {
     context: () => context,
+    // A live page, which is what `raiseHand` checks before it starts anything.
+    isClosed: () => false,
     // SAFETY: approval mode calls screenshot() for its one frame and reads the
     // viewport for that frame's metadata; neither result is used as anything else.
     screenshot: (async () => {
@@ -578,7 +585,11 @@ test("an approval with a blank action is refused before a relay is started", asy
     logger: noopLogger,
   })
 
-  await expect(asking).rejects.toThrow(/needs a non-empty `action`/)
+  // The code is the contract; the sentence is for whoever reads the log.
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "empty_action",
+  })
 })
 
 test("an unknown mode is refused before anything is created", async () => {
@@ -595,7 +606,96 @@ test("an unknown mode is refused before anything is created", async () => {
   Object.assign(options, { mode: "approval; touch /tmp/handraise-pwned" })
 
   const asking = raiseHand(fakePage(fakeCdp().cdp), options)
-  await expect(asking).rejects.toThrow(/unknown mode/)
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "invalid_mode",
+  })
+})
+
+test("a handoff without an API key is refused, with a code", async () => {
+  // `apiKey: ""` rather than deleting the environment variable: bun loads
+  // `.env`, and a test that mutates `process.env` would decide the outcome of
+  // whatever runs next to it.
+  const asking = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    apiKey: "",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "missing_api_key",
+  })
+})
+
+/** Ask for a handoff on `page`, against a gateway that cannot answer. */
+function askOn(page: Page): Promise<HandoffResult> {
+  return raiseHand(page, {
+    reason: "Aurora Bank is asking for a 2FA code",
+    apiKey: "not-a-real-key",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+}
+
+/**
+ * A page with exactly what the pre-flight guard reads, and modelled on what a
+ * real Playwright page does: `context()` keeps answering on a closed page (it
+ * is a field read), so `isClosed()` is the only thing that can report one.
+ */
+function pageThatIs(closed: boolean, connected: boolean): Page {
+  const browserPartial: Partial<Browser> = { isConnected: () => connected }
+  const contextPartial: Partial<BrowserContext> = {
+    // SAFETY: the guard reads only `browser()` off the context.
+    browser: () => browserPartial as Browser,
+  }
+  const pagePartial: Partial<Page> = {
+    isClosed: () => closed,
+    // SAFETY: the guard reads only `context().browser()` on the page.
+    context: () => contextPartial as BrowserContext,
+  }
+  // SAFETY: the guard touches `isClosed` and `context` and nothing else; it
+  // refuses before any other member could be reached.
+  return pagePartial as Page
+}
+
+test("a closed page is refused before a sandbox is created", async () => {
+  // The agent closed the page — or its own step raced a `page.close()` —
+  // while the browser is still connected. Starting a relay for it would spend
+  // a sandbox and a person's attention on a page nobody can drive.
+  await expect(askOn(pageThatIs(true, true))).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "browser_unusable",
+  })
+})
+
+test("a page whose state cannot be read at all is refused too", async () => {
+  // Not a Playwright page any more: a stub, a proxy over a dead CDP
+  // connection, a page from a browser object that has been torn down. The
+  // guard may not turn that into an unhandled TypeError.
+  const broken: Partial<Page> = {
+    isClosed: () => {
+      throw new Error("Target page, context or browser has been closed")
+    },
+  }
+
+  // SAFETY: the refusal under test reads only `isClosed()`, which is the one
+  // member this page has.
+  await expect(askOn(broken as Page)).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "browser_unusable",
+  })
+})
+
+test("an open page whose browser has disconnected is refused too", async () => {
+  // The Solari session hit its ~10-minute hard lifetime while the agent was
+  // still working. The page is not closed and `context()` answers — only the
+  // browser is gone, which is the case this guard exists for.
+  await expect(askOn(pageThatIs(false, false))).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "browser_unusable",
+  })
 })
 
 // --- Channels ------------------------------------------------------------
@@ -1379,4 +1479,44 @@ test("settled reports the outcome the caller gets, not the one the human gave", 
   expect(end.outcome).toBe("disconnected")
   expect(end.storageState).toBeUndefined()
   expect(await recorder.seen[0]?.settled).toBe("disconnected")
+})
+
+test("a logger that throws does not break the handoff", async () => {
+  // `logger` is a public option and it is the caller's object: a pino instance
+  // over a closed transport throws. Every call handraise makes to it sits on a
+  // failure path or inside a promise callback, so a throw would either lose
+  // the outcome (the wide event is logged before it is returned) or reject a
+  // promise nobody awaits, and node ends the process for that.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const down = (): never => {
+    throw new Error("logger is down (EPIPE)")
+  }
+  const hostile: Logger = { debug: down, info: down, warn: down, error: down }
+  const events: HandoffEvent[] = []
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "the logger is hostile",
+      logger: hostile,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "hostile-logger",
+    relayColdStartMs: 5,
+    logger: hostile,
+  })
+
+  await until("the phone to connect", () => human.inbox.length >= 0)
+  human.send({ type: "handback" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  // The wide event still reaches the caller: `logger.info` throwing must not
+  // take `onEvent` with it.
+  expect(events).toHaveLength(1)
 })

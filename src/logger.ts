@@ -84,3 +84,34 @@ export const quietLogger: Logger = {
     consoleLogger.error(event, fields)
   },
 }
+
+/**
+ * Wrap a logger so a throw from it can never end a handoff.
+ *
+ * `Logger` is the caller's object: a pino instance over a closed transport, a
+ * socket that went away, a sink that decided a field was unserialisable. Most
+ * of handraise's log calls sit inside a `catch` or a promise callback on the
+ * failure path, where a throw would either escape `raiseHand` after a human
+ * has already been shown the URL or reject a promise nobody is awaiting — and
+ * an unhandled rejection ends the agent's process. A broken logger may cost a
+ * log line. It may not cost the browser session.
+ *
+ * Wrapping once, where the logger enters handraise, beats a try/catch at every
+ * call site: it also covers the calls made by everything the logger is passed
+ * on to.
+ */
+export function safeLogger(inner: Logger): Logger {
+  const swallow = (write: () => void): void => {
+    try {
+      write()
+    } catch {
+      // Nothing to report this with — the reporter is what broke.
+    }
+  }
+  return {
+    debug: (event, fields) => swallow(() => inner.debug(event, fields)),
+    info: (event, fields) => swallow(() => inner.info(event, fields)),
+    warn: (event, fields) => swallow(() => inner.warn(event, fields)),
+    error: (event, fields) => swallow(() => inner.error(event, fields)),
+  }
+}

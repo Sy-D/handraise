@@ -29,6 +29,11 @@ export type {
   TakeoverChannelHandoff,
 } from "./channels"
 export { raiseHand } from "./core/raise-hand"
+export {
+  HandraiseError,
+  type HandraiseErrorCode,
+  isHandraiseError,
+} from "./errors"
 export type { HandoffEvent } from "./events"
 export {
   consoleLogger,

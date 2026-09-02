@@ -5,6 +5,56 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.6.0
+
+### Added
+
+- **Typed errors: `HandraiseError`, `HandraiseErrorCode`, `isHandraiseError`.**
+  Everything `raiseHand` throws now carries a `code` you can branch on —
+  `missing_api_key`, `invalid_mode`, `empty_action`, `browser_unusable`,
+  `relay_start_failed`, `concurrency_limit`, `relay_not_ready` — plus the
+  original SDK, CDP or network error as `cause`. `concurrency_limit` is the
+  one worth retrying: it means your Solari account is at its concurrent
+  session cap, not that anything is broken. When to expect each code, and what
+  to do about it, is in the README's [Errors](README.md#errors) table. The
+  messages were never a contract; they can still be reworded in any release.
+  Outcomes are unchanged and still values: a human who never came, a session
+  that died mid-handoff and a webhook that 500s are not exceptions.
+- **A logger that throws can no longer end a handoff.** `logger` is your
+  object — a pino instance over a closed transport throws — and handraise
+  calls it from `catch` blocks and promise callbacks. One of those was the
+  webhook notification, which `raiseHand` fires and only awaits minutes later:
+  a throw there was an unhandled rejection (node ends the process for that)
+  and then an uncoded `Error` out of `raiseHand`, long after the URL existed.
+  Log calls are now wrapped where the logger enters handraise. A broken logger
+  costs a log line.
+- **The relay health poll enforces its deadline.** Each attempt carries
+  `AbortSignal.timeout`, so a preview URL that accepts the connection and never
+  answers ends as `relay_not_ready` at the deadline instead of blocking
+  `raiseHand` for minutes with a live sandbox burning its idle window.
+- **No preview token can reach an error message.** Anything a gateway or proxy
+  says is redacted before it is quoted — `pt_token=…` in any case or
+  separator, percent-encoded inside a `?next=` parameter, or the bare
+  credential in prose.
+### Changed
+
+- **A page that is already dead is now refused instead of handed off.**
+  `raiseHand` used to create a relay, fail on the first CDP call and *return*
+  `{ outcome: "disconnected" }`. It now throws a `HandraiseError`
+  (`browser_unusable`) before anything is created — no sandbox, no QR code, no
+  person's attention spent on a page nobody can drive. **If you only branched
+  on `result.outcome`, add a `catch`.** It reads local state only
+  (`page.isClosed()`, `browser.isConnected()`), so a Solari session that has
+  died server-side while the CDP socket is still open is unaffected and still
+  arrives as the `disconnected` outcome.
+- **Solari SDK errors no longer escape `raiseHand` unchanged.** They are
+  wrapped in a `HandraiseError`, with the SDK's error kept as `error.cause`.
+  Branch on `error.code === "concurrency_limit"`; if you must have the class,
+  it is `error.cause`, and `error.cause.status === 429` is the check that
+  survives a second copy of `@solarisdk/core` in your tree. Apart from the
+  page check above, nothing throws that did not throw before, and no outcome
+  became an exception.
+
 ## [0.5.1] - 2026-09-02
 
 Republish of 0.5.0 with no code change. 0.5.0 was published to npm and

@@ -7,7 +7,8 @@
  * else's automation, so it may only fail in ways the caller can act on:
  *
  * - It throws only if the relay never came up, i.e. before a human could
- *   possibly have been asked to help. Nothing was promised yet.
+ *   possibly have been asked to help. Nothing was promised yet, and what it
+ *   throws is a `HandraiseError` with a code (see ../errors.ts).
  * - After the handoff URL exists it never throws. Every failure — a dead
  *   browser session, a rejected CDP call, a webhook that 500s — becomes an
  *   `outcome` and a log line, because by then the caller has already shown the
@@ -15,15 +16,16 @@
  * - Every path destroys the relay sandbox and settles the promise exactly
  *   once.
  */
-import type { CDPSession, Page } from "playwright-core"
+import type { Browser, CDPSession, Page } from "playwright-core"
 import type {
   ApprovalChannelHandoff,
   ChannelHandoff,
   HandoffChannel,
   TakeoverChannelHandoff,
 } from "../channels"
+import { HandraiseError } from "../errors"
 import type { HandoffEvent } from "../events"
-import { type Logger, quietLogger } from "../logger"
+import { type Logger, quietLogger, safeLogger } from "../logger"
 import { printHandoffQr } from "../qr"
 import { startRelay } from "../relay/deploy"
 import type { AgentToHuman, HumanToAgent } from "../relay/protocol"
@@ -274,7 +276,10 @@ function notifyChannels(
  * fake page; `raiseHand` is the supported entry point.
  */
 export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
-  const { page, agentWsUrl, options, timeoutMs, logger } = run
+  const { page, agentWsUrl, options, timeoutMs } = run
+  // Wrapped here as well as in `raiseHand`, because this is the entry point
+  // the tests drive: from this line on, no log call can end a handoff.
+  const logger = safeLogger(run.logger)
   const mode: HandoffMode = options.mode ?? "takeover"
   const startedAt = Date.now()
   let framesSent = 0
@@ -596,7 +601,8 @@ const MODES = new Set<string>(["takeover", "approval"])
 function checkedMode(options: RaiseHandOptions): HandoffMode {
   const mode = options.mode ?? "takeover"
   if (!MODES.has(mode)) {
-    throw new Error(
+    throw new HandraiseError(
+      "invalid_mode",
       `handraise: unknown mode ${JSON.stringify(mode)} — it must be "takeover" or "approval".`,
     )
   }
@@ -606,7 +612,8 @@ function checkedMode(options: RaiseHandOptions): HandoffMode {
     options.mode === "approval" &&
     String(options.action ?? "").trim() === ""
   ) {
-    throw new Error(
+    throw new HandraiseError(
+      "empty_action",
       'handraise: mode "approval" needs a non-empty `action` — it is the step the human says yes or no to, and the phone shows it as the decision. Without it a human is asked to approve a blank line.',
     )
   }
@@ -615,19 +622,59 @@ function checkedMode(options: RaiseHandOptions): HandoffMode {
   return mode as HandoffMode
 }
 
+/**
+ * Refuse a dead page before a sandbox is created.
+ *
+ * A dead session cannot be driven or screenshotted, so a handoff on one would
+ * spend a relay sandbox, a QR code and a person's attention to end in
+ * `disconnected`. Two questions, both answered from local state — neither
+ * touches the network: is this page closed, and is its browser still
+ * connected? `context()` is a field read and throws nothing in Playwright, so
+ * it is `isClosed()` that catches a closed page; the try/catch is for the page
+ * object that is not a working Playwright page at all.
+ */
+function checkedPage(page: Page): void {
+  let closed: boolean
+  let browser: Browser | null
+  try {
+    closed = page.isClosed()
+    browser = page.context().browser()
+  } catch (cause) {
+    throw new HandraiseError(
+      "browser_unusable",
+      `handraise: this page cannot be handed to a human — reading its state (page.isClosed(), page.context()) threw. A dead CDP connection does that, and so does a page-like object that is not a Playwright page. ${String(cause)}`,
+      { cause },
+    )
+  }
+  if (closed) {
+    throw new HandraiseError(
+      "browser_unusable",
+      "handraise: this page is already closed, so there is nothing for a human to take over. Open a new page (its `storageState` from an earlier handoff, if you kept it, restores the human's work) and retry.",
+    )
+  }
+  if (browser && !browser.isConnected()) {
+    throw new HandraiseError(
+      "browser_unusable",
+      "handraise: the browser session behind this page is already disconnected, so there is nothing for a human to take over. Relaunch the session (its `storageState` from an earlier handoff, if you kept it, restores the human's work) and retry.",
+    )
+  }
+}
+
 /** See `RaiseHand` in ../types.ts for the contract. */
 export async function raiseHand(
   page: Page,
   options: RaiseHandOptions,
 ): Promise<HandoffResult> {
-  const logger = options.logger ?? quietLogger
+  const logger = safeLogger(options.logger ?? quietLogger)
   const mode = checkedMode(options)
   const apiKey = options.apiKey ?? process.env.SOLARI_API_KEY
   if (!apiKey) {
-    throw new Error(
+    throw new HandraiseError(
+      "missing_api_key",
       "handraise: no API key. Pass options.apiKey or set SOLARI_API_KEY — it is needed to create the relay sandbox that gives the handoff a public URL.",
     )
   }
+  checkedPage(page)
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const relay = await startRelay(
@@ -676,6 +723,11 @@ export async function raiseHand(
           : payload,
         logger,
       )
+        // `notifyWebhook` does not reject, and this is what makes that safe to
+        // rely on: nothing awaits this promise until the `finally`, minutes
+        // later, so a rejection would be unhandled for the whole handoff (node
+        // ends the process for that) and would then throw from the `finally`.
+        .catch(() => undefined)
     }
 
     end = await runHandoff({
