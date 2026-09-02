@@ -147,6 +147,49 @@ async function connect(port: number, role: "agent" | "human"): Promise<Client> {
   }
 }
 
+/**
+ * Resolve when the relay logs a given event with the given fields. The relay
+ * writes one JSON line per event to stdout; this reads them. Arm it before the
+ * action that causes the event, so the line cannot land before we are looking.
+ *
+ * `agent.closed` only tells us the client's socket is down — the server may not
+ * have run its close handler yet. When a test's next step depends on that
+ * handler having run (a scrubbed buffer, a freed role), wait for its log line
+ * instead of the client close, or the two race.
+ */
+function waitForLog(
+  relay: Relay,
+  event: string,
+  fields: Record<string, string>,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let buffered = ""
+    const onData = (chunk: Buffer): void => {
+      buffered += chunk.toString("utf8")
+      for (const line of buffered.split("\n")) {
+        if (!line.includes(`"event":"${event}"`)) continue
+        const all = Object.entries(fields).every(([key, value]) =>
+          line.includes(`"${key}":"${value}"`),
+        )
+        if (all) {
+          cleanup()
+          resolve()
+          return
+        }
+      }
+    }
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`no ${event} log within ${MESSAGE_TIMEOUT_MS}ms`))
+    }, MESSAGE_TIMEOUT_MS)
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      relay.process.stdout.removeListener("data", onData)
+    }
+    relay.process.stdout.on("data", onData)
+  })
+}
+
 let relay: Relay
 
 beforeEach(async () => {
@@ -588,8 +631,13 @@ test("the replay buffer is dropped when the agent disconnects, and restored when
     reason: "Aurora Bank is asking for a code",
   })
 
+  // Arm the wait before the close so the log line cannot slip past us, then
+  // wait for the server to have run its close handler — not just the client
+  // socket to be down — before a late human can prove the buffer is gone.
+  const scrubbed = waitForLog(relay, "peer closed", { role: "agent" })
   agent.socket.close()
   await agent.closed
+  await scrubbed
   const late = await connect(relay.port, "human")
   await expect(late.next()).rejects.toThrow(/no message/)
 
