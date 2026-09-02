@@ -256,6 +256,87 @@ test("POST /logout clears the session", async () => {
   expect(jar.names()).toEqual([])
 })
 
+/** Sign in the whole way, so the jar holds a session cookie. */
+async function signIn(): Promise<CookieJar> {
+  const jar = await loginToTotpStep()
+  await request(jar, "/totp", form([["code", totp(SECRET)]]))
+  expect(jar.names()).toEqual(["hr_session"])
+  return jar
+}
+
+test("GET /transfer without a session bounces back to the login page", async () => {
+  const response = await fetch(`${baseUrl}/transfer`, { redirect: "manual" })
+  expect(response.status).toBe(303)
+  expect(response.headers.get("location")).toBe("/")
+})
+
+test("GET /transfer serves an amount and a payee behind the session", async () => {
+  const jar = await signIn()
+  const response = await request(jar, "/transfer")
+  const html = await response.text()
+  expect(response.status).toBe(200)
+  expect(html).toContain('data-testid="transfer-amount"')
+  expect(html).toContain('data-testid="transfer-payee"')
+  expect(html).toContain('data-testid="transfer-submit"')
+  expect(html).toContain('method="post"')
+})
+
+test("POST /transfer rejects an amount that is not money", async () => {
+  const jar = await signIn()
+  const response = await request(
+    jar,
+    "/transfer",
+    form([
+      ["amount", "twelve"],
+      ["payee", "Acme GmbH"],
+    ]),
+  )
+  const html = await response.text()
+  expect(response.status).toBe(400)
+  expect(html).toContain("Enter an amount")
+  expect(jar.names()).toEqual(["hr_session"])
+})
+
+test("POST /transfer rejects an empty payee", async () => {
+  const jar = await signIn()
+  const response = await request(
+    jar,
+    "/transfer",
+    form([
+      ["amount", "12430.00"],
+      ["payee", "   "],
+    ]),
+  )
+  expect(response.status).toBe(400)
+  expect(await response.text()).toContain("Enter a payee name")
+})
+
+test("a submitted transfer shows up on the account page", async () => {
+  const jar = await signIn()
+  const sent = await request(
+    jar,
+    "/transfer",
+    form([
+      ["amount", "12430.00"],
+      ["payee", "Acme GmbH"],
+    ]),
+  )
+  expect(sent.status).toBe(303)
+  expect(sent.headers.get("location")).toBe("/account")
+
+  const account = await request(jar, "/account")
+  const html = await account.text()
+  expect(html).toContain('data-testid="transfer-done"')
+  expect(html).toContain("Sent EUR 12430.00 to Acme GmbH")
+})
+
+test("an account page with no transfer shows no transfer receipt", async () => {
+  const jar = await signIn()
+  const html = await (await request(jar, "/account")).text()
+  expect(html).not.toContain('data-testid="transfer-done"')
+  expect(html).toContain('data-testid="transfer-link"')
+})
+
 test("an unknown path is a 404 page", async () => {
   const response = await fetch(`${baseUrl}/nope`)
   expect(response.status).toBe(404)
