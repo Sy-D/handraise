@@ -85,11 +85,16 @@ interface AgentClient {
   /** Put bytes on the wire that the protocol has no way to describe. */
   sendRaw(text: string): void
   next(): Promise<RelayMessage>
-  /** Every message this socket has seen, in order. `next()` never consumes it,
-   *  so a test can assert that something was sent *exactly once*. */
+  /** Every message the *phone* has sent, in order. `next()` never consumes it,
+   *  so a test can assert that something was sent *exactly once*. The relay's
+   *  own messages — `presence`, `ended_ack` — are not the phone's and are not
+   *  here: every test in this file is about what the page puts on the wire. */
   received: RelayMessage[]
   close(): void
 }
+
+/** What the relay says for itself, rather than forwarding from the phone. */
+const RELAY_ORIGINATED = new Set<string>(["presence", "ended_ack"])
 
 interface Box {
   x: number
@@ -176,6 +181,7 @@ async function connectAgent(port: number): Promise<AgentClient> {
 
   socket.on("message", (raw: Buffer) => {
     const message = parseMessage(raw.toString("utf8"))
+    if (RELAY_ORIGINATED.has(message.type)) return
     received.push(message)
     const waiter = waiters.shift()
     if (waiter) waiter(message)

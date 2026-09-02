@@ -16,6 +16,7 @@ pre-publish security review — they document the history, they do not invent it
 | [0006](0006-approval-mode.md) | Approval mode: one screenshot, a hold on yes | accepted | Scope decision |
 | [0007](0007-channels.md) | Channels: an in-process hook, not a second WebSocket client | accepted | Scope decision |
 | [0008](0008-qr-passthrough.md) | QR passthrough: the agent reads the code, the phone gets the link | accepted | [Measurement 05](../measurements/05-qr.md) |
+| [0009](0009-peer-presence-and-ended-ack.md) | Peer presence, and a receipt for the ending | accepted | Measurements [01](../measurements/01-preview-transport.md), [04](../measurements/04-browser-session-lifetime.md) |
 
 ## Format
 

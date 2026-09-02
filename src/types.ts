@@ -39,6 +39,22 @@ export interface HandoffOptions {
    * wait is more likely to end in `disconnected` than in `resolved`.
    */
   timeoutMs?: number
+  /**
+   * How long to keep waiting after the human's phone disappears, in ms.
+   * Default: 60 seconds.
+   *
+   * The relay reports whether a human is connected (it answers the heartbeats
+   * itself, so nobody else can tell). Once one has been there and their socket
+   * is gone for this long, the handoff ends as `timeout` rather than waiting
+   * out `timeoutMs` for somebody who has closed the tab. A phone that comes
+   * back inside the grace resets it, which is what makes the 60 s default
+   * safe: the preview proxy cuts an idle socket every 60 s and the phone
+   * reconnects in about a second.
+   *
+   * A handoff nobody ever opened is not affected — that is the ordinary wait,
+   * and it runs for the full `timeoutMs`.
+   */
+  humanGoneGraceMs?: number
   /** Print a scannable QR code for the handoff URL to the terminal. Default: true. */
   qr?: boolean
   /**

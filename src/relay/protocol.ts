@@ -128,6 +128,29 @@ export type HumanToAgent =
   | { type: "deny" }
 
 /**
+ * The two things the relay says on its own behalf, to the agent only.
+ *
+ * Everything else on this wire is forwarded verbatim between two peers who
+ * cannot see each other. These are the exceptions, and both exist because the
+ * relay knows something neither peer can find out for itself.
+ *
+ * `presence` is the human's socket, reported as a fact rather than inferred
+ * from silence: the relay answers the heartbeats itself, so a phone whose tab
+ * was closed looks exactly like a phone whose owner is reading a code off
+ * another device. Sent on every connect, replace and close of the human
+ * socket, and once immediately after an agent connects so a reconnecting agent
+ * starts from the truth instead of from its last guess.
+ *
+ * `ended_ack` is the receipt for `ended`: the relay has stored the ending and
+ * will hand it to whoever opens the link next. The agent kills the sandbox
+ * seconds later, and before this existed the ending and the kill were a race
+ * that a second viewer of the link regularly lost.
+ */
+export type RelayToAgent =
+  | { type: "presence"; human: boolean }
+  | { type: "ended_ack" }
+
+/**
  * Either side may ping; the receiver answers pong. Required: the preview
  * proxy kills WebSockets after exactly 60s of silence (close 1006, see
  * docs/measurements/01-preview-transport.md). Send a ping at least every 25s; treat 1006 as
@@ -135,7 +158,11 @@ export type HumanToAgent =
  */
 export type Heartbeat = { type: "ping" } | { type: "pong" }
 
-export type RelayMessage = AgentToHuman | HumanToAgent | Heartbeat
+export type RelayMessage =
+  | AgentToHuman
+  | HumanToAgent
+  | RelayToAgent
+  | Heartbeat
 
 export const HEARTBEAT_INTERVAL_MS = 20_000
 export const RELAY_PORT = 3000

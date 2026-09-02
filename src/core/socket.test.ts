@@ -18,12 +18,18 @@ import WebSocket, { WebSocketServer } from "ws"
 
 import type { HumanToAgent, RelayMessage } from "../relay/protocol"
 import type { HandoffMode } from "../types"
-import { connectRelay, type RelayConnection } from "./socket"
+import {
+  connectRelay,
+  ENDED_ACK_TIMEOUT_MS,
+  type RelayConnection,
+} from "./socket"
 
 const SERVER_PATH = fileURLToPath(
   new URL("../relay/guest/server.js", import.meta.url),
 )
 const START_TIMEOUT_MS = 5000
+/** Long enough for one local round trip through the real relay process. */
+const MESSAGE_WAIT_MS = 2000
 
 const META = {
   deviceWidth: 1280,
@@ -317,6 +323,81 @@ test("sendFinal waits for a reconnect before giving up on the ending", async () 
     fake.received.some((message) => message.type === "ended"),
   )
 })
+
+test("presence from the real relay is reported, and only presence", async () => {
+  const relay = await startRelayProcess()
+  const presence: boolean[] = []
+  const human: HumanToAgent[] = []
+  const connection = track(
+    connectRelay({
+      url: `ws://127.0.0.1:${relay.port}/ws?role=agent`,
+      onMessage: (message) => human.push(message),
+      onPresence: (there) => presence.push(there),
+    }),
+  )
+  await until("the agent socket to open", () => connection.isOpen())
+  // Nobody has opened the link yet, and that is what the relay says first.
+  await until("the empty relay to report itself", () => presence.length === 1)
+  expect(presence).toEqual([false])
+
+  const phone = await rawPeer(relay.port, "human")
+  await until("the arrival", () => presence.length === 2)
+  phone.socket.close()
+  await until("the departure", () => presence.length === 3)
+
+  expect(presence).toEqual([false, true, false])
+  // Presence is the relay's own message, not the human's: it must never reach
+  // the handoff as if a person had sent it.
+  expect(human).toEqual([])
+})
+
+test("sendFinal waits for the relay to acknowledge the ending", async () => {
+  const relay = await startRelayProcess()
+  const connection = track(
+    connectRelay({
+      url: `ws://127.0.0.1:${relay.port}/ws?role=agent`,
+      onMessage: () => undefined,
+    }),
+  )
+  await until("the agent socket to open", () => connection.isOpen())
+
+  await connection.sendFinal({ type: "ended", outcome: "approved" })
+
+  // The ack is what makes the next line safe to assert without polling: the
+  // relay has stored the ending before `sendFinal` resolved, so a phone that
+  // opens the link now is told how it ended.
+  expect(connection.stats().endedAcked).toBe(true)
+  const late = await rawPeer(relay.port, "human")
+  await until(
+    "the late phone to be told",
+    () => late.inbox.length > 0,
+    MESSAGE_WAIT_MS,
+  )
+  expect(late.inbox).toEqual([{ type: "ended", outcome: "approved" }])
+})
+
+test("a relay that never acknowledges the ending costs two seconds, not the handoff", async () => {
+  // An older relay, or one whose socket died between the write and the ack.
+  // The ending still went out; the agent must not hang on the receipt.
+  const fake = await startFakeRelay()
+  const connection = track(
+    connectRelay({
+      url: `ws://127.0.0.1:${fake.port}/ws?role=agent`,
+      onMessage: () => undefined,
+      heartbeatMs: 60_000,
+    }),
+  )
+  await until("the socket to open", () => connection.isOpen())
+
+  const startedAt = Date.now()
+  await connection.sendFinal({ type: "ended", outcome: "timeout" })
+  const waited = Date.now() - startedAt
+
+  expect(fake.received).toEqual([{ type: "ended", outcome: "timeout" }])
+  expect(connection.stats().endedAcked).toBe(false)
+  expect(waited).toBeGreaterThanOrEqual(ENDED_ACK_TIMEOUT_MS - 50)
+  expect(waited).toBeLessThan(ENDED_ACK_TIMEOUT_MS + 1500)
+}, 10000)
 
 test("close() ends the handoff and stops reconnecting", async () => {
   const fake = await startFakeRelay()

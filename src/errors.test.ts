@@ -23,6 +23,8 @@ const COVERED_BY = {
   invalid_mode: "handoff.test.ts — an unknown mode is refused",
   empty_action:
     "handoff.test.ts and tool.test.ts — a blank approval action is refused",
+  invalid_option:
+    "handoff.test.ts — a humanGoneGraceMs below the floor, and an infinite one",
   browser_unusable: "handoff.test.ts — a closed or orphaned page is refused",
   relay_start_failed: "deploy.test.ts — an unreachable gateway",
   concurrency_limit: "deploy.test.ts — a gateway at its session cap",

@@ -10,8 +10,9 @@
  *    valid for an hour, so a dropped socket is recovered with backoff for as
  *    long as the handoff is running.
  * 3. The relay answers `ping` itself and does not forward it. A pong proves
- *    the relay is alive; it proves nothing about the human. There is no signal
- *    for "the human closed the tab" — the timeout is the honest answer.
+ *    the relay is alive; it proves nothing about the human. The relay says
+ *    that in its own words instead — `presence`, reported here as `onPresence`
+ *    — because it is the only party that can see the phone's socket.
  */
 import WebSocket from "ws"
 
@@ -27,6 +28,17 @@ const MAX_BACKOFF_MS = 8_000
 const BASE_BACKOFF_MS = 500
 const CLOSE_GRACE_MS = 2_000
 
+/**
+ * How long `sendFinal` waits for `ended_ack` before it stops caring.
+ *
+ * The sandbox is destroyed within a second or so of this call, and the ack is
+ * the only proof that the ending was stored rather than merely written to a
+ * socket that died with the process. Two seconds is the same grace the write
+ * itself gets: long enough for a round trip to us-west and a reconnect, short
+ * enough that a relay which cannot answer never becomes the caller's problem.
+ */
+export const ENDED_ACK_TIMEOUT_MS = 2_000
+
 export interface RelayConnectionOptions {
   /** `wss://…/ws?role=agent&pt_token=…`, exactly as `startRelay()` returned it. */
   url: string
@@ -34,6 +46,13 @@ export interface RelayConnectionOptions {
   onMessage: (message: HumanToAgent) => void
   /** Called on every successful connect, including reconnects. */
   onOpen?: () => void
+  /**
+   * Called with whether a human is connected to the relay: once shortly after
+   * every connect, and then on every change. The relay is the only party that
+   * can see the phone's socket — it answers the heartbeats itself — so this is
+   * the sole signal that a tab was closed.
+   */
+  onPresence?: (human: boolean) => void
   /** Heartbeat period. Defaults to the protocol's 20 s. */
   heartbeatMs?: number
 }
@@ -47,9 +66,12 @@ export interface RelayConnection {
   send(message: AgentToHuman | Heartbeat): Promise<void>
   /**
    * Send a terminal message (the `ended` frame), waiting up to the close grace
-   * period for a reconnect to finish if the socket is momentarily down. The
-   * human's phone hangs on "Reconnecting…" forever if this is dropped, so it is
-   * worth the short wait that `send` deliberately refuses for stale frames.
+   * period for a reconnect to finish if the socket is momentarily down, and
+   * then up to `ENDED_ACK_TIMEOUT_MS` for the relay's `ended_ack`. The human's
+   * phone hangs on "Reconnecting…" forever if this is dropped, so it is worth
+   * the short wait that `send` deliberately refuses for stale frames — and the
+   * caller destroys the sandbox next, so "written" is not the same as
+   * "stored". `stats().endedAcked` says which of the two happened.
    */
   sendFinal(message: AgentToHuman): Promise<void>
   isOpen(): boolean
@@ -66,6 +88,13 @@ export interface RelayConnectionStats {
    * second one connects; both are recovered here, and both count.
    */
   reconnects: number
+  /**
+   * Whether the relay confirmed it had stored the ending before `sendFinal`
+   * gave up on it. False until `sendFinal` is called, and false afterwards
+   * against a relay too old to answer — in which case the ending was still
+   * sent, it is only its survival past the sandbox that is unproven.
+   */
+  endedAcked: boolean
 }
 
 function toText(data: WebSocket.RawData): string {
@@ -99,6 +128,12 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
   let opens = 0
   let heartbeat: ReturnType<typeof setInterval> | null = null
   let reconnect: ReturnType<typeof setTimeout> | null = null
+  // Set while `sendFinal` is waiting for the receipt, and called by the
+  // `ended_ack` branch of `handle`. Null at every other moment, so a stray ack
+  // — a relay that answers twice, a reconnect that replays one — resolves
+  // nothing.
+  let acknowledgeEnded: (() => void) | null = null
+  let endedAcked = false
 
   const send = (message: AgentToHuman | Heartbeat): Promise<void> =>
     new Promise<void>((resolve) => {
@@ -110,7 +145,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       live.send(JSON.stringify(message), () => resolve())
     })
 
-  const sendFinal = (message: AgentToHuman): Promise<void> =>
+  const deliverFinal = (message: AgentToHuman): Promise<void> =>
     new Promise<void>((resolve) => {
       const trySend = (): boolean => {
         const live = socket
@@ -134,10 +169,38 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       }, 25)
     })
 
+  /** Wait for `ended_ack`, or for the ack deadline, whichever comes first. */
+  const waitForAck = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const giveUp = setTimeout(() => {
+        acknowledgeEnded = null
+        resolve()
+      }, ENDED_ACK_TIMEOUT_MS)
+      acknowledgeEnded = () => {
+        clearTimeout(giveUp)
+        acknowledgeEnded = null
+        endedAcked = true
+        resolve()
+      }
+    })
+
+  const sendFinal = async (message: AgentToHuman): Promise<void> => {
+    await deliverFinal(message)
+    await waitForAck()
+  }
+
   const handle = (message: RelayMessage): void => {
     switch (message.type) {
       case "ping":
         void send({ type: "pong" })
+        return
+      case "presence":
+        // The relay's own report, not a human message: it is delivered even
+        // after `close()` has been called, because nothing acts on it then.
+        options.onPresence?.(message.human)
+        return
+      case "ended_ack":
+        acknowledgeEnded?.()
         return
       case "tap":
       case "char":
@@ -191,7 +254,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
     send,
     sendFinal,
     isOpen: () => socket?.readyState === WebSocket.OPEN,
-    stats: () => ({ reconnects: Math.max(0, opens - 1) }),
+    stats: () => ({ reconnects: Math.max(0, opens - 1), endedAcked }),
     close() {
       shuttingDown = true
       if (heartbeat) clearInterval(heartbeat)

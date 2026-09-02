@@ -100,6 +100,11 @@ export async function openHandoffPage(
   await page.text()
 
   const socket = new WebSocket(humanWebSocketUrl(humanUrl))
+  // A phone whose socket is reset — replaced by a second holder of the link,
+  // or left holding a sandbox that has just been destroyed — must not take the
+  // run down with it. `ws` throws an unhandled error event when nothing is
+  // listening, and there is nothing to do about it here: the page is gone.
+  socket.on("error", () => undefined)
   let frame: ReceivedFrame | null = null
   let firstFrameAt: number | null = null
   let frames = 0
