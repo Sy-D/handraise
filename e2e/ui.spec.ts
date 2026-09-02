@@ -271,24 +271,88 @@ const MIN_TAP_TARGET_PX = 44
 /** The gutter that keeps a missed Backspace off "clear the whole field". */
 const MIN_DESTRUCTIVE_GAP_PX = 24
 
+/** The page's auto-zoom constants, restated so a change to one is a red test. */
+const MAX_ZOOM = 3
+const TAP_ZOOM = 2.5
+const READABLE_FIELD_PX = 44
+const FIELD_WIDTH_SHARE = 0.92
+const FOCUS_ANCHOR_Y = 0.42
+
+const QUEUE_HINT = "Reconnecting \u2014 your input is queued"
+
+/** The zoom wrapper's transform: scale, then translate, origin at 0 0. */
+interface Transform {
+  scale: number
+  tx: number
+  ty: number
+}
+
+/**
+ * The transform the page must settle on after a focus, computed here the long
+ * way round from FOCUS_RECT and META so a mistake in the page's own maths
+ * cannot cancel itself out.
+ *
+ * One k, not two: this META scales both axes by jpeg/device = 0.25 and the
+ * letterbox is square in both, so kx and ky coincide.
+ */
+function expectedZoom(frame: Box): Transform {
+  const fit = Math.min(frame.w / FRAME_W, frame.h / FRAME_H)
+  const lb = letterbox(frame.w, frame.h)
+  const k = (META.jpegWidth / META.deviceWidth) * META.pageScaleFactor * fit
+  const scale = Math.min(
+    Math.max(READABLE_FIELD_PX / (FOCUS_RECT.height * k), 1),
+    Math.max((frame.w * FIELD_WIDTH_SHARE) / (FOCUS_RECT.width * k), 1),
+    MAX_ZOOM,
+  )
+  const lx = lb.x + (FOCUS_RECT.x + FOCUS_RECT.width / 2) * k
+  const ly = lb.y + (FOCUS_RECT.y + FOCUS_RECT.height / 2) * k
+  const pan = (offset: number, size: number): number =>
+    Math.min(0, Math.max(size - size * scale, offset))
+  return {
+    scale,
+    tx: pan(frame.w / 2 - lx * scale, frame.w),
+    ty: pan(frame.h * FOCUS_ANCHOR_Y - ly * scale, frame.h),
+  }
+}
+
+/** What the zoom wrapper is actually transformed by, right now. */
+function zoomTransform(target: Page): Promise<Transform> {
+  return target.evaluate(() => {
+    const zoom = document.getElementById("zoom")
+    if (!zoom) throw new Error("no zoom wrapper")
+    const live = new DOMMatrixReadOnly(getComputedStyle(zoom).transform)
+    return { scale: live.a, tx: live.e, ty: live.f }
+  })
+}
+
+/** #frame is never transformed, so this is the letterbox's own coordinate box. */
+async function frameBox(): Promise<Box> {
+  const box = await page.locator("#frame").boundingBox()
+  if (!box) throw new Error("#frame has no bounding box")
+  return { x: box.x, y: box.y, w: box.width, h: box.height }
+}
+
 /**
  * Where the ring must end up, computed here the long way round so a mistake in
  * the page's own maths cannot cancel out: page CSS px → frame px (the JPEG
  * scaling Chromium left out of the metadata) → canvas px (this page's
- * letterbox). Viewport-relative, like every Playwright bounding box.
+ * letterbox) → screen px (the auto-zoom transform, which the ring rides inside
+ * rather than recomputing). Viewport-relative, like every Playwright box.
  */
-function expectedRing(canvas: Box, frame: Box): Box {
+function expectedRing(frame: Box): Box {
+  const lb = letterbox(frame.w, frame.h)
   const kx =
-    ((META.jpegWidth / META.deviceWidth) * META.pageScaleFactor * frame.w) /
+    ((META.jpegWidth / META.deviceWidth) * META.pageScaleFactor * lb.w) /
     FRAME_W
   const ky =
-    ((META.jpegHeight / META.deviceHeight) * META.pageScaleFactor * frame.h) /
+    ((META.jpegHeight / META.deviceHeight) * META.pageScaleFactor * lb.h) /
     FRAME_H
+  const zoom = expectedZoom(frame)
   return {
-    x: canvas.x + frame.x + FOCUS_RECT.x * kx,
-    y: canvas.y + frame.y + FOCUS_RECT.y * ky,
-    w: FOCUS_RECT.width * kx,
-    h: FOCUS_RECT.height * ky,
+    x: frame.x + zoom.tx + (lb.x + FOCUS_RECT.x * kx) * zoom.scale,
+    y: frame.y + zoom.ty + (lb.y + FOCUS_RECT.y * ky) * zoom.scale,
+    w: FOCUS_RECT.width * kx * zoom.scale,
+    h: FOCUS_RECT.height * ky * zoom.scale,
   }
 }
 
@@ -505,7 +569,7 @@ test("every key is a 44px target and clear is fenced off from backspace", async 
   expect(consoleErrors).toEqual([])
 })
 
-test("the key bar stays on one line on a narrow phone", async () => {
+test("the field owns its row and the key bar stays on one line", async () => {
   await page.setViewportSize({ width: 320, height: 568 })
   await showFrame()
 
@@ -513,15 +577,190 @@ test("the key bar stays on one line on a narrow phone", async () => {
   const keys = await page.locator(".keys").boundingBox()
   if (!field || !keys) throw new Error("the input bar has no bounding box")
 
-  // Same row, keys to the right of the field, and every tap target usable.
-  expect(Math.abs(field.y - keys.y)).toBeLessThanOrEqual(6)
-  expect(keys.x).toBeGreaterThan(field.x + field.width - 1)
-  expect(field.width).toBeGreaterThan(60)
-  for (const id of ["#key-back", "#key-clear", "#key-tab", "#key-enter"]) {
-    const key = await page.locator(id).boundingBox()
-    if (!key) throw new Error(`${id} has no bounding box`)
-    expect(key.height).toBeGreaterThanOrEqual(44)
+  // Sharing the row with four keys left the field 69px here — about four
+  // visible characters. Fine for a six-digit code, useless for an email.
+  expect(field.width).toBeGreaterThan(260)
+  expect(keys.y).toBeGreaterThanOrEqual(field.y + field.height - 1)
+
+  // The keys themselves still share one line: a wrapped key bar on a 320px
+  // phone pushes the hint and both buttons below the fold.
+  const boxes = await keyBoxes()
+  const first = boxes[0]
+  if (!first) throw new Error("the key bar is missing keys")
+  for (const key of boxes) {
+    expect(Math.abs(key.y - first.y)).toBeLessThanOrEqual(1)
+    expect(key.w).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
+    expect(key.h).toBeGreaterThanOrEqual(MIN_TAP_TARGET_PX)
   }
+  expect(keys.height).toBeLessThan(first.h * 1.5)
+
+  // The footer took a row; the stage is what paid for it and it can afford to.
+  const stage = await page.locator("#stage").boundingBox()
+  if (!stage) throw new Error("#stage has no bounding box")
+  expect(stage.height).toBeGreaterThan(200)
+  expect(consoleErrors).toEqual([])
+})
+
+test("the focused field is zoomed to and a tap on it still lands exactly", async () => {
+  await showFrame()
+
+  const frame = await frameBox()
+  const want = expectedZoom(frame)
+  // The bug this exists for: at fit the field is 11.6 CSS px tall on a 390px
+  // phone, which is the audit's "about a millimetre of glyph height".
+  expect(want.scale).toBeGreaterThan(2)
+
+  agent.send({ type: "focus", rect: FOCUS_RECT, label: "Code" })
+  await waitForRing(page, true)
+  await page.waitForTimeout(320)
+
+  const live = await zoomTransform(page)
+  expect(Math.abs(live.scale - want.scale)).toBeLessThanOrEqual(0.01)
+  expect(Math.abs(live.tx - want.tx)).toBeLessThanOrEqual(1)
+  expect(Math.abs(live.ty - want.ty)).toBeLessThanOrEqual(1)
+
+  // And the tap maths survived the transform. Inverted by hand from the
+  // transform above: client px → canvas CSS px → frame px.
+  //   local = (client - frameOrigin - t) / scale
+  //   fx    = (local.x - letterbox.x) * FRAME_W / letterbox.w
+  const clientX = frame.x + frame.w * 0.32
+  const clientY = frame.y + frame.h * 0.55
+  const lb = letterbox(frame.w, frame.h)
+  const localX = (clientX - frame.x - want.tx) / want.scale
+  const localY = (clientY - frame.y - want.ty) / want.scale
+  const expectedFx = Math.round(((localX - lb.x) * FRAME_W) / lb.w)
+  const expectedFy = Math.round(((localY - lb.y) * FRAME_H) / lb.h)
+  // A point that fell outside the frame would make the assertion below vacuous.
+  expect(expectedFx).toBeGreaterThanOrEqual(0)
+  expect(expectedFx).toBeLessThanOrEqual(FRAME_W)
+  expect(expectedFy).toBeGreaterThanOrEqual(0)
+  expect(expectedFy).toBeLessThanOrEqual(FRAME_H)
+
+  await page.mouse.click(clientX, clientY)
+
+  const message = await agent.next()
+  expect(message.type).toBe("tap")
+  if (message.type !== "tap") throw new Error("expected a tap")
+  expect(Math.abs(message.fx - expectedFx)).toBeLessThanOrEqual(1)
+  expect(Math.abs(message.fy - expectedFy)).toBeLessThanOrEqual(1)
+  expect(consoleErrors).toEqual([])
+})
+
+test("a double tap toggles the zoom and sends only the first tap", async () => {
+  await showFrame()
+
+  const frame = await frameBox()
+  const lb = letterbox(frame.w, frame.h)
+  const x = frame.x + lb.x + lb.w * 0.4
+  const y = frame.y + lb.y + lb.h * 0.6
+
+  // The first tap goes out immediately — waiting 250ms to learn whether a
+  // second one is coming would delay the one action this page exists for.
+  await page.mouse.click(x, y)
+  expect(await agent.next()).toEqual({
+    type: "tap",
+    fx: Math.round((lb.w * 0.4 * FRAME_W) / lb.w),
+    fy: Math.round((lb.h * 0.6 * FRAME_H) / lb.h),
+  })
+
+  await page.mouse.click(x, y)
+  await page.waitForTimeout(320)
+  expect(await zoomTransform(page)).toMatchObject({ scale: TAP_ZOOM })
+  // The second tap paid for the zoom instead of reaching the remote page.
+  expect(countOf("tap")).toBe(1)
+
+  // And back to fit, which is the only way out of a zoom the human chose.
+  await page.mouse.click(x, y)
+  await page.mouse.click(x, y)
+  await page.waitForTimeout(320)
+  const back = await zoomTransform(page)
+  expect(back.scale).toBe(1)
+  expect(back.tx).toBe(0)
+  expect(back.ty).toBe(0)
+  expect(consoleErrors).toEqual([])
+})
+
+test("input made while the socket is down is queued, then sent once in order", async () => {
+  await showFrame()
+
+  // Displace the page's socket the way the preview proxy's 60s close does.
+  const intruder = new WebSocket(`ws://127.0.0.1:${relay.port}/ws?role=human`)
+  await new Promise<void>((resolve, reject) => {
+    intruder.once("open", () => resolve())
+    intruder.once("error", reject)
+  })
+  await page.waitForFunction(() => {
+    const dot = document.getElementById("dot")
+    return dot ? dot.className.includes("waiting") : false
+  })
+
+  await page.locator("#kbd").focus()
+  await page.locator("#kbd").pressSequentially("abc")
+  // Silence is the one thing an interface may never do: the human has to be
+  // told the characters are held, or they retype them and double-submit.
+  expect(await page.locator("#hint").textContent()).toBe(QUEUE_HINT)
+
+  intruder.close()
+  await page.waitForFunction(() => {
+    const dot = document.getElementById("dot")
+    return dot ? dot.className === "dot" : false
+  })
+  await page.waitForFunction(
+    () => document.querySelector<HTMLInputElement>("#kbd")?.value === "abc",
+  )
+  await page.waitForTimeout(300)
+
+  // Exactly these three, in the order they were typed, once each.
+  const typed = agent.received
+    .filter((message) => message.type === "char")
+    .map((message) => (message.type === "char" ? message.ch : ""))
+  expect(typed).toEqual(["a", "b", "c"])
+  expect(await page.locator("#hint").textContent()).toBe(DEFAULT_HINT)
+  expect(consoleErrors).toEqual([])
+}, 20000)
+
+test("the local field dresses itself as the remote one: OTP, then password", async () => {
+  await showFrame()
+
+  agent.send({
+    type: "focus",
+    rect: FOCUS_RECT,
+    label: "Verification code",
+    kind: "otp",
+  })
+  await waitForRing(page, true)
+
+  const kbd = page.locator("#kbd")
+  // The reason the field is on the wire at all: this is what makes iOS offer
+  // the code from Messages instead of making the human copy it between apps.
+  expect(await kbd.getAttribute("autocomplete")).toBe("one-time-code")
+  expect(await kbd.getAttribute("inputmode")).toBe("numeric")
+  expect(await kbd.getAttribute("type")).toBe("text")
+  // No pattern: plenty of one-time codes are alphanumeric.
+  expect(await kbd.getAttribute("pattern")).toBe(null)
+
+  await kbd.focus()
+  await kbd.pressSequentially("31")
+  expect(await agent.next()).toEqual({ type: "char", ch: "3" })
+  expect(await agent.next()).toEqual({ type: "char", ch: "1" })
+
+  agent.send({
+    type: "focus",
+    rect: { x: 400, y: 320, width: 200, height: 40 },
+    label: "Password",
+    kind: "password",
+  })
+  await page.waitForFunction(
+    () => document.getElementById("kbd")?.getAttribute("type") === "password",
+  )
+  expect(await kbd.getAttribute("autocomplete")).toBe("off")
+  // A new field is a new context: the mirror must not leave the old value for
+  // the next keystroke's Backspace diff to run against.
+  expect(await kbd.inputValue()).toBe("")
+
+  await kbd.focus()
+  await kbd.pressSequentially("s")
+  expect(await agent.next()).toEqual({ type: "char", ch: "s" })
   expect(consoleErrors).toEqual([])
 })
 
@@ -683,18 +922,13 @@ test("the header names the page and gives a long reason two lines", async () => 
 test("a focus message rings the remote field and names it in the bar", async () => {
   await showFrame()
 
-  const canvas = await page.locator("#view").boundingBox()
-  if (!canvas) throw new Error("canvas has no bounding box")
-  const want = expectedRing(
-    { x: canvas.x, y: canvas.y, w: canvas.width, h: canvas.height },
-    letterbox(canvas.width, canvas.height),
-  )
+  const want = expectedRing(await frameBox())
 
   agent.send({ type: "focus", rect: FOCUS_RECT, label: "Password" })
   await waitForRing(page, true)
-  // Longer than the ring's 120 ms move transition, so the box read below is
-  // the one it settled on and not a frame somewhere along the way.
-  await page.waitForTimeout(200)
+  // Longer than the ring's 120 ms move and the zoom's 180 ms, so the box read
+  // below is the one it settled on and not a frame somewhere along the way.
+  await page.waitForTimeout(320)
 
   const ring = await page.locator("#focus-ring").boundingBox()
   if (!ring) throw new Error("the focus ring has no bounding box")

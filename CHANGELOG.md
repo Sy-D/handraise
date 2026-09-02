@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-02
+
+The phone UI, rebuilt from a design-engineering audit (`spikes/emil-ui-audit.md`).
+The headline finding: the human could not read the page they were operating —
+a 1280×800 frame letterboxed to 29% on a 390px phone, ~1mm glyphs, with zoom
+blocked. Remote 16px text now renders at 10.4 CSS px instead of 4.6.
+
+### Added
+
+- **Auto-zoom to the focused field.** The agent already reports which field
+  has focus; the phone now zooms so that field is readable and centred, capped
+  at 3×. Pinch to zoom and pan, double-tap to toggle. The first tap is never
+  delayed — a second tap within 250ms toggles zoom instead of sending again.
+- **Hold to give up.** The give-up button is now "I can't do this" and needs a
+  700ms press-and-hold; a bare tap explains why. The primary "Hand back" stays
+  a single tap. Both are irreversible; only one of them deserved a guard.
+- **Input queued across reconnects.** Keystrokes typed while the socket is
+  reconnecting are held (up to 50) and flushed in order, once; the hint says so.
+  A give-up during an outage used to vanish and cost the agent its full timeout.
+  Taps and scrolls are deliberately not replayed — the page may have moved.
+- **One-time-code autofill.** The focus event carries an optional `kind`
+  (`otp` | `password` | `text`), derived from the remote field's attributes
+  only — never its value — so the phone's field gets `autocomplete=one-time-code`
+  and iOS can offer the SMS code instead of making the human retype it.
+- Tap feedback on the live view; a ripple where the finger landed.
+
+### Changed
+
+- Key bar regrouped by consequence: `⌫ ⇥ ⏎` together, **Clear** fenced 124px
+  away (was 6px from backspace). Every key ≥44px; disabled contrast 1.96→3.17:1.
+  The input has its own full-width row (296px at 320px wide, was 69px).
+- The give-up button lost the UI's only colour; red survives only as the hold's
+  progress fill. Both exit buttons are now exactly the same height.
+- Safe-area inset applied once (was twice, ~78px on notched iPhones);
+  `100dvh` + `interactive-widget=resizes-content` so the bar survives the
+  Android keyboard. Header and footer lifted off the stage (was 1.04:1).
+- Overlays speak to the human, say thank you, and fade in instead of snapping.
+  The idle dot no longer pulses; only "reconnecting" does.
+
 ## [0.2.0] - 2026-09-01
 
 Everything below shipped after 0.1.0 was published. **0.1.0 is broken and
@@ -100,5 +139,6 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   so two simultaneous handoffs is the plan-tier ceiling.
 - TypeScript/Node only.
 
+[0.3.0]: https://github.com/Sy-D/handraise/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Sy-D/handraise/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Sy-D/handraise/releases/tag/v0.1.0

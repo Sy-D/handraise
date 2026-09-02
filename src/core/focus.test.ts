@@ -8,7 +8,7 @@
  */
 import { afterAll, beforeAll, expect, test } from "bun:test"
 import { type Browser, chromium, type Page } from "playwright-core"
-
+import type { FocusKind } from "../relay/protocol"
 import { probeFocus } from "./focus"
 
 let browser: Browser
@@ -42,7 +42,16 @@ async function labelOf(html: string): Promise<string | null> {
   return probe.label
 }
 
-test("a labelled input reports its box and its label text", async () => {
+/** The kind `probeFocus` reports for the focused `#field` of `html`. */
+async function kindOf(html: string): Promise<FocusKind> {
+  const page = await open(html)
+  await page.focus("#field")
+  const probe = await probeFocus(page)
+  await page.close()
+  return probe.kind
+}
+
+test("a labelled input reports its box, its label text and its kind", async () => {
   const page = await open(`
     <label for="field">Password</label>
     <input id="field" type="password"
@@ -54,6 +63,7 @@ test("a labelled input reports its box and its label text", async () => {
 
   expect(probe.label).toBe("Password")
   expect(probe.rect).toEqual({ x: 40, y: 80, width: 200, height: 30 })
+  expect(probe.kind).toBe("password")
 })
 
 test("nothing focused reports no rect and no label", async () => {
@@ -63,7 +73,7 @@ test("nothing focused reports no rect and no label", async () => {
   await page.close()
 
   // The page reports <body> as the active element; that is not a field.
-  expect(probe).toEqual({ rect: null, label: null })
+  expect(probe).toEqual({ rect: null, label: null, kind: "text" })
 })
 
 test("a wrapping label wins over aria-label", async () => {
@@ -109,7 +119,7 @@ test("a zero-sized field has nothing to draw around", async () => {
   const probe = await probeFocus(page)
   await page.close()
 
-  expect(probe).toEqual({ rect: null, label: null })
+  expect(probe).toEqual({ rect: null, label: null, kind: "text" })
 })
 
 test("the field's own value never leaves the page", async () => {
@@ -127,5 +137,50 @@ test("a closed page yields no focus instead of throwing", async () => {
   const page = await open(`<input id="field" aria-label="gone">`)
   await page.close()
 
-  expect(await probeFocus(page)).toEqual({ rect: null, label: null })
+  expect(await probeFocus(page)).toEqual({
+    rect: null,
+    label: null,
+    kind: "text",
+  })
+})
+
+/**
+ * The kind exists so the phone can switch its own field to a numeric keypad
+ * with `autocomplete="one-time-code"` — which is the difference between iOS
+ * offering the SMS code and the human retyping it from another app. It is
+ * derived from attributes only, never from the value, for the same reason the
+ * label is.
+ */
+test("a password field is a password even when it is named like a code", async () => {
+  // type wins over the name, or a "passcode" field would offer autofill from
+  // Messages and put the human's password in a numeric keypad.
+  expect(
+    await kindOf(`<input id="field" type="password" name="passcode">`),
+  ).toBe("password")
+})
+
+test("a one-time-code field is recognised by autocomplete, shape or name", async () => {
+  expect(await kindOf(`<input id="field" autocomplete="one-time-code">`)).toBe(
+    "otp",
+  )
+  // The shape of every SMS-code box: digits only, four to eight of them.
+  expect(
+    await kindOf(`<input id="field" inputmode="numeric" maxlength="6">`),
+  ).toBe("otp")
+  expect(
+    await kindOf(`<label for="field">Verification code</label>
+      <input id="field">`),
+  ).toBe("otp")
+  expect(await kindOf(`<input id="field" name="totp_token">`)).toBe("otp")
+})
+
+test("an ordinary field is text, and a long numeric field is not an OTP", async () => {
+  expect(await kindOf(`<input id="field" type="email" name="email">`)).toBe(
+    "text",
+  )
+  // A 16-digit card number is numeric and is not a one-time code.
+  expect(
+    await kindOf(`<input id="field" inputmode="numeric" maxlength="16"
+      aria-label="Card number">`),
+  ).toBe("text")
 })

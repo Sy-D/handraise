@@ -533,12 +533,39 @@ const PAGE = `<!doctype html>
     justify-content: center;
     padding: 10px calc(10px + env(safe-area-inset-right)) 10px calc(10px + env(safe-area-inset-left));
   }
+  /* Two boxes, and both are load-bearing.
+
+     #frame is never transformed, so its getBoundingClientRect() is the honest
+     layout size even while a zoom is mid-animation — everything the letterbox
+     maths needs. It also does the clipping, at the stage's content edge.
+
+     #zoom carries the transform. transform-origin: 0 0 is what makes the
+     inverse in toFrame() one subtraction and one division: a canvas-local
+     point l lands at l * scale + t, and nothing else moves. */
+  #frame {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    border-radius: var(--radius);
+  }
+  #zoom {
+    position: absolute;
+    inset: 0;
+    transform-origin: 0 0;
+    will-change: transform;
+  }
+  /* Only the eased moves animate: a pinch follows the fingers with no lag at
+     all, and the auto-zoom is the one place where movement explains something
+     (this is the field you are typing into, and here is where it went). */
+  #zoom[data-eased] {
+    transition: transform 180ms cubic-bezier(0.23, 1, 0.32, 1);
+  }
   canvas {
     width: 100%;
     height: 100%;
     touch-action: none;
     display: block;
-    border-radius: var(--radius);
   }
   #placeholder {
     position: absolute;
@@ -572,19 +599,28 @@ const PAGE = `<!doctype html>
   /* The ring around the focused remote field. A sibling of the canvas, never
      drawn on it: every frame repaints the canvas and would wipe it out.
      pointer-events: none keeps taps going to the canvas underneath. */
+  /* Inside #zoom, so the ring scales and pans with the frame it points at for
+     free — one transform instead of a second set of maths that can disagree
+     with the first. Its stroke divides the zoom back out: a 2px ring is a 2px
+     ring at 3x, not a 6px slab over the field it is meant to outline. */
   #focus-ring {
     position: absolute;
     pointer-events: none;
-    border: 2px solid var(--text);
+    border: calc(2px / var(--zoom, 1)) solid var(--text);
     /* Most login pages are light, and a near-white ring on a white form is
        invisible. The 1px dark keyline outside it is not decoration: it is what
        makes the ring readable on a page whose colours we do not control. */
-    outline: 1px solid var(--bg);
-    border-radius: 2px;
+    outline-width: calc(1px / var(--zoom, 1));
+    outline-style: solid;
+    outline-color: var(--bg);
+    border-radius: calc(2px / var(--zoom, 1));
     transition: left .12s ease, top .12s ease, width .12s ease, height .12s ease;
   }
   @media (prefers-reduced-motion: reduce) {
     #focus-ring { transition: none; }
+    /* The zoom still happens — it is the only way the page can be read at all.
+       It just arrives instead of travelling. */
+    #zoom[data-eased] { transition: none; }
     /* The acknowledgement is the point, the ripple is not: keep the dot, drop
        the movement. */
     .tapmark { animation: tapmark-fade 200ms linear forwards; }
@@ -602,12 +638,13 @@ const PAGE = `<!doctype html>
       padding-left: calc(12px + env(safe-area-inset-left));
     }
   }
-  /* Field and key bar on one line. The field takes the slack, the keys never
-     shrink and never wrap: a wrapped key bar on a 320px phone would push the
-     hint and the buttons below the fold. */
-  .bar { display: flex; align-items: stretch; gap: 8px; }
+  /* The field owns its own row, the keys sit underneath it on theirs. Sharing
+     one line left the field 69px at 320px — about four visible characters,
+     which is fine for a six-digit code and useless for an email address. The
+     footer costs ~52px more; the stage was wasting 414 of them. */
+  .bar { display: flex; flex-direction: column; gap: 8px; }
   input {
-    flex: 1 1 auto;
+    width: 100%;
     min-width: 0;
     padding: 12px 14px;
     border-radius: var(--radius);
@@ -618,14 +655,15 @@ const PAGE = `<!doctype html>
     font-size: 16px;
   }
   input:focus { outline: none; border-color: oklch(0.44 0 0); }
-  .keys { display: flex; flex: none; gap: 6px; }
-  /* 44 x 44: the minimum is a target, not a height. These four buttons exist
-     because a phone's soft keyboard is unreliable, so they have to be the most
-     reliable controls on the page. Muted weight so the bar does not compete
-     with the hand-back button below it. */
+  .keys { display: flex; gap: 6px; }
+  /* 44 x 44 is the floor, not the target. With a row to themselves the three
+     safe keys take a third of it each — 70px at 320px — because these four
+     buttons exist precisely because a phone's soft keyboard is unreliable, so
+     they have to be the most reliable controls on the page. Muted weight so the
+     bar does not compete with the hand-back button below it. */
   .key {
-    flex: none;
-    width: 44px;
+    flex: 1 1 0;
+    min-width: 44px;
     min-height: 44px;
     padding: 0;
     border: 1px solid var(--field);
@@ -641,7 +679,7 @@ const PAGE = `<!doctype html>
      guess at, and it sits behind a gutter the thumb has to reach for. A missed
      backspace can no longer empty the field. */
   #key-clear {
-    width: auto;
+    flex: 0 0 auto;
     min-width: 44px;
     margin-left: 18px;
     padding: 0 8px;
@@ -776,9 +814,13 @@ const PAGE = `<!doctype html>
     </div>
   </header>
   <main id="stage">
-    <canvas id="view"></canvas>
+    <div id="frame">
+      <div id="zoom">
+        <canvas id="view"></canvas>
+        <div id="focus-ring" hidden></div>
+      </div>
+    </div>
     <p id="placeholder">Waiting for the first frame…</p>
-    <div id="focus-ring" hidden></div>
   </main>
   <footer>
     <div class="bar">
@@ -807,6 +849,8 @@ const PAGE = `<!doctype html>
   var reason = document.getElementById("reason")
   var placeholder = document.getElementById("placeholder")
   var stage = document.getElementById("stage")
+  var frameEl = document.getElementById("frame")
+  var zoomEl = document.getElementById("zoom")
   var canvas = document.getElementById("view")
   var ctx = canvas.getContext("2d")
   var ring = document.getElementById("focus-ring")
@@ -838,9 +882,102 @@ const PAGE = `<!doctype html>
   /** Long enough that a stray thumb cannot reach it, short enough to not annoy. */
   var HOLD_MS = 700
   var HOLD_HINT = "Hold the button to stop the agent"
+  var QUEUE_HINT = "Reconnecting — your input is queued"
+  var QUEUE_FULL_HINT = "Reconnecting — queue full, the oldest input was dropped"
+  var hintTimer = null
+
+  /** Past this the JPEG has no more detail to magnify, only artefacts. */
+  var MAX_ZOOM = 3
+  /** Where a double tap lands when the page is at fit. */
+  var TAP_ZOOM = 2.5
+  /** A field has to be about this tall on the phone before it can be read. */
+  var READABLE_FIELD_PX = 44
+  /** A thumb of margin either side of the field, and the rest is zoom. Below
+      this the field falls off the screen; above it, readability is paying for
+      margin the letterbox already provides. */
+  var FIELD_WIDTH_SHARE = 0.92
+  /** Slightly above centre: what sits below a field is the button that submits it. */
+  var FOCUS_ANCHOR_Y = 0.42
+  /** Two taps closer than this in time and in space are one double tap. */
+  var DOUBLE_TAP_MS = 250
+  var DOUBLE_TAP_PX = 20
+  /** A finger that moves this far was never a tap. */
+  var TAP_SLOP_PX = 10
+  /** Queue depth while the socket is down: 50 keystrokes is a long password. */
+  var MAX_QUEUED = 50
+
+  /**
+   * The canvas transform, in canvas CSS pixels. transform-origin is 0 0, so a
+   * canvas-local point l is drawn at l * scale + t — which makes the inverse
+   * every tap needs a subtraction and a division, with no origin term.
+   * w and h are #frame's untransformed size, measured in render().
+   */
+  var view = { scale: 1, tx: 0, ty: 0, w: 0, h: 0 }
+
+  /**
+   * Human input made while the socket is down. It used to be dropped where the
+   * readyState === 1 check failed, which is the one thing an interface may
+   * never do silently: the human assumes the *remote page* ignored them, and
+   * retypes the character or taps the button again once the socket is back.
+   */
+  var outbox = []
+  var dropped = 0
 
   function send(message) {
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify(message))
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify(message))
+      return
+    }
+    // A heartbeat is only worth anything now. Replaying it later says nothing.
+    if (message.type === "ping") return
+    if (outbox.length >= MAX_QUEUED) {
+      outbox.shift()
+      dropped++
+    }
+    outbox.push(message)
+    showQueue()
+  }
+
+  /** The queue is never a secret: a full one says so, in the same line. */
+  function showQueue() {
+    if (hintTimer) {
+      clearTimeout(hintTimer)
+      hintTimer = null
+    }
+    hint.textContent = dropped > 0 ? QUEUE_FULL_HINT : QUEUE_HINT
+  }
+
+  /**
+   * In order, and at most once. The queue is taken before the first send, so a
+   * socket that dies halfway through cannot replay what already left: a
+   * duplicated Backspace deletes a character the human never asked to lose,
+   * while a dropped one is a character they can see is missing and retype.
+   */
+  function flushOutbox() {
+    var pending = outbox
+    outbox = []
+    dropped = 0
+    for (var i = 0; i < pending.length; i++) {
+      // Keystrokes, keys, clear, handback and abort are safe to deliver late:
+      // they mean the same thing whenever they land. A tap or a scroll does
+      // not — the page may have moved while the link was down, and a stale
+      // tap on the wrong element is worse than a tap the human repeats.
+      var t = pending[i].type
+      if (t === "tap" || t === "scroll") continue
+      ws.send(JSON.stringify(pending[i]))
+    }
+    if (hint.textContent === QUEUE_HINT || hint.textContent === QUEUE_FULL_HINT) {
+      setHint()
+    }
+  }
+
+  /**
+   * A handback or an abort made while the socket was down still has to arrive:
+   * the agent is waiting on exactly that message and would otherwise burn its
+   * whole five-minute timeout on a human who already answered.
+   */
+  function stillSending() {
+    return outbox.length > 0
   }
 
   function setStatus(live) {
@@ -848,26 +985,110 @@ const PAGE = `<!doctype html>
     if (!live) reason.textContent = "Reconnecting…"
   }
 
-  function render() {
-    var rect = canvas.getBoundingClientRect()
+  /**
+   * Push the transform to the compositor. The CSS variable rides along so the
+   * focus ring can divide the zoom back out of its own stroke width.
+   */
+  function applyTransform(eased) {
+    if (eased) zoomEl.dataset.eased = ""
+    else delete zoomEl.dataset.eased
+    zoomEl.style.transform =
+      "translate(" + view.tx + "px, " + view.ty + "px) scale(" + view.scale + ")"
+    zoomEl.style.setProperty("--zoom", String(view.scale))
+  }
+
+  function clampZoom(scale) {
+    return Math.min(MAX_ZOOM, Math.max(1, scale))
+  }
+
+  /** Keep the frame covering the viewport. At fit there is nowhere to pan to. */
+  function clampPan(offset, size, scale) {
+    return Math.min(0, Math.max(size - size * scale, offset))
+  }
+
+  function setView(scale, tx, ty, eased) {
+    view.scale = clampZoom(scale)
+    view.tx = clampPan(tx, view.w, view.scale)
+    view.ty = clampPan(ty, view.h, view.scale)
+    applyTransform(eased)
+  }
+
+  /** Put the canvas-local point (lx, ly) at this share of the visible box. */
+  function centreOn(lx, ly, scale, anchorY, eased) {
+    var next = clampZoom(scale)
+    setView(next, view.w / 2 - lx * next, view.h * anchorY - ly * next, eased)
+  }
+
+  /** A resize can strand the pan outside the frame; nothing else can. */
+  function reclamp() {
+    var tx = clampPan(view.tx, view.w, view.scale)
+    var ty = clampPan(view.ty, view.h, view.scale)
+    if (tx === view.tx && ty === view.ty) return
+    view.tx = tx
+    view.ty = ty
+    applyTransform(false)
+  }
+
+  /**
+   * Freeze a running zoom where it currently is. A finger on the glass owns the
+   * view: without this the pinch maths would read a mid-animation rectangle and
+   * compare it against the transform's final value, and the frame would jump.
+   */
+  function settleView() {
+    if (!zoomEl.hasAttribute("data-eased")) return
+    var live = new DOMMatrixReadOnly(getComputedStyle(zoomEl).transform)
+    view.scale = live.a > 0 ? live.a : view.scale
+    view.tx = live.e
+    view.ty = live.f
+    applyTransform(false)
+  }
+
+  /**
+   * Device pixels per canvas CSS pixel to draw at.
+   *
+   * The transform scales the canvas's rasterised bitmap, so drawing a dpr-sized
+   * backing store and then magnifying it 3x means squeezing the JPEG down to
+   * the canvas first and blowing the result back up — the field gets big and
+   * stays unreadable, which is the whole bug this is meant to fix. Draw at the
+   * zoom instead, capped twice: at the JPEG's own resolution, past which there
+   * is no more detail to find, and at MAX_ZOOM, so the backing store cannot
+   * grow without bound on a phone.
+   */
+  function backingScale() {
     var dpr = window.devicePixelRatio || 1
-    var w = Math.round(rect.width * dpr)
-    var h = Math.round(rect.height * dpr)
-    if (canvas.width !== w) canvas.width = w
-    if (canvas.height !== h) canvas.height = h
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    if (!frameW || !frameH || !rect.width) return
-    var scale = Math.min(rect.width / frameW, rect.height / frameH)
-    box = {
-      w: frameW * scale,
-      h: frameH * scale,
-      x: (rect.width - frameW * scale) / 2,
-      y: (rect.height - frameH * scale) / 2
+    var source = box.w > 0 ? frameW / (box.w * dpr) : 1
+    return dpr * Math.max(1, Math.min(view.scale, source, MAX_ZOOM))
+  }
+
+  function render() {
+    // #frame is never transformed, so this is the layout size even while a zoom
+    // is mid-flight. Measuring the canvas would return the animating rectangle.
+    var rect = frameEl.getBoundingClientRect()
+    view.w = rect.width
+    view.h = rect.height
+    if (!frameW || !frameH || !rect.width) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      return
     }
+    var fit = Math.min(rect.width / frameW, rect.height / frameH)
+    box = {
+      w: frameW * fit,
+      h: frameH * fit,
+      x: (rect.width - frameW * fit) / 2,
+      y: (rect.height - frameH * fit) / 2
+    }
+    var pixels = backingScale()
+    var wide = Math.round(rect.width * pixels)
+    var high = Math.round(rect.height * pixels)
+    if (canvas.width !== wide) canvas.width = wide
+    if (canvas.height !== high) canvas.height = high
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
     ctx.imageSmoothingQuality = "high"
-    ctx.drawImage(img, box.x * dpr, box.y * dpr, box.w * dpr, box.h * dpr)
+    ctx.drawImage(img, box.x * pixels, box.y * pixels, box.w * pixels, box.h * pixels)
     // The letterbox just moved, so the ring has to follow it.
+    reclamp()
     placeRing()
+    zoomToFocus()
   }
 
   function finiteNumber(value) {
@@ -886,27 +1107,75 @@ const PAGE = `<!doctype html>
    * The first factor is the scaling Chromium applied to the JPEG and left out
    * of the metadata; the second is this page's own letterbox.
    */
+  /** Remote page CSS px -> canvas CSS px, or null when the maths cannot run. */
+  function frameScale() {
+    if (!meta || !frameW || !frameH || !box.w) return null
+    var pageZoom = meta.pageScaleFactor > 0 ? meta.pageScaleFactor : 1
+    var kx = (meta.jpegWidth / meta.deviceWidth) * pageZoom * (box.w / frameW)
+    var ky = (meta.jpegHeight / meta.deviceHeight) * pageZoom * (box.h / frameH)
+    if (!isFinite(kx) || !isFinite(ky) || kx <= 0 || ky <= 0) return null
+    return { kx: kx, ky: ky }
+  }
+
   function placeRing() {
-    if (!focus || !focus.rect || !meta || !frameW || !frameH || !box.w) {
+    var k = focus && focus.rect ? frameScale() : null
+    if (!k) {
       ring.hidden = true
       return
     }
-    var zoom = meta.pageScaleFactor > 0 ? meta.pageScaleFactor : 1
-    var kx = (meta.jpegWidth / meta.deviceWidth) * zoom * (box.w / frameW)
-    var ky = (meta.jpegHeight / meta.deviceHeight) * zoom * (box.h / frameH)
-    if (!isFinite(kx) || !isFinite(ky) || kx <= 0 || ky <= 0) {
-      ring.hidden = true
-      return
-    }
-    // The ring is positioned against <main>, the canvas is centred inside it.
-    var here = canvas.getBoundingClientRect()
-    var host = stage.getBoundingClientRect()
+    // Canvas-local coordinates and nothing else: the ring sits inside #zoom, so
+    // the transform carries it onto the screen for free.
     var rect = focus.rect
-    ring.style.left = (here.left - host.left + box.x + rect.x * kx) + "px"
-    ring.style.top = (here.top - host.top + box.y + rect.y * ky) + "px"
-    ring.style.width = (rect.width * kx) + "px"
-    ring.style.height = (rect.height * ky) + "px"
+    ring.style.left = (box.x + rect.x * k.kx) + "px"
+    ring.style.top = (box.y + rect.y * k.ky) + "px"
+    ring.style.width = (rect.width * k.kx) + "px"
+    ring.style.height = (rect.height * k.ky) + "px"
     ring.hidden = false
+  }
+
+  /**
+   * The rect the view was last zoomed to. A focus that repeats — the agent
+   * re-probes after every keystroke — must not drag the frame back from
+   * wherever the human has since pinched to.
+   */
+  var zoomedTo = ""
+
+  /**
+   * The headline fix. At fit the remote page is letterboxed to about 29%, which
+   * puts 14px body text at ~4 CSS px — a millimetre of glyph. The agent already
+   * says which box it wants filled in, so fill the screen with that box the
+   * moment it says so.
+   *
+   * Losing the focus deliberately keeps the zoom. Snapping back to 29% would
+   * undo the one thing the human asked for and lose their place on the page
+   * between two fields of the same form; they zoom out with a double tap, when
+   * they mean to.
+   */
+  function zoomToFocus() {
+    var rect = focus && focus.rect
+    if (!rect) {
+      zoomedTo = ""
+      return
+    }
+    var key = rect.x + ":" + rect.y + ":" + rect.width + ":" + rect.height
+    var k = key === zoomedTo ? null : frameScale()
+    if (!k || !view.w) return
+    var wide = rect.width * k.kx
+    var high = rect.height * k.ky
+    if (wide <= 0 || high <= 0) return
+    zoomedTo = key
+    // Big enough to read, small enough that the field still fits on the screen,
+    // and never past the point where the JPEG runs out of pixels to magnify.
+    var readable = READABLE_FIELD_PX / high
+    var fits = (view.w * FIELD_WIDTH_SHARE) / wide
+    var scale = Math.min(Math.max(readable, 1), Math.max(fits, 1), MAX_ZOOM)
+    centreOn(
+      box.x + (rect.x + rect.width / 2) * k.kx,
+      box.y + (rect.y + rect.height / 2) * k.ky,
+      scale,
+      FOCUS_ANCHOR_Y,
+      true
+    )
   }
 
   /**
@@ -931,8 +1200,44 @@ const PAGE = `<!doctype html>
       rect: usable
         ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
         : null,
-      label: typeof message.label === "string" ? message.label : null
+      label: typeof message.label === "string" ? message.label : null,
+      // An agent that predates the field sends nothing, and "text" is exactly
+      // how every field behaved before it existed.
+      kind: message.kind === "otp" || message.kind === "password"
+        ? message.kind
+        : "text"
     }
+  }
+
+  /**
+   * Dress the local field like the remote one.
+   *
+   * This is the whole reason kind is on the wire: on iOS a text field with
+   * autocomplete="one-time-code" is offered the code straight from Messages,
+   * and the human stops copying six digits between two apps — which is the
+   * single most common thing this product is used for. There is deliberately no
+   * pattern attribute: plenty of one-time codes are alphanumeric, and a
+   * digits-only pattern would silently swallow the letters.
+   *
+   * Password gets type="password" so the secret is not left legible on a phone
+   * held in an office. The characters still stream out one at a time; the mirror
+   * keeps working, it just stops being readable over a shoulder.
+   */
+  var KINDS = {
+    otp: { type: "text", mode: "numeric", complete: "one-time-code" },
+    password: { type: "password", mode: "text", complete: "off" },
+    text: { type: "text", mode: "text", complete: "off" }
+  }
+
+  function applyKind(kind) {
+    var want = KINDS[kind] || KINDS.text
+    if (kbd.type === want.type && kbd.autocomplete === want.complete) return
+    kbd.type = want.type
+    kbd.inputMode = want.mode
+    kbd.autocomplete = want.complete
+    // A different field is a different context. Without this the Backspace diff
+    // would run the next keystroke against what was typed into the last one.
+    resetMirror()
   }
 
   img.onload = function () {
@@ -960,24 +1265,78 @@ const PAGE = `<!doctype html>
     img.src = src
   }
 
+  /**
+   * Client point -> canvas CSS pixel. The transform is ours and anchored at
+   * 0 0, so the inverse is the rectangle's own left edge (which is the image of
+   * canvas-local zero) and a division by the scale. No origin term, no pan
+   * term: both are already inside rect.left.
+   */
+  function toLocal(clientX, clientY) {
+    var rect = zoomEl.getBoundingClientRect()
+    return {
+      x: (clientX - rect.left) / view.scale,
+      y: (clientY - rect.top) / view.scale
+    }
+  }
+
   function toFrame(clientX, clientY) {
     if (!frameW || !box.w) return null
-    var rect = canvas.getBoundingClientRect()
-    var x = ((clientX - rect.left - box.x) * frameW) / box.w
-    var y = ((clientY - rect.top - box.y) * frameH) / box.h
+    var local = toLocal(clientX, clientY)
+    var x = ((local.x - box.x) * frameW) / box.w
+    var y = ((local.y - box.y) * frameH) / box.h
     if (x < 0 || y < 0 || x > frameW || y > frameH) return null
     return { x: Math.round(x), y: Math.round(y) }
   }
 
   var press = null
-  canvas.addEventListener("pointerdown", function (e) {
-    canvas.setPointerCapture(e.pointerId)
-    press = { x: e.clientX, y: e.clientY, lastY: e.clientY, travel: 0, sentAt: 0 }
-  })
-  canvas.addEventListener("pointermove", function (e) {
-    if (!press) return
+  /** Live pointers on the canvas. Two of them is a pinch; one is everything else. */
+  var pointers = new Map()
+  var pinch = null
+  var lastTap = { at: 0, x: 0, y: 0 }
+
+  function pinchSpan() {
+    var points = []
+    pointers.forEach(function (point) { points.push(point) })
+    var a = points[0]
+    var b = points[1]
+    return {
+      dist: Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)),
+      cx: (a.x + b.x) / 2,
+      cy: (a.y + b.y) / 2
+    }
+  }
+
+  function beginPinch() {
+    var span = pinchSpan()
+    var rect = zoomEl.getBoundingClientRect()
+    // The point between the fingers, in canvas CSS pixels, plus the wrapper's
+    // untransformed origin. Holding that point under the fingers for the whole
+    // gesture is the entire feel of a pinch.
+    pinch = {
+      dist: span.dist,
+      scale: view.scale,
+      lx: (span.cx - rect.left) / view.scale,
+      ly: (span.cy - rect.top) / view.scale,
+      ox: rect.left - view.tx,
+      oy: rect.top - view.ty
+    }
+  }
+
+  function updatePinch() {
+    if (!pinch) return
+    var span = pinchSpan()
+    var next = clampZoom((pinch.scale * span.dist) / pinch.dist)
+    setView(
+      next,
+      span.cx - pinch.ox - pinch.lx * next,
+      span.cy - pinch.oy - pinch.ly * next,
+      false
+    )
+  }
+
+  function dragScroll(e) {
     press.travel = Math.max(press.travel, Math.hypot(e.clientX - press.x, e.clientY - press.y))
-    if (press.travel < 10 || !box.h) return
+    if (press.travel < TAP_SLOP_PX || !box.h) return
     var now = Date.now()
     if (now - press.sentAt < 60) return
     var stepped = e.clientY - press.lastY
@@ -985,8 +1344,35 @@ const PAGE = `<!doctype html>
     press.sentAt = now
     // Direct manipulation: dragging the finger down reveals earlier content, so
     // the wheel delta the agent forwards is the inverse of the finger movement.
-    var fdy = Math.round((-stepped * frameH) / box.h)
+    // Divided by the zoom, or a magnified page would scroll magnified too.
+    var fdy = Math.round((-stepped * frameH) / (box.h * view.scale))
     if (fdy !== 0) send({ type: "scroll", fdy: fdy })
+  }
+
+  canvas.addEventListener("pointerdown", function (e) {
+    canvas.setPointerCapture(e.pointerId)
+    settleView()
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    if (pointers.size >= 2) {
+      // Two fingers is a pinch and never a tap or a scroll: drop whatever the
+      // first finger had started, so releasing them sends nothing.
+      press = null
+      beginPinch()
+      return
+    }
+    press = { x: e.clientX, y: e.clientY, lastY: e.clientY, travel: 0, sentAt: 0 }
+  })
+  canvas.addEventListener("pointermove", function (e) {
+    var point = pointers.get(e.pointerId)
+    if (point) {
+      point.x = e.clientX
+      point.y = e.clientY
+    }
+    if (pointers.size >= 2) {
+      updatePinch()
+      return
+    }
+    if (press) dragScroll(e)
   })
   /** Acknowledge the tap where the finger landed, inside the same frame. */
   function markTap(clientX, clientY) {
@@ -1004,16 +1390,63 @@ const PAGE = `<!doctype html>
     if (navigator.vibrate) navigator.vibrate(8)
   }
 
+  /**
+   * The second half of a double tap.
+   *
+   * The first tap is already gone — waiting 250ms to find out whether a second
+   * one is coming would put a delay on the single action this whole page exists
+   * for, and a tap that arrives late on a login form is worse than no zoom
+   * gesture at all. So the second tap sends nothing and toggles the zoom
+   * instead. The cost is one extra tap delivered to the remote page per double
+   * tap, which lands in the same place the human was already tapping.
+   */
+  function isDoubleTap(clientX, clientY, now) {
+    return (
+      now - lastTap.at < DOUBLE_TAP_MS &&
+      Math.hypot(clientX - lastTap.x, clientY - lastTap.y) < DOUBLE_TAP_PX
+    )
+  }
+
+  function toggleZoom(clientX, clientY) {
+    if (view.scale > 1.01) {
+      setView(1, 0, 0, true)
+      return
+    }
+    var local = toLocal(clientX, clientY)
+    centreOn(local.x, local.y, TAP_ZOOM, 0.5, true)
+  }
+
   canvas.addEventListener("pointerup", function (e) {
+    var pinching = pointers.size >= 2
+    pointers.delete(e.pointerId)
+    if (pinching) {
+      // Lifting one finger of a pinch ends the gesture; the other one is not a
+      // tap. Re-render so the backing store follows the zoom it settled on.
+      if (pointers.size < 2) pinch = null
+      press = null
+      render()
+      return
+    }
     var was = press
     press = null
-    if (!was || was.travel >= 10) return
+    if (!was || was.travel >= TAP_SLOP_PX) return
+    var now = Date.now()
+    if (isDoubleTap(e.clientX, e.clientY, now)) {
+      lastTap.at = 0
+      toggleZoom(e.clientX, e.clientY)
+      return
+    }
+    lastTap = { at: now, x: e.clientX, y: e.clientY }
     var point = toFrame(e.clientX, e.clientY)
     if (!point) return
     send({ type: "tap", fx: point.x, fy: point.y })
     markTap(e.clientX, e.clientY)
   })
-  canvas.addEventListener("pointercancel", function () { press = null })
+  canvas.addEventListener("pointercancel", function (e) {
+    pointers.delete(e.pointerId)
+    if (pointers.size < 2) pinch = null
+    press = null
+  })
 
   // The field is a local mirror only. Every keystroke leaves for the browser the
   // moment it is typed, so what the remote page shows is the real state.
@@ -1124,8 +1557,12 @@ const PAGE = `<!doctype html>
     placeRing()
     setHint()
     setClearEnabled()
+    applyKind("text")
     kbd.blur()
-    if (ws) ws.close()
+    // Only close once there is nothing left to deliver. A give-up made during a
+    // reconnect has to reach the agent, or it waits out its whole timeout for a
+    // human who already answered.
+    if (ws && !stillSending()) ws.close()
   }
 
   // The expected ending, and the only one whose worst case is recoverable in
@@ -1147,7 +1584,6 @@ const PAGE = `<!doctype html>
   var abortButton = document.getElementById("abort")
   var holdTimer = null
   var holdFired = false
-  var hintTimer = null
 
   function flashHint(text) {
     hint.textContent = text
@@ -1208,7 +1644,9 @@ const PAGE = `<!doctype html>
     else if (message.type === "state") reason.textContent = message.reason
     else if (message.type === "focus") {
       focus = readFocus(message)
+      applyKind(focus.rect ? focus.kind : "text")
       placeRing()
+      zoomToFocus()
       setHint()
       setClearEnabled()
     }
@@ -1222,7 +1660,7 @@ const PAGE = `<!doctype html>
   // leaving. Reconnecting is the normal path. One timer only, so a backoff and
   // a visibilitychange can never race into two overlapping sockets.
   function scheduleReconnect() {
-    if (finished || reconnectTimer) return
+    if ((finished && !stillSending()) || reconnectTimer) return
     var wait = Math.min(500 * Math.pow(2, retries++), 8000)
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null
@@ -1231,7 +1669,7 @@ const PAGE = `<!doctype html>
   }
 
   function connect() {
-    if (finished) return
+    if (finished && !stillSending()) return
     // Refuse a second socket while one is already connecting or open — that is
     // how the displaced-socket churn started.
     if (ws && (ws.readyState === 0 || ws.readyState === 1)) return
@@ -1245,6 +1683,9 @@ const PAGE = `<!doctype html>
       if (mine !== generation) { sock.close(); return }
       retries = 0
       setStatus(true)
+      flushOutbox()
+      // finish() left this socket open for exactly that flush.
+      if (finished) sock.close()
     }
     sock.onmessage = function (e) { if (mine === generation) handle(e.data) }
     sock.onclose = function () {
@@ -1258,13 +1699,14 @@ const PAGE = `<!doctype html>
     sock.onerror = function () { if (mine === generation) sock.close() }
   }
 
+  applyTransform(false)
   setInterval(function () { send({ type: "ping" }) }, 20000)
   window.addEventListener("resize", render)
   // The stage also changes size without the window doing so: a longer reason
   // takes the header to its second line. The letterbox has to follow.
   if (window.ResizeObserver) new ResizeObserver(render).observe(stage)
   document.addEventListener("visibilitychange", function () {
-    if (document.hidden || finished) return
+    if (document.hidden || (finished && !stillSending())) return
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
     retries = 0
     // connect() refuses if a socket is already live, so this is safe to call

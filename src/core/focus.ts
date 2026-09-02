@@ -22,17 +22,19 @@
  */
 import type { Page } from "playwright-core"
 
-import type { FocusRect } from "../relay/protocol"
+import type { FocusKind, FocusRect } from "../relay/protocol"
 
 export interface FocusProbe {
   /** The focused field's box in CSS viewport pixels, or null if there is none. */
   rect: FocusRect | null
   /** A human-readable field name, or null when nothing is focused. */
   label: string | null
+  /** What the field takes, so the phone can pick its own keyboard for it. */
+  kind: FocusKind
 }
 
 /** Nothing is focused. Also the state the phone starts in, before any probe. */
-export const NO_FOCUS: FocusProbe = { rect: null, label: null }
+export const NO_FOCUS: FocusProbe = { rect: null, label: null, kind: "text" }
 
 /**
  * Runs inside the remote page. Self-contained on purpose: `page.evaluate`
@@ -42,6 +44,10 @@ export const NO_FOCUS: FocusProbe = { rect: null, label: null }
 function readFocus(): FocusProbe {
   /** Long enough for "Confirmation code", short enough for a phone's bar. */
   const MAX_LABEL_CHARS = 40
+  /** What every SMS-code box looks like: digits only, four to eight of them. */
+  const OTP_MIN_LENGTH = 4
+  const OTP_MAX_LENGTH = 8
+  const OTP_WORDS = /otp|one.?time|verification|2fa|totp|code/i
   const tidy = (text: string | null | undefined): string =>
     (text ?? "").replace(/\s+/g, " ").trim().slice(0, MAX_LABEL_CHARS)
 
@@ -53,12 +59,14 @@ function readFocus(): FocusProbe {
     element === document.body ||
     element === document.documentElement
   ) {
-    return { rect: null, label: null }
+    return { rect: null, label: null, kind: "text" }
   }
 
   const box = element.getBoundingClientRect()
   // A hidden or collapsed element is focusable but has nothing to draw around.
-  if (box.width <= 0 || box.height <= 0) return { rect: null, label: null }
+  if (box.width <= 0 || box.height <= 0) {
+    return { rect: null, label: null, kind: "text" }
+  }
 
   const id = element.getAttribute("id")
   const forLabel = id
@@ -78,6 +86,35 @@ function readFocus(): FocusProbe {
       tidy(element.tagName.toLowerCase()),
     ].find((candidate) => candidate.length > 0) ?? null
 
+  // Attributes again, for the same reason: the phone needs to know it is
+  // holding a password or an SMS code, and the one thing that must never be
+  // consulted to find that out is what has been typed into it.
+  const maxLength = Number(element.getAttribute("maxlength") ?? "0")
+  const named = [
+    element.getAttribute("name") ?? "",
+    id ?? "",
+    element.getAttribute("aria-label") ?? "",
+    forLabel?.textContent ?? "",
+    element.closest("label")?.textContent ?? "",
+  ].join(" ")
+  const numericAndShort =
+    element.getAttribute("inputmode") === "numeric" &&
+    maxLength >= OTP_MIN_LENGTH &&
+    maxLength <= OTP_MAX_LENGTH
+
+  let kind: FocusKind = "text"
+  // `type` first and alone: a field called "passcode" that takes a password is
+  // a password. Getting that order wrong would put a secret into a numeric
+  // keypad and offer to autofill it from Messages.
+  if (element.getAttribute("type") === "password") kind = "password"
+  else if (
+    (element.getAttribute("autocomplete") ?? "").includes("one-time-code") ||
+    numericAndShort ||
+    OTP_WORDS.test(named)
+  ) {
+    kind = "otp"
+  }
+
   return {
     // Whole pixels: the phone scales these down by 4x or more, so a fraction
     // buys nothing and only makes the change-detection noisier.
@@ -88,6 +125,7 @@ function readFocus(): FocusProbe {
       height: Math.round(box.height),
     },
     label,
+    kind,
   }
 }
 

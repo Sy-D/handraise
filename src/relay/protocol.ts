@@ -33,6 +33,17 @@ export interface FocusRect {
   height: number
 }
 
+/**
+ * What the focused field takes, derived on the agent side from the remote
+ * element's attributes only — never from its value. The phone uses it to pick
+ * its own field's `type`, `inputmode` and `autocomplete`, which is what lets
+ * iOS offer the SMS code from Messages instead of making the human retype it.
+ *
+ * Three values, not five: the phone's keyboard has exactly three behaviours to
+ * choose between, and a kind nothing acts on is a kind that goes stale.
+ */
+export type FocusKind = "otp" | "password" | "text"
+
 export type AgentToHuman =
   | { type: "frame"; data: string; meta: FrameMeta }
   | { type: "state"; reason: string }
@@ -40,8 +51,17 @@ export type AgentToHuman =
    * Where the human's typing currently lands. `rect: null` means nothing is
    * focused; `label` is a human-readable field name taken from the remote
    * page's own markup, never from the field's value.
+   *
+   * `kind` is optional so an older agent still speaks this protocol: a phone
+   * that receives no `kind` falls back to "text", which is what every field
+   * behaved as before it existed.
    */
-  | { type: "focus"; rect: FocusRect | null; label: string | null }
+  | {
+      type: "focus"
+      rect: FocusRect | null
+      label: string | null
+      kind?: FocusKind
+    }
   | {
       type: "ended"
       outcome: "resolved" | "aborted" | "timeout" | "disconnected"

@@ -101,26 +101,31 @@ served from `*.preview.getsolari.com`, and nothing else.
 ## What the human sees on the phone
 
 The handoff link opens a dark, minimal page: the live browser session on top,
-one input bar at the bottom. Tap the live view to click; drag to scroll. A
-ring marks the field that currently has focus, and the bar names it
-("Typing into: Password") — typing goes straight into that field, character by
-character.
+an input bar at the bottom. Tap the live view to click, drag to scroll. When
+the agent reports which field has focus, the view **zooms to it** so it is
+readable (remote 16px text renders at ~10px instead of ~5px), draws a ring
+around it, and the bar names it ("Typing into: Verification code"). Pinch to
+zoom and pan yourself; double-tap toggles between zoomed and fit. Typing goes
+straight into the focused field, character by character — and if that field is
+a one-time code, the phone offers the SMS code it just received.
 
-Four keys sit next to the input, because a phone's virtual keyboard cannot be
-trusted to send them:
+Four keys under the input, because a phone's virtual keyboard cannot be trusted
+to send them:
 
 | Key | What it does |
 |---|---|
 | ⌫ | Delete one character in the remote field |
-| ✕ | Clear the focused field (select-all + backspace; disabled while nothing is focused) |
 | ⇥ | Move to the next field |
 | ⏎ | Submit / press Enter |
+| Clear | Empty the focused field (select-all + backspace; disabled while nothing is focused, and kept well away from ⌫) |
 
-Below that, two ways out: **✋ Hand back to agent** ends the handoff as
-`resolved` — the agent continues. **Can't help** ends it as `aborted` — the
-agent is told a human looked and could not solve it, so it should not retry
-the same step. The dot in the header shows the connection: white is live, grey
-is reconnecting, red means the handoff has ended.
+Below that, two ways out. **✋ Hand back** ends the handoff as `resolved` — one
+tap, the agent continues. **I can't do this** ends it as `aborted` — the agent
+is told a human looked and could not solve it, so it should not retry the same
+step; it takes a 700ms hold, because it is irreversible and sits next to the
+primary. The dot in the header shows the connection: white is live, pulsing
+grey is reconnecting (your input is queued and sent in order once it is back),
+red means the handoff has ended.
 
 ## Getting notified
 
