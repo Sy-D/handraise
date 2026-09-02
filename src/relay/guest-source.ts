@@ -1020,6 +1020,10 @@ const PAGE = \`<!doctype html>
   var retries = 0
   var finished = false
   var reconnectTimer = null
+  // Non-zero only after finish() with something still queued: the wall-clock
+  // time past which the flush gives up. Zero while the handoff is live, which
+  // is what keeps a running handoff reconnecting forever the way it always has.
+  var flushDeadline = 0
   // Every connect() bumps this; a displaced socket's stale callbacks compare
   // against it and bow out, so an old onclose never nulls the live socket.
   var generation = 0
@@ -1135,12 +1139,24 @@ const PAGE = \`<!doctype html>
   }
 
   /**
+   * How long the page keeps trying to deliver a queued answer after the human
+   * has finished. A relay that is actually alive reconnects in seconds — this
+   * covers several backoff cycles of that. Past it the agent has timed out and
+   * killed the sandbox, so the host is gone and retrying it every 8s forever
+   * only spins a dead tab; the backoff caps the wait between attempts, not
+   * their number, so this is what caps their number.
+   */
+  var FLUSH_DEADLINE_MS = 30000
+
+  /**
    * A handback or an abort made while the socket was down still has to arrive:
    * the agent is waiting on exactly that message and would otherwise burn its
-   * whole five-minute timeout on a human who already answered.
+   * whole five-minute timeout on a human who already answered. But only until
+   * the flush deadline: after finish(), a dead host is not worth retrying past
+   * the point a live one would have answered.
    */
   function stillSending() {
-    return outbox.length > 0
+    return outbox.length > 0 && (flushDeadline === 0 || Date.now() < flushDeadline)
   }
 
   function setStatus(live) {
@@ -1744,6 +1760,10 @@ const PAGE = \`<!doctype html>
     setClearEnabled()
     applyKind("text")
     kbd.blur()
+    // A queued answer now has a deadline: keep reconnecting to flush it, but
+    // not forever against a host that may already be gone. Set before the
+    // stillSending() check below so both read the same state.
+    if (outbox.length > 0) flushDeadline = Date.now() + FLUSH_DEADLINE_MS
     // Only close once there is nothing left to deliver. A give-up made during a
     // reconnect has to reach the agent, or it waits out its whole timeout for a
     // human who already answered.

@@ -274,8 +274,17 @@ function captureSockets(): void {
   }
 }
 
-/** A relay in `mode`, an agent on it, and the real page in a phone viewport. */
-async function openFixture(mode: HandoffMode, capture = false): Promise<void> {
+/**
+ * A relay in `mode`, an agent on it, and the real page in a phone viewport.
+ * `capture` records every WebSocket the page opens; `clock` freezes the page's
+ * timers so a test drives the reconnect backoff itself instead of waiting on
+ * it. Both are installed before the page script runs.
+ */
+async function openFixture(
+  mode: HandoffMode,
+  capture = false,
+  clock = false,
+): Promise<void> {
   relay = await startRelay(mode)
   agent = await connectAgent(relay.port)
   consoleErrors = []
@@ -287,6 +296,9 @@ async function openFixture(mode: HandoffMode, capture = false): Promise<void> {
     if (message.type() === "error") consoleErrors.push(message.text())
   })
   page.on("pageerror", (error) => consoleErrors.push(error.message))
+  // Fake time only touches the page, not Playwright's own waits, so a network
+  // close still fires for real while a reconnect timer waits for fastForward.
+  if (clock) await page.clock.install()
   if (capture) await page.addInitScript(captureSockets)
   await page.goto(`http://127.0.0.1:${relay.port}/`)
 }
@@ -295,11 +307,12 @@ async function openFixture(mode: HandoffMode, capture = false): Promise<void> {
 async function reopenFixture(
   mode: HandoffMode,
   capture = false,
+  clock = false,
 ): Promise<void> {
   await page.close()
   agent.close()
   relay.process.kill("SIGKILL")
-  await openFixture(mode, capture)
+  await openFixture(mode, capture, clock)
 }
 
 /**
@@ -1306,3 +1319,71 @@ test("one finger pans the approval screenshot and still sends nothing", async ()
   expect(agent.received).toEqual([])
   expect(consoleErrors).toEqual([])
 })
+
+/** The FLUSH_DEADLINE_MS the page uses, restated so a change to one is a red test. */
+const FLUSH_DEADLINE_MS = 30_000
+
+/** How many WebSockets the page has opened since it loaded (captureSockets). */
+function socketCount(target: Page): Promise<number> {
+  return target.evaluate(() => window.handraiseSockets?.length ?? 0)
+}
+
+test("the reconnect loop gives up flushing once its deadline passes", async () => {
+  // A finished page with a queued answer keeps reconnecting to deliver it. The
+  // backoff caps the wait between attempts, not their number, so against a
+  // relay the agent has already timed out and killed, the tab used to retry a
+  // dead host every 8s forever. The deadline caps the attempts.
+  //
+  // Deterministic, not a 30s wait: the page's clock is frozen, so every
+  // reconnect timer fires only when this test fast-forwards it, and the socket
+  // count is the attempt count.
+  await reopenFixture("takeover", true, true)
+  await showFrame()
+
+  // Kill the relay so every reconnect from here on fails, then wait for the
+  // page to notice its own socket drop (a network event, real even under the
+  // fake clock).
+  agent.close()
+  relay.process.kill("SIGKILL")
+  await page.waitForFunction(() => {
+    const dot = document.getElementById("dot")
+    return dot ? dot.className.includes("waiting") : false
+  })
+
+  // Answer while the socket is down: the message queues, and finish() starts
+  // the flush deadline. One socket has been opened so far — the initial one,
+  // now dead — and no reconnect has fired because its timer is frozen.
+  await page.locator("#handback").click()
+  await waitForOverlay(page)
+  const baseline = await socketCount(page)
+  expect(baseline).toBe(1)
+
+  // Well within the deadline: advance past the first backoff so a reconnect
+  // actually fires. It is the attempt that would flush the answer against a
+  // relay that had come back — proof the loop is still trying.
+  await page.clock.fastForward(2_000)
+  await page.waitForTimeout(150)
+  const during = await socketCount(page)
+  expect(during).toBeGreaterThan(baseline)
+
+  // Cross the deadline. The pending reconnect timer still fires, but connect()
+  // and onclose now see `finished && !stillSending()` and stop.
+  await page.clock.fastForward(FLUSH_DEADLINE_MS)
+  await page.waitForTimeout(150)
+  const atStop = await socketCount(page)
+
+  // Keep advancing: a dead host is no longer retried. The socket count is
+  // frozen — the loop has actually stopped, not merely slowed.
+  await page.clock.fastForward(60_000)
+  await page.waitForTimeout(200)
+  const after = await socketCount(page)
+  expect(after).toBe(atStop)
+
+  // The only console noise here is the browser's own "connection refused" for
+  // each reconnect against the relay this test deliberately killed — the page
+  // handles it (onerror closes the socket). Anything else is a real error.
+  const unexpected = consoleErrors.filter(
+    (line) => !line.includes("net::ERR_CONNECTION_REFUSED"),
+  )
+  expect(unexpected).toEqual([])
+}, 20000)

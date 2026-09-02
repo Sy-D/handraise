@@ -109,8 +109,10 @@ breaks, and they apply even to an application that never asks for an approval.
   fails to be destroyed stays public until it idles out. Anyone holding the
   link could be served the last frame of a logged-in page in that window. The
   relay now drops the last frame, state and focus the moment the authenticated
-  agent socket closes; a handoff that is still running restores them by itself
-  on the next reconnect.
+  agent socket closes. On the next reconnect the agent re-sends its state at
+  once; the frame comes back with the next repaint in takeover mode or the
+  re-sent screenshot in approval mode, so a late human may briefly see a blank
+  stage but never the previous logged-in frame.
 
 ## [0.3.0] - 2026-09-02
 
