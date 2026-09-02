@@ -76,6 +76,35 @@ and `RaiseHandOptions` is now a union (extend `HandoffOptions` or
 `TakeoverOptions` instead of it). The
 [CHANGELOG](CHANGELOG.md) has the detail.
 
+## Channels
+
+An approval is a screenshot, a sentence and two answers — which is a chat
+message. A **channel** is an object handraise notifies when the handoff starts;
+in approval mode it also gets the JPEG and can answer in-process, so nobody has
+to open the link at all.
+
+```ts
+import { raiseHand } from "handraise"
+import { telegram } from "handraise-telegram"
+
+await raiseHand(page, {
+  mode: "approval",
+  reason: "The agent may not move money without a human",
+  action: "Submit $12,430 vendor payment to Acme GmbH",
+  channels: [telegram({ botToken: process.env.TELEGRAM_BOT_TOKEN, chatId: "…" })],
+})
+// The screenshot and two buttons arrive in the chat; the first answer wins,
+// whether it comes from there or from the phone.
+```
+
+Write your own in about ten lines: `notify(handoff)` gets `handoffId`, `url`,
+`reason`, `mode` and — in approval mode — `action`, `screenshot` (the same
+bytes the phone shows) and `answer("approve" | "deny")`, which returns `false`
+if somebody was faster. `notify` is never awaited and whatever it throws is one
+`channel_failed` warning: a chat API that is down costs you a notification, not
+a browser session. Anyone who can see the channel can answer it
+([`docs/adr/0007`](docs/adr/0007-channels.md)).
+
 Runnable without writing any code: [`demo/try.ts`](demo/try.ts) raises a hand
 immediately so you can drive it; [`demo/approval.ts`](demo/approval.ts) asks
 you to approve a payment; [`demo/github-2fa.ts`](demo/github-2fa.ts) does the
@@ -184,7 +213,7 @@ takes the 700ms; the ending says which one happened.
 
 ## Getting notified
 
-Three ways, no vendor lock-in:
+Four ways, no vendor lock-in:
 
 - **QR code in the terminal** (default) — scan with the phone camera.
 - **`onUrl` callback** — do whatever you want with the link.
@@ -192,6 +221,8 @@ Three ways, no vendor lock-in:
   as JSON (`action` only in approval mode).
   Point it at Slack, Discord, ntfy, a Telegram bot — anything that accepts a
   POST.
+- **`channels`** — the only one that can carry the screenshot and bring an
+  answer back. See [Channels](#channels).
 
 ```ts
 await raiseHand(page, {
@@ -213,6 +244,7 @@ await raiseHand(page, {
 | `timeoutMs` | `number` | 5 minutes | How long to wait for the human. |
 | `webhookUrl` | `string` | — | Generic JSON POST when the link is ready. |
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
+| `channels` | `HandoffChannel[]` | — | Where else to announce it. In approval mode a channel also gets the screenshot and can answer. See [Channels](#channels). |
 | `qr` | `boolean` | `true` | Print a QR code to the terminal. |
 | `apiKey` | `string` | `$SOLARI_API_KEY` | Solari key used to create the relay sandbox. |
 | `logger` | `Logger` | warn/error only | Structured logging sink. Pass `consoleLogger` for full JSON lines incl. the per-handoff wide event. |

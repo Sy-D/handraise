@@ -1,4 +1,5 @@
 import type { BrowserContext, Page } from "playwright-core"
+import type { HandoffChannel } from "./channels"
 import type { HandoffEvent } from "./events"
 import type { Logger } from "./logger"
 
@@ -23,6 +24,14 @@ export interface HandoffOptions {
   webhookUrl?: string
   /** Called with the public handoff URL as soon as it exists. */
   onUrl?: (url: string) => void
+  /**
+   * Where else to announce this handoff — a chat channel, a pager, anything
+   * that implements `HandoffChannel`. Each one is notified once, is never
+   * awaited, and cannot break the handoff. In approval mode a channel also
+   * gets the screenshot and can answer in-process, so the human never has to
+   * open the link (see `handraise-telegram`).
+   */
+  channels?: HandoffChannel[]
   /**
    * How long to wait for the human before giving up. Default: 5 minutes.
    * Keep this short: Solari browser sessions have a hard lifetime of about

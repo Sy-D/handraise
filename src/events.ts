@@ -51,6 +51,13 @@ export interface HandoffEvent {
   reconnects: number
   /** Whether cookies + localStorage were captured after a handback. */
   storageStateCaptured: boolean
+  /**
+   * Who answered, on the `approved` and `denied` outcomes only: `relay` is the
+   * handoff page (the phone), `channel` is an in-process `HandoffChannel` such
+   * as a Telegram adapter. Absent on every other outcome, and on an approval
+   * nobody answered.
+   */
+  answeredVia?: "relay" | "channel"
   /** Gateway base URL, when the caller overrode the Solari default. */
   baseUrl?: string
   /** Set on a failure path: the first error message that shaped the outcome. */
