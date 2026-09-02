@@ -119,13 +119,29 @@ const TOKEN_PARAM = /pt_token\s*[=:]\s*[^&;\s"'<>]+/gi
 const TOKEN_VALUE = /pt_[A-Za-z0-9._~-]{16,}/g
 
 /**
+ * The ways a dot arrives once something has escaped the text around it: a
+ * percent-encoded path, an HTML error page. Both nets below key on the JWT's
+ * two dots, so an encoded one is the cheapest way past either.
+ */
+const ENCODED_DOTS = ["%2E", "%2e", "&#46;"]
+
+/** One base64url segment of a JWT, at the length a real one has. */
+const JWT_SEGMENT = "[A-Za-z0-9_-]{20,}"
+
+/** The separator between two of them, literal or escaped. */
+const JWT_DOT = `(?:\\.|${ENCODED_DOTS.join("|")})`
+
+/**
  * The credential's real grammar: three base64url segments separated by dots.
  * The preview token is a ~362-character JWT
  * (docs/measurements/01-preview-transport.md §3), so this is the rule that
  * catches it bare in prose — "invalid preview token eyJhbGci…" — or behind a
  * `%3D` neither rule above can see.
  */
-const TOKEN_JWT = /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/g
+const TOKEN_JWT = new RegExp(
+  `${JWT_SEGMENT}${JWT_DOT}${JWT_SEGMENT}${JWT_DOT}${JWT_SEGMENT}`,
+  "g",
+)
 
 /**
  * Short enough to be an accident rather than a credential. Blanking every
@@ -153,9 +169,7 @@ const MIN_TOKEN_LENGTH = 16
 export function redactPreviewToken(text: string, token?: string): string {
   let redacted = text
   if (token !== undefined && token.length >= MIN_TOKEN_LENGTH) {
-    // A Set because a token made only of unreserved characters — a JWT is —
-    // encodes to itself, and replacing it twice would be busywork.
-    for (const form of new Set([token, encodeURIComponent(token)]))
+    for (const form of tokenForms(token))
       redacted = redacted.replaceAll(form, "[redacted]")
   }
   return redacted
@@ -165,11 +179,28 @@ export function redactPreviewToken(text: string, token?: string): string {
 }
 
 /**
+ * The written forms of one exact value.
+ *
+ * A Set because a token made only of unreserved characters — a JWT is —
+ * survives `encodeURIComponent` unchanged, so most of these collapse into one.
+ * The dot variants are the ones that do not: `encodeURIComponent` leaves a dot
+ * alone, and a proxy that escapes the whole path does not.
+ */
+function tokenForms(token: string): Set<string> {
+  const written = [token, encodeURIComponent(token)]
+  const forms = new Set(written)
+  for (const form of written)
+    for (const dot of ENCODED_DOTS) forms.add(form.replaceAll(".", dot))
+  return forms
+}
+
+/**
  * The credential this URL carries, so it can be redacted by value instead of
  * by grammar. Returns nothing for a string that is not a URL: there is simply
  * no known token then, and the patterns above still apply.
  */
-function previewTokenOf(url: string): string | undefined {
+function previewTokenOf(url: string | undefined): string | undefined {
+  if (url === undefined) return undefined
   try {
     return new URL(url).searchParams.get("pt_token") ?? undefined
   } catch {
@@ -193,40 +224,131 @@ interface WithBody {
  *
  * Through JSON rather than field by field: `code`, `error` and `message` are
  * what the type declares today, and the field a future gateway release puts
- * the request URI in is the one worth covering in advance.
+ * the request URI in is the one worth covering in advance. A body that
+ * references itself makes this throw, which `redactedCause` catches.
  */
-function redactedBody(body: GatewayErrorBody): GatewayErrorBody {
+function redactedBody(
+  body: GatewayErrorBody,
+  token: string | undefined,
+): GatewayErrorBody {
   // SAFETY: this re-parses text serialised one call earlier; redaction only
   // ever replaces a run of characters inside a JSON string value, so the
   // document is still the same shape.
   return JSON.parse(
-    redactPreviewToken(JSON.stringify(body)),
+    redactPreviewToken(JSON.stringify(body), token),
   ) as GatewayErrorBody
 }
 
 /**
- * A copy of an SDK error with the credential out of everything the gateway
- * wrote.
+ * How far a `cause` chain is followed. Deeper than any chain the SDK, undici
+ * or this package builds, and finite, which is the point.
+ */
+const MAX_CAUSE_DEPTH = 8
+
+/**
+ * Replace one property with a redacted value, keeping the descriptor the
+ * original had.
+ *
+ * A plain assignment onto an `Object.create` clone makes the property own and
+ * *enumerable*. On a real `Error`, `message`, `stack` and `cause` are none of
+ * those, and a consumer that does `JSON.stringify(error.cause)` into a log
+ * payload would suddenly ship the whole stack.
+ */
+function redefine<T>(target: Error, key: string, value: T): void {
+  const existing = Object.getOwnPropertyDescriptor(target, key)
+  Object.defineProperty(target, key, {
+    value,
+    writable: existing?.writable ?? true,
+    enumerable: existing?.enumerable ?? false,
+    configurable: true,
+  })
+}
+
+/**
+ * What an error says, for a message being built out of it.
+ *
+ * Reading it runs the caller's code: `toString` reads `name` and `message`,
+ * and either can be a getter that throws. A throw here would replace a coded
+ * error with a raw one — the failure class this module exists to remove — so
+ * an error that will not say what it is says that instead.
+ */
+function sentenceOf(cause: unknown): string {
+  try {
+    return String(cause)
+  } catch {
+    return "an error that could not be read"
+  }
+}
+
+/**
+ * The sentence and nothing else, for an error that cannot be copied.
+ *
+ * Reached when reading the original runs a getter that throws, or when its
+ * body references itself. A partial copy would be worse than this one: it
+ * would carry fields nothing has redacted.
+ */
+function unreadableCause(error: Error, token: string | undefined): Error {
+  return new Error(redactPreviewToken(sentenceOf(error), token))
+}
+
+/**
+ * A copy of an error with the credential out of everything foreign in it.
  *
  * `cause` exists so a caller keeps the original — `cause instanceof
- * ConcurrencyLimitError`, `cause.status === 429` — so the copy keeps the
- * prototype and every own field, and rewrites only the two made of foreign
- * text: `message` and the parsed `body`. Without this, a clean outer message
- * buys nothing: `console.error(error)`, pino's error serialiser and every
- * crash reporter print the whole chain.
+ * ConcurrencyLimitError`, `cause.status === 429` — so the copy is built from
+ * the prototype and the full property descriptors, and only the text is
+ * rewritten: `message`, `stack`, a `GatewayError`'s parsed `body`, and
+ * recursively the chain hanging off `cause` (`new Error(msg, { cause })`
+ * installs that one non-enumerable, which is how a copy made by assignment
+ * loses undici's root `ECONNREFUSED`). Without any of this a clean outer
+ * message buys nothing: `console.error(error)`, pino's error serialiser and
+ * every crash reporter print the whole chain.
+ *
+ * Descriptors are copied, not read: an accessor stays an accessor and is never
+ * invoked here. That keeps a foreign getter from running inside a `catch`
+ * whose job is to produce a coded error — at the price of not redacting what
+ * such a getter would return, which nothing in the dependency tree has.
  */
-function redactedCause(error: Error): Error {
-  // SAFETY: `Object.create` returns a new object with `error`'s own prototype,
-  // so it is an instance of the same class; its own fields are copied below.
-  const clone = Object.create(Object.getPrototypeOf(error)) as Error & WithBody
-  // Own enumerable fields — `name`, and on a `GatewayError` `status`, `code`
-  // and `body`. `message` and `stack` are own but not enumerable, which is why
-  // they are the two lines after it.
-  Object.assign(clone, error)
-  clone.message = redactPreviewToken(error.message)
-  if (error.stack !== undefined) clone.stack = redactPreviewToken(error.stack)
-  if (clone.body !== undefined) clone.body = redactedBody(clone.body)
-  return clone
+function redactedCause(error: Error, token?: string): Error {
+  return redactedChain(error, token, new Set(), 0)
+}
+
+/** One link, plus the `seen` set and the depth that make the recursion end. */
+function redactedChain(
+  error: Error,
+  token: string | undefined,
+  seen: Set<Error>,
+  depth: number,
+): Error {
+  // A chain that points back at itself, or one deeper than any real chain.
+  if (seen.has(error) || depth > MAX_CAUSE_DEPTH)
+    return unreadableCause(error, token)
+  seen.add(error)
+  try {
+    // SAFETY: `Object.create` returns a new object with `error`'s own
+    // prototype, so it is an instance of the same class; the descriptors below
+    // give it the same own properties, enumerable or not.
+    const clone = Object.create(Object.getPrototypeOf(error)) as Error &
+      WithBody
+    Object.defineProperties(clone, Object.getOwnPropertyDescriptors(error))
+    redefine(clone, "message", redactPreviewToken(error.message, token))
+    if (error.stack !== undefined)
+      redefine(clone, "stack", redactPreviewToken(error.stack, token))
+    if (clone.body !== undefined)
+      redefine(clone, "body", redactedBody(clone.body, token))
+    if (clone.cause instanceof Error)
+      redefine(
+        clone,
+        "cause",
+        redactedChain(clone.cause, token, seen, depth + 1),
+      )
+    return clone
+  } catch {
+    // A getter that throws on the way in, a body that references itself: a
+    // faithful copy is not worth an uncoded exception out of `startRelay`'s
+    // catch, which is the failure class this module exists to remove.
+    return unreadableCause(error, token)
+  }
 }
 
 /**
@@ -235,24 +357,33 @@ function redactedCause(error: Error): Error {
  * A 429 is the one worth telling apart: the account is at its concurrent
  * session cap, which is a "try again in a minute", not a "this is broken".
  * An error that already carries a code is passed through untouched.
+ *
+ * `token` is the preview credential when the caller has one — `startRelay`
+ * does from the moment the sandbox answers — so the message and the `cause`
+ * are redacted by value rather than by grammar. Exported for `deploy.test.ts`.
  */
-function relayStartError(cause: unknown): HandraiseError {
+export function relayStartError(
+  cause: unknown,
+  token?: string,
+): HandraiseError {
   if (isHandraiseError(cause)) return cause
   if (cause instanceof ConcurrencyLimitError) {
     return new HandraiseError(
       "concurrency_limit",
       redactPreviewToken(
-        `handraise: your Solari account is at its concurrent session limit, so the relay sandbox that gives the handoff its public URL could not be created. Free a session and retry. (${cause.message})`,
+        `handraise: your Solari account is at its concurrent session limit, so the relay sandbox that gives the handoff its public URL could not be created. Free a session and retry. (${sentenceOf(cause)})`,
+        token,
       ),
-      { cause: redactedCause(cause) },
+      { cause: redactedCause(cause, token) },
     )
   }
   return new HandraiseError(
     "relay_start_failed",
     redactPreviewToken(
-      `handraise: the relay sandbox could not be started, so the handoff has no public URL and nobody has been asked for anything yet. ${String(cause)}`,
+      `handraise: the relay sandbox could not be started, so the handoff has no public URL and nobody has been asked for anything yet. ${sentenceOf(cause)}`,
+      token,
     ),
-    { cause: cause instanceof Error ? redactedCause(cause) : cause },
+    { cause: cause instanceof Error ? redactedCause(cause, token) : cause },
   )
 }
 
@@ -294,11 +425,15 @@ export async function createSandbox(
  * a plain `Error` and not a `HandraiseError`: both callers catch it and log
  * `relay_release_failed`, so it can never reach a `catch` around `raiseHand`,
  * and a code nobody can branch on is documentation for dead code.
- * `attempts` is a parameter for the same reason as in `createSandbox`.
+ * `attempts` is a parameter for the same reason as in `createSandbox`, and
+ * `token` is the preview credential when the caller knows it — `startRelay`
+ * does once the sandbox has answered — so this message is redacted by value
+ * and not only by grammar.
  */
 export async function killSandbox(
   sandbox: Pick<Sandbox, "kill">,
   attempts: number = KILL_ATTEMPTS,
+  token?: string,
 ): Promise<void> {
   let lastError: unknown
   // At least one attempt: "could not destroy it after 0 attempts" would be a
@@ -318,12 +453,16 @@ export async function killSandbox(
   }
   throw new Error(
     redactPreviewToken(
-      `handraise: could not destroy the relay sandbox after ${budget} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
+      `handraise: could not destroy the relay sandbox after ${budget} attempts; its public URL stays reachable until the idle timeout. Last error: ${sentenceOf(lastError)}`,
+      token,
     ),
     // The SDK's error, with the gateway's own words redacted — `cause` is
     // printed by every error serialiser that exists.
     {
-      cause: lastError instanceof Error ? redactedCause(lastError) : lastError,
+      cause:
+        lastError instanceof Error
+          ? redactedCause(lastError, token)
+          : lastError,
     },
   )
 }
@@ -427,12 +566,17 @@ export async function startRelay(
     options.mode === "approval" ? "approval" : "takeover"
   const sandbox = await createSandbox(client, timeoutMs)
 
+  // Known only once `previewUrl()` answers, and every message built after that
+  // — the teardown failure, the wrapped start failure — can quote it. Declared
+  // out here so `kill` and the `catch` can both reach it.
+  let previewUrl: string | undefined
+
   let killed = false
   const kill = async (): Promise<void> => {
     if (killed) return
     // Throws if it cannot: the caller must not believe the relay is gone when
     // it is not. Both callers log it as `relay_release_failed`.
-    await killSandbox(sandbox)
+    await killSandbox(sandbox, KILL_ATTEMPTS, previewTokenOf(previewUrl))
     killed = true
   }
 
@@ -451,7 +595,7 @@ export async function startRelay(
     })
 
     const preview = await sandbox.previewUrl(RELAY_PORT)
-    const previewUrl = withToken(preview.url, preview.token)
+    previewUrl = withToken(preview.url, preview.token)
     await waitForHealth(relayUrl(previewUrl, "/healthz"))
 
     // https and wss are both "special" URL schemes, so a textual swap is exact.
@@ -470,6 +614,6 @@ export async function startRelay(
     // Everything from `connect()` to the health poll is "the relay did not come
     // up"; `relayStartError` keeps the more specific codes (a 429, a public URL
     // that never answered) as they are.
-    throw relayStartError(error)
+    throw relayStartError(error, previewTokenOf(previewUrl))
   }
 }

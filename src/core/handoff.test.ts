@@ -1556,9 +1556,12 @@ test("a logger whose methods reject does not break the handoff either", async ()
   // agent's process mid-handoff — before the relay sandbox is released, which
   // leaves a public URL and its last frame reachable until the idle timeout.
   //
-  // `bun test` fails a test that leaves an unhandled rejection behind, which
-  // is the red signal this was written against; the listener states the same
-  // assertion in the test itself.
+  // The gate here is the runner: `bun test` fails a test that leaves an
+  // unhandled rejection behind, which is how this was watched failing against
+  // the unfixed wrapper. The listener below is NOT that gate — bun claims the
+  // rejection first and never calls it, so `unhandled` stays empty either way.
+  // It is kept because it costs nothing and states the invariant for a runner
+  // that only warns; do not read it as the thing that catches a regression.
   const port = await startRelayProcess()
   const human = await connectHuman(port)
   const cdp = fakeCdp()
@@ -1607,7 +1610,8 @@ test("a logger whose methods reject does not break the handoff either", async ()
     expect(calls).toBeGreaterThan(0)
 
     // Long enough for the loop turn on which an unhandled rejection is
-    // reported, after the handoff has fully torn down.
+    // reported, after the handoff has fully torn down. Inert under bun — see
+    // the note above the listener.
     await Bun.sleep(50)
     expect(unhandled).toEqual([])
   } finally {

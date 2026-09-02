@@ -53,9 +53,10 @@ export type HandraiseErrorCode =
 /**
  * Everything handraise throws on purpose. `cause` carries the original SDK,
  * CDP or network error whenever there was one — same class, same `name`,
- * `status` and `code` — so the wrapping hides nothing. Its `message` and its
- * response body are redacted, because the relay's preview token is a live
- * bearer credential and every error serialiser prints the whole chain.
+ * `status` and `code`, same own properties and same `cause` chain — so the
+ * wrapping hides nothing. Every `message`, `stack` and response body along
+ * that chain is redacted, because the relay's preview token is a live bearer
+ * credential and every error serialiser prints the whole chain.
  */
 export class HandraiseError extends Error {
   override readonly name = "HandraiseError"

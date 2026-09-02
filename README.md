@@ -297,9 +297,10 @@ exception. What it throws is a `HandraiseError` with a `code`: the code is the
 contract, the message is for whoever reads the log and may be reworded in any
 release. `isHandraiseError` narrows a `catch` binding, and `cause` keeps the
 original SDK, CDP or network error whenever there was one — the same class,
-`name`, `status` and `code`, with credentials redacted out of its `message` and
-its response body. Every error serialiser prints the whole chain, so a clean
-outer message on its own would not be worth much.
+`name`, `status` and `code`, its own non-enumerable properties, and its own
+`cause` chain — with credentials redacted out of every `message`, `stack` and
+response body along it. Every error serialiser prints the whole chain, so a
+clean outer message on its own would not be worth much.
 
 The first thing `raiseHand` does is look at your page, before it creates
 anything: a page you have closed, or a browser you have disconnected, is

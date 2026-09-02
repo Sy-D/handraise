@@ -40,15 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The preview token is redacted out of error messages and out of `cause`.**
   It is a live bearer credential for the relay, and a proxy that echoes the
   request URI in its 401 body would otherwise put it in an exception message.
-  Where the exact value is known — the health poll is holding the URL that
-  carries it — that value and its percent-encoded form are removed by
-  comparison, whatever syntax the proxy wrapped them in. Three patterns are the
-  net for foreign text where it is not known: `pt_token=…` in any case or
-  separator, a `pt_`-prefixed value, and the JWT shape the preview token
-  actually has (three base64url segments — see
-  `docs/measurements/01-preview-transport.md` §3). The SDK error attached as
-  `cause` is redacted the same way, because every error serialiser prints the
-  whole chain.
+  Where the exact value is known — the health poll, the teardown failure and
+  the wrapped start failure all hold the URL that carries it — that value is
+  removed by comparison in each of the forms an escaping proxy produces: bare,
+  percent-encoded, and with its dots written `%2E`, `%2e` or `&#46;`. Three
+  patterns are the net for foreign text where the value is not known:
+  `pt_token=…` in any case or separator, a `pt_`-prefixed value, and the JWT
+  shape the preview token actually has (three base64url segments, separator
+  literal or escaped — see `docs/measurements/01-preview-transport.md` §3). The
+  SDK error attached as `cause` goes through the same redaction, because every
+  error serialiser prints the whole chain. A proxy that invents an encoding
+  none of those cover — folding the value across lines, say — is still a leak;
+  this is a net, not a proof.
 
 ### Changed
 
@@ -66,10 +69,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Branch on `error.code === "concurrency_limit"`; if you must have the class,
   it is `error.cause`, and `error.cause.status === 429` is the check that
   survives a second copy of `@solarisdk/core` in your tree. `cause` is the SDK's
-  error with credentials redacted: same class, same `name`, `status` and `code`,
-  with `message` and the parsed `body` rewritten. Apart from the page check
-  above, nothing throws that did not throw before, and no outcome became an
-  exception.
+  error with credentials redacted: a copy carrying the same prototype and the
+  same property descriptors — so `name`, `status`, `code`, the non-enumerable
+  `message` and `stack`, and the `cause` chain hanging off it all survive, and
+  `JSON.stringify(cause)` still produces what it did — with `message`, `stack`,
+  the parsed `body` and every nested `cause` rewritten. An error that cannot be
+  copied without running its own code (a throwing getter, a body that
+  references itself) becomes a plain redacted `Error` rather than an exception.
+  Apart from the page check above, nothing throws that did not throw before,
+  and no outcome became an exception.
 
 ## [0.5.1] - 2026-09-02
 

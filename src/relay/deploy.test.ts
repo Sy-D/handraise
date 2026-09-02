@@ -24,6 +24,7 @@ import {
   createSandbox,
   killSandbox,
   redactPreviewToken,
+  relayStartError,
   startRelay,
   waitForHealth,
 } from "./deploy"
@@ -449,3 +450,197 @@ test("a public URL that accepts and never answers still hits the deadline", asyn
     hanging.stop()
   }
 }, 15_000)
+
+// --- The sanitized `cause` ------------------------------------------------
+//
+// `cause` is documented as the original error with credentials redacted, and
+// callers branch on it. Copying it is where fidelity and safety pull against
+// each other: too little and the chain is truncated, too much and reading a
+// foreign object throws out of a `catch` whose whole job is to produce a coded
+// error.
+
+/**
+ * A parsed error body that references itself — what an HTTP client that
+ * attaches the response object to its error produces.
+ */
+interface CyclicBody {
+  code: string
+  self?: CyclicBody
+}
+
+/** One link of the `cause` chain, when there is an error at the end of it. */
+function causeOf(error: Error): Error | undefined {
+  const cause = error.cause
+  return cause instanceof Error ? cause : undefined
+}
+
+/** A sandbox whose `kill()` always fails with `error`, so `killSandbox` surfaces it. */
+function sandboxThatFailsWith(error: Error): Pick<Sandbox, "kill"> {
+  return {
+    kill: async () => {
+      throw error
+    },
+  }
+}
+
+/** The error `run` rejected with; anything else becomes a legible failure. */
+async function errorOf(run: Promise<unknown>): Promise<Error> {
+  try {
+    await run
+    return new Error("nothing was thrown")
+  } catch (error) {
+    return error instanceof Error
+      ? error
+      : new Error(`not an Error: ${String(error)}`)
+  }
+}
+
+test("a nested cause survives the copy, redacted", async () => {
+  // `new Error(msg, { cause })` installs `cause` as a *non-enumerable* own
+  // property, so a copy made by assignment truncates the chain exactly where
+  // the root reason lives — undici's `TypeError: fetch failed` is that shape.
+  const root = new Error(`connect refused, was using ${FAKE_TOKEN}`)
+  const wrapped = new Error(`sandbox teardown failed for ${FAKE_TOKEN}`, {
+    cause: root,
+  })
+
+  const surfaced = await errorOf(killSandbox(sandboxThatFailsWith(wrapped), 1))
+
+  expect(surfaced.message).toContain("could not destroy the relay sandbox")
+  const cause = causeOf(surfaced)
+  expect(cause?.message).toContain("sandbox teardown failed")
+  expect(cause?.message).not.toContain(FAKE_TOKEN)
+  // The link that used to be dropped, and the credential inside it.
+  const nested = cause ? causeOf(cause) : undefined
+  expect(nested?.message).toContain("connect refused")
+  expect(nested?.message).not.toContain(FAKE_TOKEN)
+})
+
+test("the copy keeps message and stack out of a JSON payload", async () => {
+  // A copy built by assignment makes both own *enumerable*, so a consumer that
+  // serialises `cause` into a log payload suddenly ships the whole stack.
+  const original = new Error(`teardown failed for ${FAKE_TOKEN}`)
+
+  const surfaced = await errorOf(killSandbox(sandboxThatFailsWith(original), 1))
+  const cause = causeOf(surfaced)
+
+  expect(cause).toBeDefined()
+  expect(Object.keys(cause ?? {})).not.toContain("message")
+  expect(Object.keys(cause ?? {})).not.toContain("stack")
+  expect(JSON.stringify(cause)).toBe("{}")
+  // …while everything that reads an error properly still works.
+  expect(String(cause)).toContain("teardown failed")
+  expect(cause?.stack).toBeDefined()
+})
+
+test("a cause that cannot be copied is still redacted, never thrown", async () => {
+  // Two shapes that make a naive copy throw — and a throw here replaces a
+  // coded error with a raw `TypeError`, which is the failure class this whole
+  // branch exists to remove.
+  const cyclicBody: CyclicBody = { code: "Cyclic" }
+  cyclicBody.self = cyclicBody
+  const withCyclicBody = new Error(`teardown failed for ${FAKE_TOKEN}`)
+  Object.defineProperty(withCyclicBody, "body", {
+    value: cyclicBody,
+    enumerable: true,
+  })
+
+  const cyclic = await errorOf(
+    killSandbox(sandboxThatFailsWith(withCyclicBody), 1),
+  )
+  expect(cyclic.message).toContain("could not destroy the relay sandbox")
+  expect(cyclic.message).not.toContain(FAKE_TOKEN)
+  expect(causeOf(cyclic)?.message).not.toContain(FAKE_TOKEN)
+
+  // A getter anywhere on the error: reading it is running the caller's code.
+  const withThrowingGetter = new Error(`teardown failed for ${FAKE_TOKEN}`)
+  Object.defineProperty(withThrowingGetter, "detail", {
+    enumerable: true,
+    get: (): never => {
+      throw new Error("detail is gone")
+    },
+  })
+
+  const getter = await errorOf(
+    killSandbox(sandboxThatFailsWith(withThrowingGetter), 1),
+  )
+  expect(getter.message).toContain("could not destroy the relay sandbox")
+  expect(causeOf(getter)?.message).not.toContain(FAKE_TOKEN)
+
+  // Even the sentence itself can be a getter that throws. There is nothing
+  // left to read then, so there is nothing left to leak either.
+  const unreadable = new Error("placeholder")
+  Object.defineProperty(unreadable, "message", {
+    get: (): never => {
+      throw new Error("message is gone")
+    },
+  })
+
+  const opaque = await errorOf(killSandbox(sandboxThatFailsWith(unreadable), 1))
+  expect(opaque.message).toContain("could not destroy the relay sandbox")
+  expect(causeOf(opaque)).toBeDefined()
+})
+
+test("an encoded dot cannot hide the token's shape", () => {
+  // Both nets key on the two dots: the pattern needs literal ones, and the
+  // exact-value comparison uses `encodeURIComponent`, which leaves a dot
+  // alone. A proxy that encodes the whole path — or an HTML error page that
+  // escapes it — produces neither form.
+  const percent = FAKE_TOKEN.replaceAll(".", "%2E")
+  const percentLower = FAKE_TOKEN.replaceAll(".", "%2e")
+  const entity = FAKE_TOKEN.replaceAll(".", "&#46;")
+
+  for (const leak of [percent, percentLower, entity]) {
+    // Without the exact value: the pattern has to see through the encoding.
+    expect(redactPreviewToken(`invalid preview token ${leak}`)).not.toContain(
+      leak,
+    )
+    // And with it, by comparison.
+    expect(
+      redactPreviewToken(`invalid preview token ${leak}`, FAKE_TOKEN),
+    ).not.toContain(leak)
+  }
+
+  // The first segment on its own is not three segments, and stays.
+  const segment = FAKE_TOKEN.split(".")[0] ?? ""
+  expect(redactPreviewToken(`sbx ${segment} up`)).toContain(segment)
+})
+
+test("killSandbox redacts the exact token when the caller knows it", async () => {
+  // `startRelay` holds the preview URL from the moment the sandbox answers, so
+  // every message it builds after that can be redacted by value rather than by
+  // grammar — the same belt the health poll wears. The leak below is in a
+  // shape no pattern matches, so only the exact value can remove it.
+  const shredded = FAKE_TOKEN.split(".").reverse().join("~")
+  const teardown = new Error(`host refused, token was ${shredded}`)
+
+  const surfaced = await errorOf(
+    killSandbox(sandboxThatFailsWith(teardown), 1, shredded),
+  )
+
+  expect(surfaced.message).toContain("could not destroy the relay sandbox")
+  expect(surfaced.message).not.toContain(shredded)
+  expect(causeOf(surfaced)?.message).not.toContain(shredded)
+})
+
+test("relayStartError redacts the exact token in message and cause", () => {
+  // The path Sol's finding did not reach: `startRelay`'s catch, which knows
+  // the preview URL once the sandbox has answered. Same leak shape, so the
+  // patterns cannot help and only the value can.
+  const shredded = FAKE_TOKEN.split(".").reverse().join("~")
+  const body = { code: "GatewayTimeout", hint: `retry with ${shredded}` }
+  const gateway = new GatewayError(504, `upstream ${shredded} gave up`, body)
+
+  const wrapped = relayStartError(gateway, shredded)
+
+  expect(wrapped.code).toBe("relay_start_failed")
+  expect(wrapped.message).not.toContain(shredded)
+  const cause = causeOf(wrapped)
+  expect(cause?.message).not.toContain(shredded)
+  expect(
+    JSON.stringify(cause instanceof GatewayError ? cause.body : {}),
+  ).not.toContain(shredded)
+  // Fidelity is unchanged by the extra argument.
+  expect(cause).toBeInstanceOf(GatewayError)
+  expect(cause instanceof GatewayError ? cause.status : 0).toBe(504)
+})
