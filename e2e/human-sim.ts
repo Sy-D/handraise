@@ -29,6 +29,12 @@ export interface ReceivedFrame {
 export interface SimulatedHuman {
   /** The newest frame, or `null` before the first one. */
   lastFrame(): ReceivedFrame | null
+  /**
+   * When the first frame landed here, in ms since the epoch, or `null` if none
+   * has. Taken in the socket's message handler, so a caller that asks for it
+   * after the fact still gets the arrival time and not its own wake-up time.
+   */
+  firstFrameAt(): number | null
   frameCount(): number
   /** The `reason` currently shown in the header. */
   reason(): string
@@ -90,6 +96,7 @@ export async function openHandoffPage(
 
   const socket = new WebSocket(humanWebSocketUrl(humanUrl))
   let frame: ReceivedFrame | null = null
+  let firstFrameAt: number | null = null
   let frames = 0
   let reason = ""
   let action = ""
@@ -101,6 +108,7 @@ export async function openHandoffPage(
     if (!message) return
     if (message.type === "frame") {
       frame = { data: message.data, meta: message.meta }
+      firstFrameAt = firstFrameAt ?? Date.now()
       frames += 1
       while (waiters.length > 0) waiters.pop()?.()
       return
@@ -133,6 +141,7 @@ export async function openHandoffPage(
 
   return {
     lastFrame: () => frame,
+    firstFrameAt: () => firstFrameAt,
     frameCount: () => frames,
     reason: () => reason,
     action: () => action,

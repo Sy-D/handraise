@@ -43,6 +43,7 @@
     "test:e2e": "bun --env-file=.env e2e/handoff.e2e.ts",
     "bench": "bun --env-file=.env e2e/bench.ts",
     "bench:rescue": "bun --env-file=.env e2e/rescue-bench.ts",
+    "bench:mixed": "bun --env-file=.env e2e/mixed-bench.ts",
     "prepublishOnly": "bun run lint && bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {
