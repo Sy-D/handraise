@@ -111,8 +111,10 @@ export type HumanToAgent =
    * The one human message that asks the agent for something rather than
    * telling it what to do to the page, and it exists because a phone cannot
    * scan its own screen: the code the site is asking the human to scan is on
-   * the screen they are holding. Rate-limited in the core, not here — a scan
-   * costs a full-resolution screenshot.
+   * the screen they are holding. Rate-limited in three places, because they
+   * bound different costs: the phone so the button behaves, the relay so a
+   * burst does not cost a forward and a parse each, and the core — the one that
+   * counts — because a scan is a full-resolution screenshot of a live browser.
    */
   | { type: "scanqr" }
   | { type: "handback" }

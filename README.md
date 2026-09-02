@@ -525,7 +525,7 @@ with `isTrusted: true`.
 - The QR passthrough is **untested against reCAPTCHA itself**: its demo never
   served the scan-to-verify variant, which Google shows at its own discretion.
   The mechanism is proven end to end against a page that behaves the same way
-  ([measurement 05 §6](docs/measurements/05-qr.md)). A code drawn below ~120
+  ([measurement 05 §7](docs/measurements/05-qr.md)). A code drawn below ~120
   CSS pixels does not decode, and three or more codes on one screen are not
   attempted.
 - TypeScript/Node only for now.

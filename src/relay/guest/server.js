@@ -467,8 +467,15 @@ function route(peer, payload, opcode) {
   // The human is producing faster than the agent's socket can take it. Stop
   // reading that socket rather than growing this process's write queue with
   // input nobody has asked for yet: TCP holds it, and the agent's `drain`
-  // starts it again. The message just written is not held back, so a handback
-  // or an abort is delivered and the pause happens behind it.
+  // starts it again.
+  //
+  // What this does and does not promise. The message just written is not held
+  // back, so the one that triggered the pause is delivered. Anything already
+  // behind it in the human's socket buffer — a handback among them — is *not
+  // lost but is delayed*, until the agent drains or goes away; `closePeer`
+  // resumes the human for the second case, so a dead agent cannot mute one
+  // forever. Separating terminal messages out would mean parsing before the
+  // flow-control decision, which is the work the 4 KiB cap exists to avoid.
   if (peer.role === "human" && other?.backpressure) holdHuman(peer)
 }
 
@@ -2115,12 +2122,43 @@ const PAGE = `<!doctype html>
    * shown as its resolved form, and the card says so when the two differ.
    * Nothing is truncated; the whole link is still on the screen.
    */
+  /**
+   * The authority as the code actually wrote it, lowercased.
+   *
+   * Not what the parser made of it — that is the whole point. Empty for a
+   * scheme with no authority (mailto:), where there is no host to be deceived
+   * about.
+   */
+  function writtenHost(text) {
+    // Deliberately not a regular expression: this whole script is a template
+    // literal in server.js, which eats the backslash a regex needs. Two
+    // indexOf calls and a loop cannot be broken by that.
+    var mark = text.indexOf("://")
+    if (mark === -1) return ""
+    var rest = text.slice(mark + 3)
+    var end = rest.length
+    for (var i = 0; i < rest.length; i++) {
+      var c = rest.charAt(i)
+      if (c === "/" || c === "?" || c === "#") { end = i; break }
+    }
+    var authority = rest.slice(0, end)
+    var at = authority.lastIndexOf("@")
+    return (at === -1 ? authority : authority.slice(at + 1)).toLowerCase()
+  }
+
   function resolveLink(link) {
     if (!openable(link)) return { shown: link.text, changed: false, host: "" }
     var url = new URL(link.text)
     return {
       shown: url.href,
-      changed: url.href !== link.text,
+      // Only when the host the code wrote is not the host the browser will
+      // connect to. Comparing the whole string instead fired on
+      // "https://example.com" — the parser adds the trailing slash — and on any
+      // capital letter in a scheme or a domain, which is to say on some of the
+      // commonest shapes a QR code has. A warning that goes off on ordinary
+      // input is one a human learns to tap past, and this one has to land on
+      // the day it means a Cyrillic homograph.
+      changed: writtenHost(link.text) !== "" && writtenHost(link.text) !== url.host,
       // The ASCII host, which is the one the browser will connect to and the
       // one word on the card worth reading before tapping Open.
       host: url.host

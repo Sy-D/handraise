@@ -620,7 +620,7 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   // Let a scan that was in flight when the handoff settled finish reporting
   // itself, then stop its worker. Awaited before the wide event is built, so
   // `qrScans` and `qrHits` are frozen by the time it reads them; the decode
-  // has its own three-second deadline, so this cannot wait on a hung thread.
+  // has its own six-second deadline, so this cannot wait on a hung thread.
   await scanTask
   await scanner.close()
   await pump?.stop()

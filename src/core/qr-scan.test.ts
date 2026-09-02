@@ -22,6 +22,7 @@ import { decodePng, type RgbaImage } from "./png"
 import { NEVER_OPENABLE } from "./qr-fixtures"
 import {
   classifyLink,
+  createQrScanner,
   MAX_LINK_CHARS,
   OPENABLE_SCHEMES,
   scanImage,
@@ -288,10 +289,55 @@ test("a zip bomb is refused at the size its own header promised", () => {
   expect(grew).toBeLessThan(32)
 })
 
+test("the pixel cap is the one the decoder can finish inside its deadline", () => {
+  // The cap is not "what a screen could hold" — it is what the decode finishes
+  // inside `DECODE_TIMEOUT_MS` with margin, and the two are documented against
+  // each other. A header at the cap gets past `readHeader` and fails later, on
+  // its (deliberately absent) image data; one pixel over is refused by the cap
+  // itself. The two different messages are what prove which check fired.
+  const tiny = deflateSync(Buffer.alloc(64))
+  expect(() => decodePng(forgePng(6000, 4000, tiny))).toThrow(/decompressed to/)
+  expect(() => decodePng(forgePng(6000, 4001, tiny))).toThrow(/past the .* cap/)
+
+  // And the case the comment now names out loud: a 4K viewport at device scale
+  // 2 is 7680x4320, which is over the cap and refused.
+  expect(() => decodePng(forgePng(7680, 4320, tiny))).toThrow(/past the .* cap/)
+})
+
 test("a header that claims more pixels than any screen is refused", () => {
   // 65535x65535 is four billion pixels, and every allocation in the decoder is
   // sized from these two numbers. Refused before a byte is inflated.
   expect(() =>
     decodePng(forgePng(65_535, 65_535, deflateSync(Buffer.alloc(64)))),
   ).toThrow(/past the .* cap/)
+})
+
+// --- the worker ------------------------------------------------------------
+
+test("a decode that fails does not poison the scanner", async () => {
+  // The worker answers a refusal with a message rather than dying, so the
+  // thread survives a hostile PNG and the next scan does not pay a startup —
+  // or, worse, post into a handle that is dead and wait out the whole deadline
+  // finding out.
+  const scanner = createQrScanner()
+  try {
+    await expect(
+      scanner.scan(Buffer.from("not a png, just some bytes")),
+    ).rejects.toThrow(/not a PNG/)
+
+    const links = await scanner.scan(readFileSync(FIXTURE))
+    expect(links).toEqual([{ text: FIXTURE_PAYLOAD, kind: "url" }])
+  } finally {
+    await scanner.close()
+  }
+})
+
+test("a closed scanner refuses instead of starting another thread", async () => {
+  const scanner = createQrScanner()
+  await scanner.close()
+  await expect(scanner.scan(readFileSync(FIXTURE))).rejects.toThrow(
+    /scanner closed/,
+  )
+  // Idempotent, and safe from a `finally` that runs twice.
+  await scanner.close()
 })

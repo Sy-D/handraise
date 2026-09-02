@@ -187,14 +187,19 @@ const MAGNIFY = 2
 /**
  * The most pixels one retry pass may allocate.
  *
- * The 2x look costs four times the source, at four bytes a pixel — so a 4K
- * screenshot (8.3 MP) becomes 33 MP and 133 MB of transient typed array. That
- * is the largest thing worth spending on a retry: past it the pass is refused
- * and the ladder moves on rather than the process taking a 500 MB step for a
- * code it probably cannot read anyway. The plain first pass is not bounded by
- * this — it is bounded by `MAX_PIXELS` in png.ts, at the decode.
+ * This is the number that sets what a scan costs, not `MAX_PIXELS`: the 2x look
+ * is four times the source and it is the expensive pass by a wide margin.
+ * Measured (docs/measurements/05-qr.md §6), a 24 MP image too big to magnify
+ * decodes in 1.2 s, while a 10 MP one that magnifies to 40 MP takes 2.8 to
+ * 3.7 s.
+ *
+ * 34 MP is exactly what a 4K screenshot needs — 3840x2160 is 8.3 MP and
+ * magnifies to 33.2 — and nothing more. That input measured 2.1 s against a 6 s
+ * deadline. Set it higher and a legitimate scan starts being killed by the
+ * deadline instead of answered; set it lower and a 4K page loses the retry that
+ * makes a resampled code readable at all.
  */
-const MAX_SCAN_PIXELS = 40_000_000
+const MAX_SCAN_PIXELS = 34_000_000
 
 /**
  * Look again, twice the size.
@@ -342,12 +347,19 @@ export interface QrScanner {
 /**
  * How long one decode may take before the worker is assumed lost.
  *
- * The measured worst case is well under a second (docs/measurements/05-qr.md).
- * Three seconds is the point past which something is wrong rather than slow,
- * and terminating is the only lever there is over a worker that has stopped
+ * Derived from `MAX_SCAN_PIXELS` rather than picked: the worst input the caps
+ * admit is a 4K screenshot magnified to 34 MP, which measured 2.1 s
+ * (docs/measurements/05-qr.md §6). Six seconds is close to three times that,
+ * which is the margin an agent host under load needs — and it stays inside the
+ * phone's own 12 s wait even after a 5 s screenshot, so a human is never told
+ * "the agent didn't answer" about a scan that is still coming.
+ *
+ * It was three seconds, and three was wrong: a 10 MP screenshot measured 3.7 s
+ * and would have been killed on the way to an answer it already had. Past this,
+ * terminating is the only lever there is over a worker that has stopped
  * answering — which is exactly why the work is over there.
  */
-const DECODE_TIMEOUT_MS = 3_000
+const DECODE_TIMEOUT_MS = 6_000
 
 /**
  * Where the worker's code is, in a source tree and in a published package.
@@ -374,6 +386,16 @@ export function createQrScanner(): QrScanner {
     // A pool of one, and nothing else in the process waits on it: an idle
     // worker must not be the reason a script does not exit.
     started.unref()
+    // Two jobs, and both outlive any single scan. An `'error'` with no listener
+    // is a throw out of an EventEmitter, and between scans this worker has no
+    // other one — so it is never without this. And a worker that has errored is
+    // dead: forgetting it here is what makes the next scan start a fresh one
+    // instead of posting into a thread that will never answer and burning the
+    // whole deadline finding out.
+    started.on("error", () => {
+      if (worker === started) worker = null
+      void started.terminate()
+    })
     return started
   }
 

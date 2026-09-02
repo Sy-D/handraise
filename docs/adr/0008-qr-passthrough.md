@@ -79,12 +79,12 @@ loop for **2132 ms, during which a 5 ms heartbeat did not tick once**
 and the browser's disconnect. So the work runs in a worker thread —
 `dist/qr-worker.js`, started at the first scan of a handoff, terminated when it
 settles — and the same decode costs the loop one millisecond. The worker also
-buys the only lever there is over a decode that will not finish: a three-second
+buys the only lever there is over a decode that will not finish: a six-second
 deadline and `terminate()`.
 
 **Every size is bounded before anything is allocated.** A PNG's header is the
 only part of it that is cheap to believe, and everything downstream is sized
-from it, so it is checked first: 8192 pixels a side, 33 megapixels in total, 32
+from it, so it is checked first: 8192 pixels a side, 24 megapixels in total, 32
 MB of compressed image data, and the exact inflated length the header implies
 passed to `inflateSync` as `maxOutputLength` and then required to match. The 2x
 retry allocates four times the source, so it is refused above 40 megapixels
@@ -147,7 +147,7 @@ real cloud-browser screenshot.
 - **Two codes on one screen** need the tiled second pass to be found at all
   (§4). Three or more are not attempted: `MAX_CODES` is 2.
 - **reCAPTCHA itself is untested.** Its demo never served the QR variant
-  (§6). The mechanism is proven end to end against the test app's `/qr` page in
+  (§7). The mechanism is proven end to end against the test app's `/qr` page in
   the live e2e, and the README says as much rather than implying more.
 - A hostile page can put any string in a QR code and have a human read it on a
   phone. That is the residual risk, and it is bounded by the allowlist, by the
@@ -181,6 +181,15 @@ real cloud-browser screenshot.
   their business — and the handoff path uses `createQrScanner()`, which is the
   same decode on a worker. Both are exported; the ADR's argument only covers
   the second.
+- **The relay's backpressure pause delays, it does not drop.** When the agent's
+  socket is full the relay stops reading the human's, having first written the
+  message that triggered it. Anything already behind that in the human's socket
+  buffer — a handback among them — waits for the agent to drain, or for it to
+  go away, at which point `closePeer` resumes the human. Bounded by
+  drain-or-close and never lost, but not instant. Separating terminal messages
+  out would mean parsing before the flow-control decision, which is exactly the
+  work the 4 KiB pre-parse cap exists to avoid.
+
 - **A worker is a file, not a function.** `dist/qr-worker.js` is resolved at
   runtime with `new URL("./qr-worker.js", import.meta.url)`, so a consumer who
   re-bundles handraise has to keep it next to the entry it resolves from. The

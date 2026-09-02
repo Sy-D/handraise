@@ -47,14 +47,20 @@ const IHDR_LENGTH = 13
 /**
  * The largest image this will decode.
  *
- * 8192 on a side covers a 4K viewport at device scale 2 with room to spare;
- * 33 megapixels is a little over 8192x4096, which is more pixels than any
- * screenshot handraise takes. Both are checked before a byte is decompressed,
- * because the header is the only part of a PNG that is cheap to believe and
- * every allocation below is sized from it.
+ * 8192 on a side, 24 megapixels in total. Both are checked before a byte is
+ * decompressed, because the header is the only part of a PNG that is cheap to
+ * believe and every allocation below is sized from it.
+ *
+ * The pixel cap is set by what the decoder can finish inside its own deadline,
+ * not by what a screen could hold: 24 MP measured 1.2 s and the deadline is 6 s
+ * (docs/measurements/05-qr.md §6). **A 4K viewport at device scale 2 is
+ * 7680x4320 — 33.2 MP — and is refused**, which is a real limit and not an
+ * oversight: it is four times the pixels of the 4K screenshot the scan is built
+ * for, and no page draws a QR code that needs them. A caller who hits this
+ * should scan at device scale 1.
  */
 export const MAX_DIMENSION = 8192
-export const MAX_PIXELS = 33_000_000
+export const MAX_PIXELS = 24_000_000
 
 /**
  * The largest compressed image data this will inflate.

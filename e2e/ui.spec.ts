@@ -1649,6 +1649,32 @@ test("an ordinary link is shown verbatim, with no note about it", async () => {
   expect(consoleErrors).toEqual([])
 })
 
+test("normalising a link is not the same as changing it", async () => {
+  await showFrame()
+  // Both of these come back from the URL parser as a different string — a
+  // trailing slash appears, a capital is lowered — and neither is a deception.
+  // A bare domain is one of the commonest shapes a QR code has, and a warning
+  // that fires on it is a warning the human learns to tap past, which is
+  // exactly when the homograph case needs it to land.
+  agent.send({
+    type: "links",
+    links: [
+      { text: "https://example.com", kind: "url" },
+      { text: "HTTPS://Example.COM/Path", kind: "url" },
+    ],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([
+    "https://example.com/",
+    "https://example.com/Path",
+  ])
+  expect(await page.locator("#sheet-links .link-note").count()).toBe(0)
+  expect(await page.locator("#sheet-links a.link-action").count()).toBe(2)
+  expect(consoleErrors).toEqual([])
+})
+
 test("the result sheet stays reachable after the handoff ends", async () => {
   await showFrame()
   agent.send({
