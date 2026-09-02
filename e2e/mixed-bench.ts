@@ -40,7 +40,10 @@
  * - Deterministic scripts, not an LLM. The claim is about the mechanism.
  * - Every 4th approval is DENIED, and a denied approval counts as completed:
  *   the workflow reached a decision and the agent obeyed it. A bench that only
- *   counted "yes" would be measuring agreement, not delivery.
+ *   counted "yes" would be measuring agreement, not delivery. "Obeyed" is
+ *   checked on the account page — the only page that can render a receipt — and
+ *   it requires the session to still be there as well as the receipt to be
+ *   absent, so the check can fail in both directions.
  * - The approval arm signs itself in with the shared secret. That sign-in is
  *   setup, not the interrupt under measurement — the interrupt here is the
  *   authority boundary at the transfer, and it happens after the wall. Only the
@@ -58,19 +61,26 @@
  * - A failed run is recorded as a failed run. Percentiles are over the runs
  *   that completed, with the failures shown next to them.
  * - A run that could not get a relay because a neighbouring job held both
- *   sandbox slots is not a failed run: the bench stands back for a minute and
- *   tries that workflow again, up to ten times, and `concurrencyWaits` in the
- *   JSON says how often that happened.
+ *   sandbox slots is waited out: the bench stands back for a minute and tries
+ *   that workflow again, up to ten times. The attempt it replaces is kept in
+ *   `runs` with `superseded: "plan_full"` and counts as not completed, so a
+ *   retry rule can never quietly improve the completion rate.
  *
- * Set MIXED_FAULT=invert-completed to invert the completion test. Both modes
- * must then read 0 of N — that is how the counting is known to be load-bearing
- * rather than decorative.
+ * Set MIXED_FAULT=invert-completed to invert the page sensors — the banner
+ * check and the receipt check, not the verdict they feed. Both modes must then
+ * read 0 of N. Inverting the sensor rather than the verdict is what makes the
+ * proof worth running: a verdict flip passes even for a check that never looks
+ * at the page, and this bench shipped exactly that mistake once.
  */
 import { Solari } from "@solarisdk/browser"
 import type { Page } from "playwright-core"
 
 import type { HandoffEvent } from "../src/events"
-import { raiseHand } from "../src/index"
+import {
+  type HandraiseErrorCode,
+  isHandraiseError,
+  raiseHand,
+} from "../src/index"
 import { previewPath, startTestApp } from "../test-app/deploy"
 import { totp } from "../test-app/totp"
 import { openHandoffPage, type SimulatedHuman } from "./human-sim"
@@ -150,6 +160,16 @@ interface MixedRun {
    */
   relaySandboxSeconds: number | null
   error: string | null
+  /** handraise's own error code, when it threw one. */
+  errorCode: HandraiseErrorCode | null
+  /**
+   * Why this attempt was replaced by another one, or null if it counted. A
+   * superseded attempt stays in the data and stays not-completed: dropping it
+   * would hide a failure that the retry rule happened to forgive.
+   */
+  superseded: "plan_full" | "test_app_lost" | null
+  /** Which attempt at this workflow index this record is, from 1. */
+  attempt: number
   /**
    * Times this workflow stood back for a full plan before it ran. A neighbour
    * holding both sandbox slots is queueing, not a result, so it is waited out
@@ -231,10 +251,60 @@ async function waitUntil(
 }
 
 /**
- * The sign-in step's definition of done: the account page, rendered, for our
- * user. Not "the URL changed" — the URL changes on a 303 before the page exists.
+ * The raw page predicates every verdict is built from, and below them the
+ * sensors the verdicts actually call.
+ *
+ * The fault switch acts on the sensors, not on the verdict. That is the point
+ * of it: a check that never looks at the page would invert just as cleanly as a
+ * live one if the verdict were flipped at the end, so flipping the verdict
+ * proves only that the summary reads a boolean. Flipping the sensor proves the
+ * boolean came from the page. Setup steps deliberately use the raw predicates —
+ * setup is plumbing, not a claim.
  */
-async function reachedAccount(
+const INVERTED = FAULT === "invert-completed"
+
+/** Under the fault, every sensor answers backwards. */
+function sensed(seen: boolean): boolean {
+  return INVERTED ? !seen : seen
+}
+
+/** Raw: does the account page name our user? */
+async function bannerNamesUser(
+  page: Page,
+  user: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const banner = await page
+    .textContent('[data-testid="signed-in"]', { timeout: timeoutMs })
+    .catch(() => null)
+  return banner?.includes(user) === true
+}
+
+/**
+ * Raw: is a receipt for a sent transfer on the page, and does it name `amount`?
+ *
+ * The amount is unique per run, so matching it also catches a receipt left by
+ * an earlier workflow.
+ */
+async function receiptIsOnPage(
+  page: Page,
+  timeoutMs: number,
+  amount?: string,
+): Promise<boolean> {
+  return waitUntil(async () => {
+    const receipt = page.locator('[data-testid="transfer-done"]')
+    if ((await receipt.count()) === 0) return false
+    if (amount === undefined) return true
+    const text = await receipt.first().textContent()
+    return text?.includes(amount) === true
+  }, timeoutMs)
+}
+
+/**
+ * Raw: the account page, rendered, for our user. Not "the URL changed" — the
+ * URL changes on a 303 before the page exists.
+ */
+async function accountIsRendered(
   page: Page,
   user: string,
   timeoutMs: number,
@@ -244,10 +314,29 @@ async function reachedAccount(
     timeoutMs,
   )
   if (!arrived) return false
-  const banner = await page
-    .textContent('[data-testid="signed-in"]', { timeout: timeoutMs })
-    .catch(() => null)
-  return banner?.includes(user) === true
+  return bannerNamesUser(page, user, timeoutMs)
+}
+
+/** Sensor: did the workflow land on its account page? */
+async function reachedAccount(
+  page: Page,
+  user: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  return sensed(await accountIsRendered(page, user, timeoutMs))
+}
+
+/**
+ * Sensor: is this the account page of our signed-in user? Used where the page
+ * was loaded by URL, so there is no redirect to wait for — and the preview
+ * host's URL ends in `?pt_token=`, not in `/account`.
+ */
+async function accountShowsUser(
+  page: Page,
+  user: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  return sensed(await bannerNamesUser(page, user, timeoutMs))
 }
 
 /** Drive the agent's part: log in with the credentials it has, hit the wall. */
@@ -259,16 +348,13 @@ async function walkToWall(page: Page, app: Target): Promise<void> {
   await page.waitForSelector('[data-testid="totp-code"]', { timeout: 30_000 })
 }
 
-/** Is a receipt for a sent transfer on the page right now? */
+/** Sensor: is a receipt for a sent transfer on the page right now? */
 async function transferWasSent(
   page: Page,
   timeoutMs: number,
+  amount?: string,
 ): Promise<boolean> {
-  return waitUntil(
-    async () =>
-      (await page.locator('[data-testid="transfer-done"]').count()) > 0,
-    timeoutMs,
-  )
+  return sensed(await receiptIsOnPage(page, timeoutMs, amount))
 }
 
 // --- the takeover interrupt ------------------------------------------------
@@ -322,7 +408,9 @@ async function signInWithTheSecret(page: Page, app: Target): Promise<void> {
   await walkToWall(page, app)
   await page.fill('[data-testid="totp-code"]', totp(app.totpSecret))
   await page.click('[data-testid="totp-submit"]')
-  const arrived = await reachedAccount(page, app.user, SETTLE_TIMEOUT_MS)
+  // Raw, not sensed: a fault switch that broke the setup would prove nothing
+  // about the verdicts it is aimed at.
+  const arrived = await accountIsRendered(page, app.user, SETTLE_TIMEOUT_MS)
   if (!arrived) throw new Error("the approval arm never got signed in")
 }
 
@@ -340,6 +428,8 @@ async function fillTransfer(page: Page, amount: string, payee: string) {
 
 interface HandoffRecord {
   outcome: string | null
+  /** The typed code, when handraise threw one. The message is not a contract. */
+  errorCode: HandraiseErrorCode | null
   event: HandoffEvent | null
   stuckToVisibleMs: number | null
   humanActiveMs: number | null
@@ -361,6 +451,7 @@ async function withHandoff(
 ): Promise<HandoffRecord> {
   const record: HandoffRecord = {
     outcome: null,
+    errorCode: null,
     event: null,
     stuckToVisibleMs: null,
     humanActiveMs: null,
@@ -400,6 +491,7 @@ async function withHandoff(
     record.humanActiveMs = record.humanActiveMs ?? Date.now() - firstFrameAt
   } catch (error) {
     record.error = error instanceof Error ? error.message : String(error)
+    record.errorCode = isHandraiseError(error) ? error.code : null
     // The script gave up, so say so on the wire instead of holding the relay
     // sandbox for the rest of the timeout. A takeover settles as `aborted`; an
     // approval ignores the message by design and still runs out the clock.
@@ -408,6 +500,8 @@ async function withHandoff(
 
   const result = await handoff.catch((error: Error) => {
     record.error = record.error ?? error.message
+    record.errorCode =
+      record.errorCode ?? (isHandraiseError(error) ? error.code : null)
     return null
   })
   // Only when a relay actually came up: a handoff that never got one (the plan
@@ -488,11 +582,19 @@ async function runApproval(
   // nothing into the page, so the transfer only happens if the agent submits.
   if (handoff.outcome === "approved") {
     await page.click('[data-testid="transfer-submit"]')
-    run.completed = await transferWasSent(page, SETTLE_TIMEOUT_MS)
+    run.completed = await transferWasSent(page, SETTLE_TIMEOUT_MS, amount)
   } else if (handoff.outcome === "denied") {
     // A denied approval is a completed workflow: the decision was delivered and
-    // obeyed. What must be true is that no money moved.
-    run.completed = !(await transferWasSent(page, 1_000))
+    // obeyed. Both halves of that have to be seen on a page that could show the
+    // opposite. The transfer form cannot: `transfer-done` is rendered only by
+    // the account page, so asking the form for a receipt is a check that cannot
+    // fail. Load the account page and require the session AND the absence.
+    await page.goto(previewPath(app.url, "/account"), {
+      waitUntil: "domcontentloaded",
+      timeout: 45_000,
+    })
+    const signedIn = await accountShowsUser(page, app.user, SETTLE_TIMEOUT_MS)
+    run.completed = signedIn && !(await transferWasSent(page, 1_000, amount))
   }
 }
 
@@ -508,6 +610,7 @@ function applyHandoff(run: MixedRun, handoff: HandoffRecord): void {
   run.humanActiveMs = handoff.humanActiveMs
   run.relaySandboxSeconds = handoff.relaySandboxSeconds
   run.error = handoff.error
+  run.errorCode = handoff.errorCode
 }
 
 async function runWorkflow(
@@ -536,6 +639,9 @@ async function runWorkflow(
     humanActiveMs: null,
     relaySandboxSeconds: null,
     error: null,
+    errorCode: null,
+    superseded: null,
+    attempt: 1,
     concurrencyWaits: 0,
     browserAgeMs: Date.now() - lease.launchedAt,
   }
@@ -551,7 +657,6 @@ async function runWorkflow(
     await page.close().catch(() => undefined)
   }
 
-  if (FAULT === "invert-completed") run.completed = !run.completed
   return run
 }
 
@@ -633,8 +738,7 @@ async function appIsHealthy(url: string): Promise<boolean> {
  */
 function planWasFull(run: MixedRun): boolean {
   return (
-    run.relaySandboxSeconds === null &&
-    /too many concurrent|concurrenc|429/i.test(run.error ?? "")
+    run.relaySandboxSeconds === null && run.errorCode === "concurrency_limit"
   )
 }
 
@@ -729,6 +833,18 @@ let concurrencyWaits = 0
 let appRestarts = 0
 let abortReason: string | null = null
 
+/** Keep a replaced attempt in the data, with why it was replaced. */
+function supersede(
+  run: MixedRun,
+  reason: "plan_full" | "test_app_lost",
+  attemptNumber: number,
+): void {
+  run.superseded = reason
+  run.attempt = attemptNumber
+  run.completed = false
+  runs.push(run)
+}
+
 let app = await startTestApp({ apiKey, timeoutMs: APP_TIMEOUT_MS })
 console.log(
   JSON.stringify({
@@ -761,49 +877,63 @@ try {
     }
 
     let run = await attempt()
+    let tries = 1
     let waits = 0
-    while (planWasFull(run) && waits < CONCURRENCY_WAITS) {
-      waits += 1
-      concurrencyWaits += 1
-      console.log(
-        JSON.stringify({
-          event: "plan_full",
-          index,
-          waitSeconds: CONCURRENCY_WAIT_MS / 1000,
-          attempt: waits,
-        }),
-      )
-      await Bun.sleep(CONCURRENCY_WAIT_MS)
-      run = await attempt()
+    // One loop for both retry rules, so a retried run is judged by the same
+    // two conditions as a first attempt. Every attempt that is replaced stays
+    // in the data as a not-completed run with its error: a queue is a queue,
+    // but a failure that a retry rule happens to forgive is still a failure.
+    for (;;) {
+      if (planWasFull(run) && waits < CONCURRENCY_WAITS) {
+        waits += 1
+        concurrencyWaits += 1
+        supersede(run, "plan_full", tries)
+        console.log(
+          JSON.stringify({
+            event: "plan_full",
+            index,
+            waitSeconds: CONCURRENCY_WAIT_MS / 1000,
+            attempt: waits,
+          }),
+        )
+        await Bun.sleep(CONCURRENCY_WAIT_MS)
+        tries += 1
+        run = await attempt()
+        continue
+      }
+      // A run that never even reached the interrupt may have found the test app
+      // gone rather than anything about a handoff.
+      if (
+        !run.reachedInterrupt &&
+        appRestarts < APP_RESTARTS &&
+        !(await appIsHealthy(app.url))
+      ) {
+        supersede(run, "test_app_lost", tries)
+        console.log(JSON.stringify({ event: "test_app_lost", index }))
+        await app.kill().catch(() => undefined)
+        app = await startTestApp({ apiKey, timeoutMs: APP_TIMEOUT_MS })
+        appRestarts += 1
+        console.log(
+          JSON.stringify({
+            event: "test_app_restarted",
+            index,
+            sandbox: app.sandboxId,
+          }),
+        )
+        tries += 1
+        run = await attempt()
+        continue
+      }
+      break
     }
+    run.attempt = tries
     run.concurrencyWaits = waits
-
-    // A run that never even reached the interrupt may have found the test app
-    // gone rather than anything about a handoff. Rebuild it and try again;
-    // that is infrastructure, not a datum.
-    while (
-      !run.reachedInterrupt &&
-      appRestarts < APP_RESTARTS &&
-      !(await appIsHealthy(app.url))
-    ) {
-      console.log(JSON.stringify({ event: "test_app_lost", index }))
-      await app.kill().catch(() => undefined)
-      app = await startTestApp({ apiKey, timeoutMs: APP_TIMEOUT_MS })
-      appRestarts += 1
-      console.log(
-        JSON.stringify({
-          event: "test_app_restarted",
-          index,
-          sandbox: app.sandboxId,
-        }),
-      )
-      run = await attempt()
-    }
     runs.push(run)
     console.log(
       JSON.stringify({
         event: "mixed_run",
         index,
+        attempt: run.attempt,
         kind,
         decision: run.decision,
         completed: run.completed,
@@ -829,7 +959,13 @@ try {
     }
 
     consecutiveFailures = run.completed ? 0 : consecutiveFailures + 1
-    if (consecutiveFailures >= ABORT_AFTER_CONSECUTIVE_FAILURES) {
+    // Under the fault every workflow is supposed to fail, so the guard that
+    // reads a failure streak as broken infrastructure would end the proof
+    // before it reached the denial arm.
+    if (
+      FAULT === "" &&
+      consecutiveFailures >= ABORT_AFTER_CONSECUTIVE_FAILURES
+    ) {
       abortReason = `${ABORT_AFTER_CONSECUTIVE_FAILURES} workflows failed in a row — the infrastructure is down, not the claim`
       console.log(
         JSON.stringify({ event: "mixed_aborted", reason: abortReason }),
@@ -875,12 +1011,16 @@ await Bun.write(
         notAClaim:
           "the 50/50 mix is this harness's choice, not a measurement of any fleet's traffic; multiply the per-mode costs by your own mix",
         deniedCountAsCompleted:
-          "yes — a denied approval delivered a decision the agent obeyed, and the bench asserts no transfer was sent",
+          "yes — a denied approval delivered a decision the agent obeyed; the bench then loads /account and requires the session banner AND the absence of the receipt for that run's amount",
         approvalSetup:
           "the approval arm signs itself in with the shared secret; that sign-in is setup, and the interrupt under measurement is the transfer",
         denyEvery: DENY_EVERY,
         interleaved: true,
         fault: FAULT === "" ? null : FAULT,
+        faultActsOn:
+          "the page sensors (signed-in banner, transfer receipt), not the verdict they feed",
+        supersededAttempts: runs.filter((run) => run.superseded !== null)
+          .length,
         abortReason,
         browserRelaunches: relaunches,
         concurrencyWaits,
