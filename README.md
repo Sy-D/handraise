@@ -87,11 +87,13 @@ to open the link at all.
 import { raiseHand } from "handraise"
 import { telegram } from "handraise-telegram"
 
+const { TELEGRAM_BOT_TOKEN = "", TELEGRAM_CHAT_ID = "" } = process.env
+
 await raiseHand(page, {
   mode: "approval",
   reason: "The agent may not move money without a human",
   action: "Submit $12,430 vendor payment to Acme GmbH",
-  channels: [telegram({ botToken: process.env.TELEGRAM_BOT_TOKEN, chatId: "…" })],
+  channels: [telegram({ botToken: TELEGRAM_BOT_TOKEN, chatId: TELEGRAM_CHAT_ID })],
 })
 // The screenshot and two buttons arrive in the chat; the first answer wins,
 // whether it comes from there or from the phone.

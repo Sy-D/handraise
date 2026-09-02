@@ -163,8 +163,13 @@ const VIEWPORT = { width: 1280, height: 800 }
 /** CDP sessions opened on the fake page since the last reset. */
 let cdpSessions = 0
 
-/** A page whose context yields the fake CDP session and a live fake browser. */
-function fakePage(cdp: CDPSession): Page {
+/**
+ * A page whose context yields the fake CDP session and a live fake browser.
+ *
+ * `screenshotDelayMs` holds the approval's one screenshot in flight, which is
+ * the window in which a handoff can settle before the frame ever lands.
+ */
+function fakePage(cdp: CDPSession, screenshotDelayMs = 0): Page {
   cdpSessions = 0
   let browser: Browser
   const browserPartial: Partial<Browser> = {
@@ -192,7 +197,10 @@ function fakePage(cdp: CDPSession): Page {
     context: () => context,
     // SAFETY: approval mode calls screenshot() for its one frame and reads the
     // viewport for that frame's metadata; neither result is used as anything else.
-    screenshot: (async () => SAMPLE_JPEG) as Page["screenshot"],
+    screenshot: (async () => {
+      if (screenshotDelayMs > 0) await Bun.sleep(screenshotDelayMs)
+      return SAMPLE_JPEG
+    }) as Page["screenshot"],
     viewportSize: () => VIEWPORT,
     // SAFETY: as the browser's, above — an unused chaining emitter.
     once: (() => page) as Page["once"],
@@ -855,4 +863,73 @@ test("an approval channel gets the same JPEG bytes the phone gets", async () => 
 
   human.send({ type: "deny" })
   expect((await handoff).outcome).toBe("denied")
+})
+
+test("a handoff that ends before the screenshot lands is never announced", async () => {
+  // The window between "take the screenshot" and "send it": a round trip to
+  // the browser, during which the page can close or the wait can run out.
+  // `sendApprovalFrame` already refuses to put a frame on the wire after that;
+  // a channel that posted anyway would leave live buttons under a request that
+  // no longer exists, and the first press would be told "already decided".
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 250),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    // Runs out while the screenshot above is still being taken.
+    timeoutMs: 1,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-before-announce",
+    relayColdStartMs: 17,
+    logger: noopLogger,
+  })
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  expect(recorder.seen).toEqual([])
+})
+
+test("a takeover handback carries no answeredVia", async () => {
+  // A handback and a give-up go through the same `answerHandoff` as an
+  // approval answer, so `answeredVia` is set on them too. The wide event only
+  // carries it where it means something: "who said yes or no". This is the
+  // guard that keeps it off every takeover event.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "Aurora Bank is asking for a 2FA code",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "takeover-answered-via",
+    relayColdStartMs: 18,
+    logger: noopLogger,
+  })
+
+  await until("the phone to connect", () => human.inbox.length >= 0)
+  human.send({ type: "handback" })
+  expect((await handoff).outcome).toBe("resolved")
+
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.answeredVia).toBeUndefined()
+  expect(JSON.stringify(event)).not.toContain("answeredVia")
 })

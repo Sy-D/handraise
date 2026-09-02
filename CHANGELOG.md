@@ -38,9 +38,10 @@ Everything here is additive. No existing call, type or outcome changes.
 - **`docs/adr/0007`** on why a channel is an in-process hook rather than a
   second human WebSocket client — the relay accepts one human peer and replaces
   it, so an adapter that connected would throw the phone off the handoff.
-- **`handraise-telegram`**, the first adapter, in its own package: the
-  screenshot with Approve/Deny buttons in a Telegram chat, answered by long
-  polling, no public callback endpoint to host.
+- **`handraise-telegram`**, the first adapter, written against this release in
+  its own package: the screenshot with Approve/Deny buttons in a Telegram chat,
+  answered by long polling, no public callback endpoint to host. It is not on
+  npm at the time of writing; this release is what it needs in order to be.
 
 ### Known gap
 

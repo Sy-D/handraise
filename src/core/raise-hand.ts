@@ -16,7 +16,12 @@
  *   once.
  */
 import type { CDPSession, Page } from "playwright-core"
-import type { ChannelHandoff, HandoffChannel } from "../channels"
+import type {
+  ApprovalChannelHandoff,
+  ChannelHandoff,
+  HandoffChannel,
+  TakeoverChannelHandoff,
+} from "../channels"
 import type { HandoffEvent } from "../events"
 import { type Logger, quietLogger } from "../logger"
 import { printHandoffQr } from "../qr"
@@ -189,28 +194,40 @@ function emitHandoffEvent(
 }
 
 /**
- * Build the view of this handoff a channel adapter receives.
- *
- * `shot` is the approval's one screenshot, or null in takeover mode — where
- * there is nothing to answer and nothing to look at, so the channel gets the
- * link and that is all.
+ * The view a channel gets of a takeover: the link, and that is all. There is
+ * nothing to answer and no one moment worth sending — the human has to drive
+ * the browser, which only the handoff page can do.
  */
-function channelHandoff(
-  run: HandoffRun,
-  answer: (decision: "approve" | "deny") => boolean,
-  shot: ApprovalFrame | null,
-): ChannelHandoff {
-  const { options } = run
-  const base = {
+function takeoverChannelHandoff(run: HandoffRun): TakeoverChannelHandoff {
+  return {
+    mode: "takeover",
     handoffId: run.handoffId,
     url: run.url,
-    reason: options.reason,
+    reason: run.options.reason,
   }
-  if (options.mode !== "approval" || !shot) return { ...base, mode: "takeover" }
+}
+
+/**
+ * The view a channel gets of an approval.
+ *
+ * `action` and `shot` are parameters rather than fields read off `run`,
+ * because only the caller has narrowed the options union far enough to know
+ * they exist. Two builders rather than one with a fallback: an approval
+ * announced as a takeover would not be a degraded message but the wrong one —
+ * a bearer link and "drive the browser", in place of a yes or no.
+ */
+function approvalChannelHandoff(
+  run: HandoffRun,
+  action: string,
+  shot: ApprovalFrame,
+  answer: (decision: "approve" | "deny") => boolean,
+): ApprovalChannelHandoff {
   return {
-    ...base,
     mode: "approval",
-    action: options.action,
+    handoffId: run.handoffId,
+    url: run.url,
+    reason: run.options.reason,
+    action,
     // The same JPEG the phone is looking at. It is held base64 because that is
     // what goes on the wire; this is that exact payload decoded back, not a
     // second screenshot of a page that may have moved on since.
@@ -397,21 +414,24 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   })
   link = connection
 
+  const answerFromChannel = (decision: "approve" | "deny"): boolean =>
+    answerHandoff(decision === "approve" ? "approved" : "denied", "channel")
+
   /**
    * Tell the channels. Once per handoff, per channel, at the first moment
    * there is something worth sending: the link in takeover mode, the link and
    * the screenshot in approval mode.
+   *
+   * Not once the handoff is over. Taking the screenshot is a round trip to the
+   * browser, and the page can close or the wait can run out while it is in
+   * flight — `sendApprovalFrame` guards exactly that window, and a channel
+   * announced anyway would leave live buttons under a request that no longer
+   * exists.
    */
-  const announce = (shot: ApprovalFrame | null): void => {
+  const announce = (handoff: ChannelHandoff): void => {
     const channels = options.channels ?? []
-    if (channels.length === 0) return
-    const answerFromChannel = (decision: "approve" | "deny"): boolean =>
-      answerHandoff(decision === "approve" ? "approved" : "denied", "channel")
-    notifyChannels(
-      channels,
-      channelHandoff(run, answerFromChannel, shot),
-      logger,
-    )
+    if (over || channels.length === 0) return
+    notifyChannels(channels, handoff, logger)
   }
 
   try {
@@ -421,12 +441,23 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       // left it, and it is still that page afterwards.
       approvalFrame = await captureApprovalFrame(page)
       await sendApprovalFrame()
-      announce(approvalFrame)
+      // `options.mode`, not the `mode` local: this is the check that narrows
+      // the union, and it is what makes `options.action` readable here.
+      if (options.mode === "approval") {
+        announce(
+          approvalChannelHandoff(
+            run,
+            options.action,
+            approvalFrame,
+            answerFromChannel,
+          ),
+        )
+      }
     } else {
       // The relay is up — `raiseHand` awaited it — so the link in the message
       // is already open. Sent before the cast starts, because the cast is not
       // what the human needs in order to be told.
-      announce(null)
+      announce(takeoverChannelHandoff(run))
       cdp = await page.context().newCDPSession(page)
       input = createInputTarget(cdp)
       pump = await startTakeoverCast(cdp, connection, (data) => {
