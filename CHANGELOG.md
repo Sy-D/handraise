@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.6.0
+
+### Added
+
+- **Typed errors: `HandraiseError`, `HandraiseErrorCode`, `isHandraiseError`.**
+  Everything `raiseHand` throws now carries a `code` you can branch on —
+  `missing_api_key`, `invalid_mode`, `empty_action`, `browser_unusable`,
+  `relay_start_failed`, `concurrency_limit`, `relay_not_ready` — plus the
+  original SDK, CDP or network error as `cause`. `concurrency_limit` is the
+  one worth retrying: it means your Solari account is at its concurrent
+  session cap, not that anything is broken. When to expect each code, and what
+  to do about it, is in the README's [Errors](README.md#errors) table. The
+  messages were never a contract; they can still be reworded in any release.
+  Outcomes are unchanged and still values: a human who never came, a session
+  that died mid-handoff and a webhook that 500s are not exceptions.
+- **`raiseHand` refuses a dead page before it creates anything**
+  (`browser_unusable`). A closed page, or a Solari browser session that has
+  already ended, cannot be driven or screenshotted, and starting a relay for
+  one spent a sandbox, a QR code and a person's attention to arrive at
+  `disconnected`.
+
+### Changed
+
+- **Solari SDK errors no longer escape `raiseHand` unchanged.** They are
+  wrapped in a `HandraiseError` and kept as `error.cause`. If you branched on
+  `instanceof ConcurrencyLimitError` (or `GatewayError`, or `ConnectionError`),
+  read `error.cause` — or, better, switch to
+  `error.code === "concurrency_limit"`. Nothing throws that did not throw
+  before, and nothing that used to be an exception became an outcome or the
+  other way round.
+
 ## [0.5.1] - 2026-09-02
 
 Republish of 0.5.0 with no code change. 0.5.0 was published to npm and

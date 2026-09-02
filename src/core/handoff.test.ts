@@ -578,7 +578,11 @@ test("an approval with a blank action is refused before a relay is started", asy
     logger: noopLogger,
   })
 
-  await expect(asking).rejects.toThrow(/needs a non-empty `action`/)
+  // The code is the contract; the sentence is for whoever reads the log.
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "empty_action",
+  })
 })
 
 test("an unknown mode is refused before anything is created", async () => {
@@ -595,7 +599,56 @@ test("an unknown mode is refused before anything is created", async () => {
   Object.assign(options, { mode: "approval; touch /tmp/handraise-pwned" })
 
   const asking = raiseHand(fakePage(fakeCdp().cdp), options)
-  await expect(asking).rejects.toThrow(/unknown mode/)
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "invalid_mode",
+  })
+})
+
+test("a handoff without an API key is refused, with a code", async () => {
+  // `apiKey: ""` rather than deleting the environment variable: bun loads
+  // `.env`, and a test that mutates `process.env` would decide the outcome of
+  // whatever runs next to it.
+  const asking = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    apiKey: "",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "missing_api_key",
+  })
+})
+
+test("a page whose browser is gone is refused before a sandbox is created", async () => {
+  // The page died between the agent's last step and its call for help — a
+  // Solari session's ~10-minute hard lifetime makes this ordinary. Starting a
+  // relay for it would spend a sandbox and a person's attention on a session
+  // nobody can drive.
+  const dead: Partial<Page> = {
+    context: () => {
+      throw new Error("Target page, context or browser has been closed")
+    },
+  }
+
+  const asking = raiseHand(
+    // SAFETY: the refusal under test reads only `context()`, which is the one
+    // member this page has.
+    dead as Page,
+    {
+      reason: "Aurora Bank is asking for a 2FA code",
+      apiKey: "not-a-real-key",
+      baseUrl: CLOSED_PORT,
+      logger: noopLogger,
+    },
+  )
+
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "browser_unusable",
+  })
 })
 
 // --- Channels ------------------------------------------------------------

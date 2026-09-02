@@ -7,7 +7,8 @@
  * else's automation, so it may only fail in ways the caller can act on:
  *
  * - It throws only if the relay never came up, i.e. before a human could
- *   possibly have been asked to help. Nothing was promised yet.
+ *   possibly have been asked to help. Nothing was promised yet, and what it
+ *   throws is a `HandraiseError` with a code (see ../errors.ts).
  * - After the handoff URL exists it never throws. Every failure — a dead
  *   browser session, a rejected CDP call, a webhook that 500s — becomes an
  *   `outcome` and a log line, because by then the caller has already shown the
@@ -15,13 +16,14 @@
  * - Every path destroys the relay sandbox and settles the promise exactly
  *   once.
  */
-import type { CDPSession, Page } from "playwright-core"
+import type { Browser, CDPSession, Page } from "playwright-core"
 import type {
   ApprovalChannelHandoff,
   ChannelHandoff,
   HandoffChannel,
   TakeoverChannelHandoff,
 } from "../channels"
+import { HandraiseError } from "../errors"
 import type { HandoffEvent } from "../events"
 import { type Logger, quietLogger } from "../logger"
 import { printHandoffQr } from "../qr"
@@ -596,7 +598,8 @@ const MODES = new Set<string>(["takeover", "approval"])
 function checkedMode(options: RaiseHandOptions): HandoffMode {
   const mode = options.mode ?? "takeover"
   if (!MODES.has(mode)) {
-    throw new Error(
+    throw new HandraiseError(
+      "invalid_mode",
       `handraise: unknown mode ${JSON.stringify(mode)} — it must be "takeover" or "approval".`,
     )
   }
@@ -606,13 +609,42 @@ function checkedMode(options: RaiseHandOptions): HandoffMode {
     options.mode === "approval" &&
     String(options.action ?? "").trim() === ""
   ) {
-    throw new Error(
+    throw new HandraiseError(
+      "empty_action",
       'handraise: mode "approval" needs a non-empty `action` — it is the step the human says yes or no to, and the phone shows it as the decision. Without it a human is asked to approve a blank line.',
     )
   }
   // SAFETY: `MODES` holds exactly the two members of HandoffMode, so a value
   // that passed the check above is one of them.
   return mode as HandoffMode
+}
+
+/**
+ * Refuse a page whose browser is already gone, before a sandbox is created.
+ *
+ * A dead session cannot be driven or screenshotted, so a handoff on one would
+ * spend a relay sandbox, a QR code and a person's attention to end in
+ * `disconnected`. Both halves are cheap and neither touches the network:
+ * `context()` throws once the page is closed, and a browser that has lost its
+ * connection says so.
+ */
+function checkedPage(page: Page): void {
+  let browser: Browser | null
+  try {
+    browser = page.context().browser()
+  } catch (cause) {
+    throw new HandraiseError(
+      "browser_unusable",
+      `handraise: this page cannot be handed to a human — reading its browser context failed, which is what a closed page or a dead CDP connection does. Relaunch the session and retry. ${String(cause)}`,
+      { cause },
+    )
+  }
+  if (browser && !browser.isConnected()) {
+    throw new HandraiseError(
+      "browser_unusable",
+      "handraise: the browser session behind this page is already disconnected, so there is nothing for a human to take over. Relaunch the session (its `storageState` from an earlier handoff, if you kept it, restores the human's work) and retry.",
+    )
+  }
 }
 
 /** See `RaiseHand` in ../types.ts for the contract. */
@@ -624,10 +656,12 @@ export async function raiseHand(
   const mode = checkedMode(options)
   const apiKey = options.apiKey ?? process.env.SOLARI_API_KEY
   if (!apiKey) {
-    throw new Error(
+    throw new HandraiseError(
+      "missing_api_key",
       "handraise: no API key. Pass options.apiKey or set SOLARI_API_KEY — it is needed to create the relay sandbox that gives the handoff a public URL.",
     )
   }
+  checkedPage(page)
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const relay = await startRelay(

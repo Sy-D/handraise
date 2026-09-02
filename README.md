@@ -289,6 +289,38 @@ await raiseHand(page, {
 | `timeout` | both | Nobody answered within `timeoutMs`. |
 | `disconnected` | both | The browser session died mid-handoff. |
 
+### Errors
+
+`raiseHand` throws only before the handoff URL exists — while nobody has been
+asked for anything yet. Everything after that is an `outcome`, never an
+exception. What it throws is a `HandraiseError` with a `code`: the code is the
+contract, the message is for whoever reads the log and may be reworded in any
+release. `isHandraiseError` narrows a `catch` binding, and `cause` keeps the
+original SDK, CDP or network error.
+
+```ts
+import { isHandraiseError, raiseHand } from "handraise"
+
+try {
+  await raiseHand(page, { reason: "GitHub is asking for a 2FA code" })
+} catch (error) {
+  if (isHandraiseError(error) && error.code === "concurrency_limit") {
+    // one Solari session too many: free one, then call again
+  }
+}
+```
+
+| `code` | Happens when | What to do |
+|---|---|---|
+| `missing_api_key` | No `options.apiKey` and no `SOLARI_API_KEY`. | Set one; handraise needs it to create the relay sandbox. |
+| `invalid_mode` | `mode` is neither `"takeover"` nor `"approval"`. | Fix the call. TypeScript already refuses it; this is for JavaScript callers. |
+| `empty_action` | `mode: "approval"` without a non-empty `action`. | Name the step the human says yes or no to. |
+| `browser_unusable` | The page's browser was already closed or disconnected. | Relaunch the session (restore `storageState` if you kept it) and retry. |
+| `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error. Retry; nothing was created. |
+| `concurrency_limit` | Your Solari account is at its concurrent session cap (429). | Free a session, or wait and retry. The one relay failure that is purely temporary. |
+| `relay_not_ready` | The sandbox started but its public URL never answered. | Retry. Persisting means the preview proxy or the region is unhealthy. |
+| `relay_kill_failed` | The relay sandbox survived every attempt to destroy it. | Its public URL stays reachable until the sandbox's idle timeout; delete it from the Solari dashboard. |
+
 ## What happens when things die
 
 A handoff tool that loses your session at the worst moment is worse than no

@@ -15,6 +15,7 @@ import {
   SolariClient,
 } from "@solarisdk/sdk"
 
+import { HandraiseError, isHandraiseError } from "../errors"
 import { type Logger, quietLogger } from "../logger"
 import type { HandoffMode } from "../types"
 import { GUEST_SERVER_JS } from "./guest-source"
@@ -106,9 +107,40 @@ function withToken(previewUrl: string, token: string | undefined): string {
   return url.toString()
 }
 
-async function createSandbox(
+/**
+ * Turn a failure from the SDK into the code the caller branches on.
+ *
+ * A 429 is the one worth telling apart: the account is at its concurrent
+ * session cap, which is a "try again in a minute", not a "this is broken".
+ * An error that already carries a code is passed through untouched.
+ */
+function relayStartError(cause: unknown): HandraiseError {
+  if (isHandraiseError(cause)) return cause
+  if (cause instanceof ConcurrencyLimitError) {
+    return new HandraiseError(
+      "concurrency_limit",
+      `handraise: your Solari account is at its concurrent session limit, so the relay sandbox that gives the handoff its public URL could not be created. Free a session and retry. (${cause.message})`,
+      { cause },
+    )
+  }
+  return new HandraiseError(
+    "relay_start_failed",
+    `handraise: the relay sandbox could not be started, so the handoff has no public URL and nobody has been asked for anything yet. ${String(cause)}`,
+    { cause },
+  )
+}
+
+/**
+ * Create the relay's sandbox, waiting out a busy account.
+ *
+ * `attempts` is a parameter so `deploy.test.ts` can reach the mapping in one
+ * request instead of sitting through the backoff; `startRelay` always uses the
+ * shipped budget.
+ */
+export async function createSandbox(
   client: SolariClient,
   timeoutMs: number,
+  attempts: number = CREATE_ATTEMPTS,
 ): Promise<Sandbox> {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -122,10 +154,41 @@ async function createSandbox(
       })
     } catch (error) {
       const collided = error instanceof ConcurrencyLimitError
-      if (!collided || attempt >= CREATE_ATTEMPTS) throw error
+      if (!collided || attempt >= attempts) throw relayStartError(error)
       await sleep(Math.min(1000 * 2 ** (attempt - 1), 8000))
     }
   }
+}
+
+/**
+ * Destroy the sandbox, retrying a transient failure.
+ *
+ * A swallowed failure would leave the public relay URL — and its last frame —
+ * reachable until the idle timeout, so the last one is surfaced with a code.
+ * `attempts` is a parameter for the same reason as in `createSandbox`.
+ */
+export async function killSandbox(
+  sandbox: Pick<Sandbox, "kill">,
+  attempts: number = KILL_ATTEMPTS,
+): Promise<void> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await sandbox.kill()
+      return
+    } catch (error) {
+      // A 404 means the sandbox is already gone — the goal, not a failure.
+      if (error instanceof GatewayError && error.status === 404) return
+      lastError = error
+      if (attempt < attempts)
+        await sleep(Math.min(500 * 2 ** (attempt - 1), 4000))
+    }
+  }
+  throw new HandraiseError(
+    "relay_kill_failed",
+    `handraise: could not destroy the relay sandbox after ${attempts} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
+    { cause: lastError },
+  )
 }
 
 /**
@@ -133,19 +196,29 @@ async function createSandbox(
  * work is the path the phone will take, including the preview proxy and the
  * token.
  */
-async function waitForHealth(healthUrl: string): Promise<void> {
-  const deadline = Date.now() + READY_TIMEOUT_MS
+export async function waitForHealth(
+  healthUrl: string,
+  timeoutMs: number = READY_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  // A deadline has no single cause, so what the URL last said is carried in
+  // the message: "connection refused" and "502 from the preview proxy" are
+  // different problems with the same code.
+  let lastAnswer = "nothing was tried"
   for (;;) {
     try {
       const response = await fetch(healthUrl, { cache: "no-store" })
       const body = await response.text()
       if (response.ok && body === "ok") return
-    } catch {
+      lastAnswer = `HTTP ${response.status} ${body.slice(0, 80)}`
+    } catch (error) {
       // The port is not routable yet; the retry below is the whole mechanism.
+      lastAnswer = String(error)
     }
     if (Date.now() >= deadline) {
-      throw new Error(
-        `handraise relay did not become healthy within ${READY_TIMEOUT_MS}ms`,
+      throw new HandraiseError(
+        "relay_not_ready",
+        `handraise: the relay sandbox started but its public URL did not answer within ${timeoutMs}ms, so the handoff page would not have loaded on the phone. Last answer: ${lastAnswer}`,
       )
     }
     await sleep(READY_POLL_MS)
@@ -194,28 +267,10 @@ export async function startRelay(
   let killed = false
   const kill = async (): Promise<void> => {
     if (killed) return
-    let lastError: unknown
-    for (let attempt = 1; attempt <= KILL_ATTEMPTS; attempt++) {
-      try {
-        await sandbox.kill()
-        killed = true
-        return
-      } catch (error) {
-        // A 404 means the sandbox is already gone — the goal, not a failure.
-        if (error instanceof GatewayError && error.status === 404) {
-          killed = true
-          return
-        }
-        lastError = error
-        if (attempt < KILL_ATTEMPTS) {
-          await sleep(Math.min(500 * 2 ** (attempt - 1), 4000))
-        }
-      }
-    }
-    // Surface it: the caller must not believe the relay is gone when it is not.
-    throw new Error(
-      `handraise: could not destroy the relay sandbox after ${KILL_ATTEMPTS} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
-    )
+    // Throws `relay_kill_failed` if it cannot: the caller must not believe the
+    // relay is gone when it is not.
+    await killSandbox(sandbox)
+    killed = true
   }
 
   try {
@@ -249,6 +304,9 @@ export async function startRelay(
     await kill().catch((killError) => {
       logger.error("relay_release_failed", { error: String(killError) })
     })
-    throw error
+    // Everything from `connect()` to the health poll is "the relay did not come
+    // up"; `relayStartError` keeps the more specific codes (a 429, a public URL
+    // that never answered) as they are.
+    throw relayStartError(error)
   }
 }

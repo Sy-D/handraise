@@ -1,5 +1,6 @@
 import type { Page } from "playwright-core"
 import { raiseHand } from "./core/raise-hand"
+import { HandraiseError } from "./errors"
 import type {
   HandoffMode,
   HandoffOptions,
@@ -105,7 +106,8 @@ function optionsFor(
 ): RaiseHandOptions {
   if (input.mode !== "approval") return { ...defaults, reason: input.reason }
   if (!input.action?.trim()) {
-    throw new Error(
+    throw new HandraiseError(
+      "empty_action",
       'needHuman: mode "approval" needs an `action` — the concrete step the human says yes or no to. Call it again with one, or use the default takeover mode if you are stuck rather than blocked.',
     )
   }

@@ -39,6 +39,12 @@ test("an approval without an action is refused, and says what is missing", async
 
   // Silently downgrading to a takeover would put a blank question on a phone
   // and hand the browser over instead of asking about a step.
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "empty_action",
+  })
+  // The one place a message *is* load-bearing: this text goes back to the
+  // model as the tool's error, and it has to say what to send instead.
   await expect(asking).rejects.toThrow(/needHuman: mode "approval" needs an/)
 })
 
@@ -59,5 +65,8 @@ test("an approval whose action is only whitespace is refused too", async () => {
 
   // A blank line on a phone is not a decision, and " " passes a truthiness
   // check — which is exactly how this one gets shipped.
-  await expect(asking).rejects.toThrow(/needHuman: mode "approval" needs an/)
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "empty_action",
+  })
 })
