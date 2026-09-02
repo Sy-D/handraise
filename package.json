@@ -1,7 +1,7 @@
 {
   "name": "handraise",
   "version": "0.5.1",
-  "description": "Human-in-the-loop handoff for Solari cloud browsers. Your agent already knows when it's stuck — handraise lets it raise its hand.",
+  "description": "Human-in-the-loop handoff for Solari cloud browsers. Your agent already knows when it's stuck \u2014 handraise lets it raise its hand.",
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -71,5 +71,8 @@
   },
   "bin": {
     "handraise": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

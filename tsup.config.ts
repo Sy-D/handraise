@@ -15,7 +15,7 @@ export default defineConfig({
   // second copy of the whole library into the tarball.
   external: ["./index.js"],
   clean: true,
-  target: "node18",
+  target: "node20",
   // The `#!/usr/bin/env node` line lives at the top of src/cli.ts; esbuild
   // hoists it to the top of the output. A tsup `banner` would apply to every
   // entry, putting a shebang on dist/index.js too.

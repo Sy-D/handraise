@@ -55,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Node 20 or newer is now declared** (`engines.node >= 20`, build target
+  `node20`). It always was the floor: `@solarisdk/browser` and the patchright
+  runtime it wraps require Node 20, so a Node 18 install never worked; the
+  package just did not say so.
 - **A page that is already dead is now refused instead of handed off.**
   `raiseHand` used to create a relay, fail on the first CDP call and *return*
   `{ outcome: "disconnected" }`. It now throws a `HandraiseError`
