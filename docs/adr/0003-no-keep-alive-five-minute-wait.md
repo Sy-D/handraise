@@ -14,10 +14,12 @@ On the test plan, browser sessions die hard **~10 minutes after creation** — f
 of six runs landed in a 604–617 s band, one died early at 319 s. The mode of
 activity made no difference: an idle session (zero bytes), a session pinged every
 25 s, and a session streaming a CDP screencast at ~14 fps all died within ~10 s of
-each other, and the idle one actually outlived the busy ones. `expiresAt` promised
-5 hours in every run and was never honored. Worse, the control plane lies:
-`GET /sessions/:id` kept returning `{"status":"active"}` for sessions that were
-already dead.
+each other, and the idle one actually outlived the busy ones. `expiresAt` sat at
+`createdAt + 5 h` — the documented plan ceiling — in every run; no session got
+close. Worse, at measurement time (2026-09-01) `GET /sessions/:id` kept returning
+`{"status":"active"}` for sessions that were already dead, where the documented
+terminal value is `released`. (Solari's changelog of Sep 1–2 reports a status
+fix; see the re-measurement note in Measurement 04.)
 
 ## Decision
 

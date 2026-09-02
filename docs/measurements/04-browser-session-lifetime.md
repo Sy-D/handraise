@@ -11,8 +11,9 @@ why `disconnected` is an outcome instead of an exception, and why
 **Short answer: no, and no-op keep-alive calls make no difference.**
 Browser sessions on this plan die ~10 minutes after creation whether they are
 completely idle, pinged every 25 s, or streaming a CDP screencast at ~14 fps.
-One session died after 5.3 minutes. `expiresAt` promises 5 hours; that promise
-was not kept in any of 6 runs.
+One session died after 5.3 minutes. `expiresAt` sat at `createdAt + 5 h` in
+every run — the documented plan ceiling, not an idle window — and no session
+got within 1/30th of it. Nothing in the docs explains the gap.
 
 The `timeoutMs` rolling idle window from the docs does **not** exist for browser
 sessions. It belongs to sandboxes/desktops, where it works exactly as
