@@ -5,6 +5,58 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.5.0
+
+Channels. 0.4.0 made an approval small enough to fit in a chat message — one
+screenshot, one sentence, two answers — and then left it in a browser tab.
+A channel is where that message goes, and in approval mode the answer can come
+back from there instead of from the phone.
+
+Everything here is additive. No existing call, type or outcome changes.
+
+### Added
+
+- **`channels?: HandoffChannel[]`** on `raiseHand`. Each channel's `notify` is
+  called once, as soon as there is something to send: the link in takeover
+  mode, the link and the screenshot in approval mode. It is never awaited, and
+  a throw or a rejection is one `channel_failed` warning — a chat API that is
+  down costs you a notification, not a browser session.
+- **`ChannelHandoff`, the view an adapter gets.** A discriminated union on
+  `mode`, like `RaiseHandOptions`: a takeover carries `handoffId`, `url`,
+  `reason` and `mode`; an approval adds the `action`, the `screenshot` as the
+  decoded JPEG the phone is looking at (the same bytes, not a second shot of a
+  page that has moved on), and `answer()`.
+- **`answer("approve" | "deny")` settles the handoff in-process**, through the
+  same path a relay `approve` takes. The first answer wins whoever gives it —
+  phone or channel — and the loser is told: `answer()` returns `false` when the
+  handoff was already settled, because an approval sent to two places at once
+  is *meant* to be answerable twice and losing that race is ordinary, not an
+  error. The relay still gets its `ended` message, so a phone that is open
+  shows the ending; nothing else about a settled handoff changes.
+- **`HandoffEvent.answeredVia`**, `"relay"` or `"channel"`, present on the
+  `approved` and `denied` outcomes only. Optional and additive.
+- **`docs/adr/0007`** on why a channel is an in-process hook rather than a
+  second human WebSocket client — the relay accepts one human peer and replaces
+  it, so an adapter that connected would throw the phone off the handoff.
+- **`handraise-telegram`**, the first adapter, written against this release in
+  its own package: the screenshot with Approve/Deny buttons in a Telegram chat,
+  answered by long polling, no public callback endpoint to host. It is not on
+  npm at the time of writing; this release is what it needs in order to be.
+
+- **`ChannelHandoff.settled`**, a promise that resolves with the outcome the
+  moment the handoff ends — an answer from the phone, an answer from a channel,
+  the timeout, a dead session, a handback. It never rejects, it stays resolved,
+  and it is the same promise for every channel of one handoff. It carries the
+  outcome the *caller* gets: a handback that turns into `disconnected` because
+  the session died during the cookie capture reaches channels as
+  `disconnected`, not `resolved`.
+
+  This is the signal that lets an adapter stop. Without it one that waits for a
+  reply can only stop on its own clock: measured on `handraise-telegram`, a
+  handoff answered on the phone 500 ms in left the adapter polling and the Node
+  process alive for another 20 s with a 20 s budget — five minutes fifty at its
+  default, holding the bot's single update slot the whole time.
+
 ## [0.4.0] - 2026-09-02
 
 Approval mode. A capability gap ("I can't do this": 2FA, a captcha) and an

@@ -16,6 +16,12 @@
  *   once.
  */
 import type { CDPSession, Page } from "playwright-core"
+import type {
+  ApprovalChannelHandoff,
+  ChannelHandoff,
+  HandoffChannel,
+  TakeoverChannelHandoff,
+} from "../channels"
 import type { HandoffEvent } from "../events"
 import { type Logger, quietLogger } from "../logger"
 import { printHandoffQr } from "../qr"
@@ -141,6 +147,8 @@ export interface HandoffRun {
   agentWsUrl: string
   options: RaiseHandOptions
   timeoutMs: number
+  /** The public handoff page, as handed to `onUrl` and to every channel. */
+  url: string
   /** Correlation key; the relay's preview subdomain. */
   handoffId: string
   /** Measured by `startRelay()` and mirrored into the event. */
@@ -186,6 +194,79 @@ function emitHandoffEvent(
 }
 
 /**
+ * The view a channel gets of a takeover: the link, and that is all. There is
+ * nothing to answer and no one moment worth sending — the human has to drive
+ * the browser, which only the handoff page can do.
+ */
+function takeoverChannelHandoff(
+  run: HandoffRun,
+  settled: Promise<HandoffOutcome>,
+): TakeoverChannelHandoff {
+  return {
+    mode: "takeover",
+    handoffId: run.handoffId,
+    url: run.url,
+    reason: run.options.reason,
+    settled,
+  }
+}
+
+/**
+ * The view a channel gets of an approval.
+ *
+ * `action` and `shot` are parameters rather than fields read off `run`,
+ * because only the caller has narrowed the options union far enough to know
+ * they exist. Two builders rather than one with a fallback: an approval
+ * announced as a takeover would not be a degraded message but the wrong one —
+ * a bearer link and "drive the browser", in place of a yes or no.
+ */
+function approvalChannelHandoff(
+  run: HandoffRun,
+  action: string,
+  shot: ApprovalFrame,
+  answer: (decision: "approve" | "deny") => boolean,
+  settled: Promise<HandoffOutcome>,
+): ApprovalChannelHandoff {
+  return {
+    mode: "approval",
+    handoffId: run.handoffId,
+    url: run.url,
+    reason: run.options.reason,
+    settled,
+    action,
+    // The same JPEG the phone is looking at. It is held base64 because that is
+    // what goes on the wire; this is that exact payload decoded back, not a
+    // second screenshot of a page that may have moved on since.
+    screenshot: Buffer.from(shot.data, "base64"),
+    answer,
+  }
+}
+
+/**
+ * Announce the handoff to every channel, once each.
+ *
+ * Fire-and-forget on purpose: a channel is a side channel. It must not delay
+ * the handoff (the human may already be scanning the QR code) and it must not
+ * be able to end it, so a synchronous throw and a rejected promise are the
+ * same thing here — one warning, and the handoff carries on.
+ */
+function notifyChannels(
+  channels: readonly HandoffChannel[],
+  handoff: ChannelHandoff,
+  logger: Logger,
+): void {
+  for (const channel of channels) {
+    try {
+      void Promise.resolve(channel.notify(handoff)).catch((error) => {
+        logger.warn("channel_failed", { error: String(error) })
+      })
+    } catch (error) {
+      logger.warn("channel_failed", { error: String(error) })
+    }
+  }
+}
+
+/**
  * Run one handoff to its end. Never throws, never leaves a timer, a listener
  * or a CDP session behind. Emits the wide event exactly once before it settles.
  *
@@ -215,6 +296,15 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     }
   })
 
+  // What every channel of this handoff awaits. Resolved once, with the outcome
+  // the caller is given — after the handback check, so a channel is never told
+  // "resolved" for a session that turned out to be dead. It never rejects, so
+  // an adapter can await it without a guard.
+  let announceSettled: (outcome: HandoffOutcome) => void = () => undefined
+  const settled = new Promise<HandoffOutcome>((resolve) => {
+    announceSettled = resolve
+  })
+
   const browser = page.context().browser()
   const onGone = (): void => settle("disconnected")
   browser?.once("disconnected", onGone)
@@ -230,6 +320,27 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   let link: RelayConnection | null = null
 
   let terminal = false
+
+  // Who ended it, when it was ended by an answer. Only meaningful for
+  // `approved` and `denied`; the event carries it on those outcomes only.
+  let answeredVia: "relay" | "channel" | undefined
+
+  /**
+   * The single settle path for a human answer, from the phone or from a
+   * channel. First answer wins: `over` is set by the first `settle`, so a
+   * second answer — the phone tapping Deny while a Telegram button was already
+   * pressed — changes nothing and is told so.
+   */
+  const answerHandoff = (
+    outcome: HandoffOutcome,
+    via: "relay" | "channel",
+  ): boolean => {
+    if (over) return false
+    terminal = true
+    answeredVia = via
+    settle(outcome)
+    return true
+  }
 
   // The phone cannot see a caret in a 60-quality JPEG, so the agent tells it
   // where the typing lands. Strictly off the critical path: a probe is never
@@ -263,8 +374,7 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   const onHuman = (message: HumanToAgent): void => {
     const ending = endingFor(mode, message.type)
     if (ending) {
-      terminal = true
-      settle(ending)
+      answerHandoff(ending, "relay")
       return
     }
     // Once a terminal message has arrived the page is being handed back or
@@ -319,6 +429,26 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   })
   link = connection
 
+  const answerFromChannel = (decision: "approve" | "deny"): boolean =>
+    answerHandoff(decision === "approve" ? "approved" : "denied", "channel")
+
+  /**
+   * Tell the channels. Once per handoff, per channel, at the first moment
+   * there is something worth sending: the link in takeover mode, the link and
+   * the screenshot in approval mode.
+   *
+   * Not once the handoff is over. Taking the screenshot is a round trip to the
+   * browser, and the page can close or the wait can run out while it is in
+   * flight — `sendApprovalFrame` guards exactly that window, and a channel
+   * announced anyway would leave live buttons under a request that no longer
+   * exists.
+   */
+  const announce = (handoff: ChannelHandoff): void => {
+    const channels = options.channels ?? []
+    if (over || channels.length === 0) return
+    notifyChannels(channels, handoff, logger)
+  }
+
   try {
     if (mode === "approval") {
       // One screenshot and nothing else: no CDP session, no screencast, no
@@ -326,7 +456,24 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
       // left it, and it is still that page afterwards.
       approvalFrame = await captureApprovalFrame(page)
       await sendApprovalFrame()
+      // `options.mode`, not the `mode` local: this is the check that narrows
+      // the union, and it is what makes `options.action` readable here.
+      if (options.mode === "approval") {
+        announce(
+          approvalChannelHandoff(
+            run,
+            options.action,
+            approvalFrame,
+            answerFromChannel,
+            settled,
+          ),
+        )
+      }
     } else {
+      // The relay is up — `raiseHand` awaited it — so the link in the message
+      // is already open. Sent before the cast starts, because the cast is not
+      // what the human needs in order to be told.
+      announce(takeoverChannelHandoff(run, settled))
       cdp = await page.context().newCDPSession(page)
       input = createInputTarget(cdp)
       pump = await startTakeoverCast(cdp, connection, (data) => {
@@ -384,6 +531,11 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     }
   }
 
+  // The earliest point at which the outcome is the one the caller will see.
+  // Before teardown on purpose: a channel that stops polling here releases the
+  // chat and the process while the relay is still being shut down.
+  announceSettled(finalOutcome)
+
   clearTimeout(timer)
   browser?.off("disconnected", onGone)
   page.off("close", onGone)
@@ -412,6 +564,14 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     storageStateCaptured: storageState !== undefined,
   }
   if (firstFrameMs !== undefined) event.firstFrameMs = firstFrameMs
+  // Only an answer has a source. A timeout, a dead session or a handback is
+  // not "answered via" anything, so the field stays absent there.
+  if (
+    answeredVia !== undefined &&
+    (finalOutcome === "approved" || finalOutcome === "denied")
+  ) {
+    event.answeredVia = answeredVia
+  }
   if (options.baseUrl !== undefined) event.baseUrl = options.baseUrl
   if (firstError !== undefined) event.error = firstError
   emitHandoffEvent(options, logger, event)
@@ -523,6 +683,7 @@ export async function raiseHand(
       agentWsUrl: relay.agentWsUrl,
       options,
       timeoutMs,
+      url: relay.humanUrl,
       handoffId: handoffId(relay.humanUrl),
       relayColdStartMs: relay.coldStartMs,
       logger,

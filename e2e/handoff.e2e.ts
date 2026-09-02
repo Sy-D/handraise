@@ -368,6 +368,87 @@ try {
   await askApproval("approve")
   await askApproval("deny")
 
+  // --- An approval answered by a channel, not by the phone ---------------
+  //
+  // The path a Telegram or Slack adapter takes: handraise hands the channel
+  // the screenshot and an `answer()`, and nobody opens the link at all. The
+  // in-process channel here stands in for the adapter; what is under test is
+  // the core's side of it against the real relay.
+  const channelAt = Date.now()
+  let channelUrl = ""
+  let channelEvent: HandoffEvent | undefined
+  let channelShot = 0
+  const channelAnswered = raiseHand(page, {
+    mode: "approval",
+    reason: "The agent may not move money without a human",
+    action: APPROVAL_ACTION,
+    qr: false,
+    timeoutMs: 60_000,
+    onUrl: (url) => {
+      channelUrl = url
+    },
+    onEvent: (raised) => {
+      channelEvent = raised
+    },
+    channels: [
+      {
+        notify: (raised) => {
+          if (raised.mode !== "approval") return
+          channelShot = raised.screenshot.length
+          check(
+            raised.action === APPROVAL_ACTION,
+            "the channel is handed the action verbatim",
+          )
+          check(
+            raised.url === channelUrl && channelUrl !== "",
+            "the channel is handed the same link the phone would open",
+          )
+          check(
+            raised.answer("approve") === true,
+            "the channel's first answer settles the handoff",
+          )
+          check(
+            raised.answer("deny") === false,
+            "a second answer from the channel is refused",
+          )
+        },
+      },
+    ],
+  })
+  pending = channelAnswered
+  const channelResult = await channelAnswered
+  pending = null
+  timings.channelApprovalMs = Date.now() - channelAt
+  log("channel_approval_done", {
+    outcome: channelResult.outcome,
+    answeredVia: channelEvent?.answeredVia,
+    screenshotBytes: channelShot,
+    ms: timings.channelApprovalMs,
+  })
+
+  check(
+    channelResult.outcome === "approved",
+    "an approval answered by a channel reports approved",
+  )
+  check(
+    channelEvent?.answeredVia === "channel",
+    `the wide event says who answered (${channelEvent?.answeredVia})`,
+  )
+  check(
+    channelShot > 1000,
+    `the channel got the real JPEG, not an empty buffer (${channelShot} bytes)`,
+  )
+  check(
+    channelResult.storageState === undefined,
+    "a channel-answered approval captures no cookies either",
+  )
+  const channelGone = await fetch(channelUrl, { cache: "no-store" })
+  await channelGone.text()
+  check(
+    channelGone.status !== 200,
+    `the channel-answered relay is gone (${channelGone.status})`,
+  )
+
   // --- The cheap second case: nobody comes -------------------------------
   const timeoutAt = Date.now()
   let secondUrl = ""

@@ -18,8 +18,13 @@ import { fileURLToPath } from "node:url"
 import type { Browser, BrowserContext, CDPSession, Page } from "playwright-core"
 import WebSocket, { WebSocketServer } from "ws"
 
+import type {
+  ChannelHandoff,
+  HandoffChannel,
+  TakeoverChannelHandoff,
+} from "../channels"
 import type { HandoffEvent } from "../events"
-import { noopLogger } from "../logger"
+import { type Logger, noopLogger } from "../logger"
 import type { RelayMessage } from "../relay/protocol"
 import type { HandoffMode, RaiseHandOptions, StorageState } from "../types"
 import { raiseHand, runHandoff } from "./raise-hand"
@@ -162,17 +167,44 @@ const VIEWPORT = { width: 1280, height: 800 }
 /** CDP sessions opened on the fake page since the last reset. */
 let cdpSessions = 0
 
-/** A page whose context yields the fake CDP session and a live fake browser. */
-function fakePage(cdp: CDPSession): Page {
+/** Kills the browser session behind the newest `fakePage()`. */
+let killSession: () => void = () => undefined
+
+/**
+ * A page whose context yields the fake CDP session and a live fake browser.
+ *
+ * `screenshotDelayMs` holds the approval's one screenshot in flight, which is
+ * the window in which a handoff can settle before the frame ever lands.
+ */
+function fakePage(
+  cdp: CDPSession,
+  screenshotDelayMs = 0,
+  storageStateDelayMs = 0,
+): Page {
   cdpSessions = 0
   let browser: Browser
+  let connected = true
+  const gone = new Set<() => void>()
+  // Solari sessions die on their own about ten minutes in; `killSession()` is
+  // how a test reproduces that, so the disconnected path is driven rather than
+  // assumed.
+  killSession = () => {
+    connected = false
+    for (const listener of gone) listener()
+  }
   const browserPartial: Partial<Browser> = {
-    // SAFETY: registration the test never fires; the returned emitter is only
+    // SAFETY: only the "disconnected" listener is kept; the returned emitter is
     // for chaining and is never used, so pointing it back at the fake is safe.
-    once: (() => browser) as Browser["once"],
+    once: ((event: string, listener: () => void) => {
+      if (event === "disconnected") gone.add(listener)
+      return browser
+    }) as Browser["once"],
     // SAFETY: as `once`, above — an unused chaining emitter.
-    off: (() => browser) as Browser["off"],
-    isConnected: () => true,
+    off: ((_event: string, listener: () => void) => {
+      gone.delete(listener)
+      return browser
+    }) as Browser["off"],
+    isConnected: () => connected,
   }
   // SAFETY: runHandoff drives only once/off/isConnected on the browser.
   browser = browserPartial as Browser
@@ -182,7 +214,10 @@ function fakePage(cdp: CDPSession): Page {
       cdpSessions += 1
       return cdp
     },
-    storageState: async () => STORAGE,
+    storageState: async () => {
+      if (storageStateDelayMs > 0) await Bun.sleep(storageStateDelayMs)
+      return STORAGE
+    },
   }
   // SAFETY: runHandoff drives only browser/newCDPSession/storageState here.
   const context = contextPartial as BrowserContext
@@ -191,7 +226,10 @@ function fakePage(cdp: CDPSession): Page {
     context: () => context,
     // SAFETY: approval mode calls screenshot() for its one frame and reads the
     // viewport for that frame's metadata; neither result is used as anything else.
-    screenshot: (async () => SAMPLE_JPEG) as Page["screenshot"],
+    screenshot: (async () => {
+      if (screenshotDelayMs > 0) await Bun.sleep(screenshotDelayMs)
+      return SAMPLE_JPEG
+    }) as Page["screenshot"],
     viewportSize: () => VIEWPORT,
     // SAFETY: as the browser's, above — an unused chaining emitter.
     once: (() => page) as Page["once"],
@@ -219,6 +257,7 @@ test("a full handoff emits exactly one wide event with plausible fields", async 
       onEvent: (event) => events.push(event),
     },
     timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
     handoffId: "test-handoff",
     relayColdStartMs: 123,
     logger: noopLogger,
@@ -285,6 +324,7 @@ test("a throwing onEvent callback does not break the handoff", async () => {
       },
     },
     timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
     handoffId: "throwing",
     relayColdStartMs: 5,
     logger: noopLogger,
@@ -315,6 +355,7 @@ test("an approval handoff sends one screenshot and settles on approve", async ()
       onEvent: (event) => events.push(event),
     },
     timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
     handoffId: "approval-handoff",
     relayColdStartMs: 42,
     logger: noopLogger,
@@ -376,6 +417,7 @@ test("an approval handoff ignores takeover messages that reach it anyway", async
     },
     timeoutMs: 1500,
     logger: noopLogger,
+    url: "https://relay.example/?pt_token=x",
     handoffId: "approval-mismatch",
     relayColdStartMs: 7,
   })
@@ -408,6 +450,7 @@ test("a denied approval reports denied", async () => {
       logger: noopLogger,
     },
     timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
     handoffId: "approval-denied",
     relayColdStartMs: 9,
     logger: noopLogger,
@@ -493,6 +536,7 @@ test("the approval screenshot is not re-published once the handoff is over", asy
     // Long enough for a reconnect or two while the "human" decides, short
     // enough that the ending falls into one of them.
     timeoutMs: 1200,
+    url: "https://relay.example/?pt_token=x",
     handoffId: "approval-reconnect",
     relayColdStartMs: 3,
     logger: noopLogger,
@@ -552,4 +596,787 @@ test("an unknown mode is refused before anything is created", async () => {
 
   const asking = raiseHand(fakePage(fakeCdp().cdp), options)
   await expect(asking).rejects.toThrow(/unknown mode/)
+})
+
+// --- Channels ------------------------------------------------------------
+//
+// A channel is an in-process object handraise notifies when the handoff URL
+// exists. In approval mode it also gets the screenshot and can answer without
+// the phone, through the same settle path a relay `approve` takes.
+
+interface ChannelRecorder {
+  channel: HandoffChannel
+  /** Every handoff this channel was notified about, in order. */
+  seen: ChannelHandoff[]
+}
+
+/** A channel that records what it was handed, and never answers by itself. */
+function recordingChannel(): ChannelRecorder {
+  const seen: ChannelHandoff[] = []
+  return {
+    channel: {
+      notify: (handoff) => {
+        seen.push(handoff)
+      },
+    },
+    seen,
+  }
+}
+
+interface LoggerRecorder {
+  logger: Logger
+  /** The event names passed to `warn`, in order. */
+  warnings: string[]
+}
+
+/** A logger that keeps its warnings, so a swallowed failure is still provable. */
+function recordingLogger(): LoggerRecorder {
+  const warnings: string[] = []
+  return {
+    logger: {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (event) => {
+        warnings.push(event)
+      },
+      error: () => undefined,
+    },
+    warnings,
+  }
+}
+
+test("a channel that approves settles the handoff and the phone is told", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+      channels: [
+        {
+          notify: (raised) => {
+            if (raised.mode === "approval") raised.answer("approve")
+          },
+        },
+      ],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "channel-approve",
+    relayColdStartMs: 11,
+    logger: noopLogger,
+  })
+
+  const end = await handoff
+  expect(end.outcome).toBe("approved")
+
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.outcome).toBe("approved")
+  expect(event.answeredVia).toBe("channel")
+
+  // The phone was never asked, and still sees the handoff end: the relay gets
+  // the same `ended` message an answer from the phone would have produced.
+  await until("the phone to be told how it ended", () =>
+    human.inbox.some(
+      (message) => message.type === "ended" && message.outcome === "approved",
+    ),
+  )
+})
+
+test("the first answer wins: the phone denies, a later channel approve is refused", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not delete production data",
+      action: "Delete s3://prod-invoices",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "relay-wins",
+    relayColdStartMs: 12,
+    logger: noopLogger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  human.send({ type: "deny" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("denied")
+  expect(events[0]?.answeredVia).toBe("relay")
+
+  // The channel was notified, and its answer arrives too late.
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+  expect(raised.answer("approve")).toBe(false)
+})
+
+test("the first answer wins the other way round: the channel denies first", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not delete production data",
+      action: "Delete s3://prod-invoices",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "channel-wins",
+    relayColdStartMs: 13,
+    logger: noopLogger,
+  })
+
+  await until("the channel to be notified", () => recorder.seen.length === 1)
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+
+  // The channel answers first, then the phone tries to overturn it.
+  expect(raised.answer("deny")).toBe(true)
+  human.send({ type: "approve" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("denied")
+  expect(events[0]?.answeredVia).toBe("channel")
+  // And a second answer from the channel itself is refused just the same.
+  expect(raised.answer("deny")).toBe(false)
+})
+
+test("a channel that throws is logged and does not touch the handoff", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingLogger()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: recorder.logger,
+      channels: [
+        {
+          notify: () => {
+            throw new Error("the chat API is down")
+          },
+        },
+        // A rejected promise is the same failure one tick later, and the
+        // channel behind the broken one still has to be notified.
+        { notify: () => Promise.reject(new Error("and so is the other one")) },
+      ],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "channel-throws",
+    relayColdStartMs: 14,
+    logger: recorder.logger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  human.send({ type: "approve" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("approved")
+  expect(
+    recorder.warnings.filter((event) => event === "channel_failed"),
+  ).toHaveLength(2)
+})
+
+test("a takeover channel gets the link and nothing to answer with", async () => {
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "Aurora Bank is asking for a 2FA code",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://takeover.example/?pt_token=secret",
+    handoffId: "takeover-channel",
+    relayColdStartMs: 15,
+    logger: noopLogger,
+  })
+
+  await until("the channel to be notified", () => recorder.seen.length === 1)
+  const raised = recorder.seen[0]
+  if (!raised) throw new Error("the channel was not notified")
+  expect(raised.mode).toBe("takeover")
+  expect(raised.url).toBe("https://takeover.example/?pt_token=secret")
+  expect(raised.reason).toBe("Aurora Bank is asking for a 2FA code")
+  expect(raised.handoffId).toBe("takeover-channel")
+  // There is no moment to show and no question to answer in a takeover, so
+  // neither field exists — the union says so, and the value agrees.
+  expect("screenshot" in raised).toBe(false)
+  expect("answer" in raised).toBe(false)
+
+  human.send({ type: "handback" })
+  expect((await handoff).outcome).toBe("resolved")
+})
+
+test("an approval channel gets the same JPEG bytes the phone gets", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "channel-bytes",
+    relayColdStartMs: 16,
+    logger: noopLogger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  const frame = human.inbox.find((message) => message.type === "frame")
+  if (frame?.type !== "frame") throw new Error("no frame reached the phone")
+
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+  expect(raised.action).toBe("Submit $12,430 vendor payment to Acme GmbH")
+  // Byte for byte the picture the human on the phone is looking at, so the two
+  // cannot be shown different things and asked the same question.
+  expect(raised.screenshot).toEqual(Buffer.from(frame.data, "base64"))
+  expect(raised.screenshot).toEqual(SAMPLE_JPEG)
+
+  human.send({ type: "deny" })
+  expect((await handoff).outcome).toBe("denied")
+})
+
+test("a handoff that ends before the screenshot lands is never announced", async () => {
+  // The window between "take the screenshot" and "send it": a round trip to
+  // the browser, during which the page can close or the wait can run out.
+  // `sendApprovalFrame` already refuses to put a frame on the wire after that;
+  // a channel that posted anyway would leave live buttons under a request that
+  // no longer exists, and the first press would be told "already decided".
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 250),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    // Runs out while the screenshot above is still being taken.
+    timeoutMs: 1,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-before-announce",
+    relayColdStartMs: 17,
+    logger: noopLogger,
+  })
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  expect(recorder.seen).toEqual([])
+})
+
+test("a takeover handback carries no answeredVia", async () => {
+  // A handback and a give-up go through the same `answerHandoff` as an
+  // approval answer, so `answeredVia` is set on them too. The wide event only
+  // carries it where it means something: "who said yes or no". This is the
+  // guard that keeps it off every takeover event.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "Aurora Bank is asking for a 2FA code",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "takeover-answered-via",
+    relayColdStartMs: 18,
+    logger: noopLogger,
+  })
+
+  await until("the phone to connect", () => human.inbox.length >= 0)
+  human.send({ type: "handback" })
+  expect((await handoff).outcome).toBe("resolved")
+
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.answeredVia).toBeUndefined()
+  expect(JSON.stringify(event)).not.toContain("answeredVia")
+})
+
+// --- The boundaries the ADR claims, as failing-first tests ---------------
+
+test("an answer that arrives after a timeout is refused and emits nothing", async () => {
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+      channels: [recorder.channel],
+    },
+    timeoutMs: 400,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "late-after-timeout",
+    relayColdStartMs: 19,
+    logger: noopLogger,
+  })
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  expect(events).toHaveLength(1)
+
+  // A channel that was notified before the wait ran out still holds a live
+  // `answer`. It has to be inert: the caller has already been told `timeout`
+  // and has moved on.
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+  expect(raised.answer("approve")).toBe(false)
+  await Bun.sleep(50)
+  expect(events).toHaveLength(1)
+  expect(events[0]?.outcome).toBe("timeout")
+  expect(events[0]?.answeredVia).toBeUndefined()
+})
+
+test("an answer that arrives after the session died is refused and emits nothing", async () => {
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "late-after-disconnect",
+    relayColdStartMs: 20,
+    logger: noopLogger,
+  })
+
+  await until("the channel to be notified", () => recorder.seen.length === 1)
+  killSession()
+
+  const end = await handoff
+  expect(end.outcome).toBe("disconnected")
+  expect(events).toHaveLength(1)
+
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+  expect(raised.answer("deny")).toBe(false)
+  await Bun.sleep(50)
+  expect(events).toHaveLength(1)
+  expect(events[0]?.outcome).toBe("disconnected")
+})
+
+test("a session that dies during the screenshot notifies no channel", async () => {
+  // The timeout half of this window is covered above; this is the other way
+  // it closes, and the one that actually happened in the field — a Solari
+  // session hitting its hard lifetime mid-capture.
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 250),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "died-mid-screenshot",
+    relayColdStartMs: 21,
+    logger: noopLogger,
+  })
+
+  // While `page.screenshot()` is still in flight.
+  await Bun.sleep(40)
+  killSession()
+
+  expect((await handoff).outcome).toBe("disconnected")
+  expect(recorder.seen).toEqual([])
+})
+
+test("a channel that mutates its screenshot cannot change what the phone got", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "buffer-isolation",
+    relayColdStartMs: 22,
+    logger: noopLogger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+
+  // A channel gets a Buffer, and a Buffer is writable. An adapter that
+  // compresses or watermarks in place must not be able to change the picture
+  // the human on the phone is deciding on.
+  raised.screenshot.fill(0)
+
+  const frame = human.inbox.find((message) => message.type === "frame")
+  if (frame?.type !== "frame") throw new Error("no frame reached the phone")
+  expect(Buffer.from(frame.data, "base64")).toEqual(SAMPLE_JPEG)
+
+  human.send({ type: "approve" })
+  expect((await handoff).outcome).toBe("approved")
+})
+
+test("a channel whose notify never settles does not hold up the handoff", async () => {
+  // `notify` is not awaited, and this is what that sentence has to mean: a
+  // chat API that accepts the request and never answers costs the handoff
+  // nothing. A regression that awaited it would hang here until the test
+  // timeout rather than fail an assertion, which is the loudest failure this
+  // boundary has.
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+
+  const startedAt = Date.now()
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [{ notify: () => new Promise<void>(() => undefined) }],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "never-settles",
+    relayColdStartMs: 23,
+    logger: noopLogger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  human.send({ type: "approve" })
+  expect((await handoff).outcome).toBe("approved")
+  expect(Date.now() - startedAt).toBeLessThan(4000)
+})
+
+test("a takeover ChannelHandoff has no answer and no screenshot, at compile time", () => {
+  // The runtime shape is asserted elsewhere with `in`. This is the other half:
+  // the union is what stops an adapter from writing `handoff.answer(...)` on a
+  // takeover in the first place, and `tsc --noEmit` covers this file, so a
+  // union that quietly grew those members would fail the typecheck here —
+  // `@ts-expect-error` is an error of its own when there is no error to expect.
+  const takeover: TakeoverChannelHandoff = {
+    mode: "takeover",
+    handoffId: "compile-negative",
+    url: "https://relay.example/?pt_token=x",
+    reason: "Aurora Bank is asking for a 2FA code",
+    settled: Promise.resolve("resolved"),
+  }
+  // @ts-expect-error `answer` exists only on the approval member of the union.
+  const answer = takeover.answer
+  // @ts-expect-error `screenshot` exists only on the approval member.
+  const screenshot = takeover.screenshot
+  expect(answer).toBeUndefined()
+  expect(screenshot).toBeUndefined()
+
+  // And through the union itself, which is what an adapter actually receives.
+  const handoff: ChannelHandoff = takeover
+  // @ts-expect-error narrow on `mode` before reaching for an approval field.
+  const unnarrowed = handoff.action
+  expect(unnarrowed).toBeUndefined()
+})
+
+// --- `settled`: the signal a channel has to have -------------------------
+
+test("settled resolves with the outcome when the phone answers", async () => {
+  const port = await startRelayProcess("approval")
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-relay",
+    relayColdStartMs: 24,
+    logger: noopLogger,
+  })
+
+  await until("the channel to be notified", () => recorder.seen.length === 1)
+  const raised = recorder.seen[0]
+  if (!raised) throw new Error("the channel was not notified")
+
+  human.send({ type: "deny" })
+  expect(await handoff).toEqual({ outcome: "denied" })
+  // This is the whole point: the channel is told the phone answered, without
+  // having been the one who was asked.
+  expect(await raised.settled).toBe("denied")
+  // And it stays resolved — an adapter may await it long after the fact.
+  expect(await raised.settled).toBe("denied")
+})
+
+test("settled resolves when the channel itself answers", async () => {
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-channel",
+    relayColdStartMs: 25,
+    logger: noopLogger,
+  })
+
+  await until("the channel to be notified", () => recorder.seen.length === 1)
+  const raised = recorder.seen[0]
+  if (raised?.mode !== "approval") throw new Error("no approval handoff")
+  expect(raised.answer("approve")).toBe(true)
+
+  expect((await handoff).outcome).toBe("approved")
+  expect(await raised.settled).toBe("approved")
+})
+
+test("settled resolves on a timeout and on a dead session", async () => {
+  const port = await startRelayProcess("approval")
+  await connectHuman(port)
+  const cdp = fakeCdp()
+  const timedOut = recordingChannel()
+
+  const waiting = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "nobody is going to answer this one",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [timedOut.channel],
+    },
+    timeoutMs: 400,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-timeout",
+    relayColdStartMs: 26,
+    logger: noopLogger,
+  })
+  await until("the channel to be notified", () => timedOut.seen.length === 1)
+  expect((await waiting).outcome).toBe("timeout")
+  expect(await timedOut.seen[0]?.settled).toBe("timeout")
+
+  const secondPort = await startRelayProcess("approval")
+  await connectHuman(secondPort)
+  const dead = recordingChannel()
+  const dying = runHandoff({
+    page: fakePage(fakeCdp().cdp),
+    agentWsUrl: `ws://127.0.0.1:${secondPort}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "the session is about to die",
+      action: "Submit $12,430 vendor payment to Acme GmbH",
+      logger: noopLogger,
+      channels: [dead.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-disconnected",
+    relayColdStartMs: 27,
+    logger: noopLogger,
+  })
+  await until("the channel to be notified", () => dead.seen.length === 1)
+  killSession()
+  expect((await dying).outcome).toBe("disconnected")
+  expect(await dead.seen[0]?.settled).toBe("disconnected")
+})
+
+test("every channel of one handoff gets the same settled promise", async () => {
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const first = recordingChannel()
+  const second = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "Aurora Bank is asking for a 2FA code",
+      logger: noopLogger,
+      channels: [first.channel, second.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-shared",
+    relayColdStartMs: 28,
+    logger: noopLogger,
+  })
+
+  await until(
+    "both channels to be notified",
+    () => first.seen.length === 1 && second.seen.length === 1,
+  )
+  // One handoff, one ending: two adapters must not be able to see different
+  // ones, and a takeover channel gets it too — it posted a bearer link that
+  // stops working when this resolves.
+  expect(first.seen[0]?.settled).toBe(second.seen[0]?.settled)
+
+  human.send({ type: "handback" })
+  expect((await handoff).outcome).toBe("resolved")
+  expect(await first.seen[0]?.settled).toBe("resolved")
+})
+
+test("settled reports the outcome the caller gets, not the one the human gave", async () => {
+  // The one path where those differ: a handback wins the promise, and the
+  // Solari session hits its ~10-minute hard death while the cookies are being
+  // captured. `raiseHand` reports `disconnected` rather than a dead
+  // "resolved" — and a channel that had been told "resolved" would post the
+  // wrong ending into a chat that outlives the process.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const recorder = recordingChannel()
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 0, 300),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "Aurora Bank is asking for a 2FA code",
+      logger: noopLogger,
+      channels: [recorder.channel],
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "settled-final-outcome",
+    relayColdStartMs: 29,
+    logger: noopLogger,
+  })
+
+  await until("the channel to be notified", () => recorder.seen.length === 1)
+  human.send({ type: "handback" })
+  // While `storageState()` is in flight: the handback has already settled the
+  // handoff, so this only changes what `isConnected()` says afterwards.
+  await Bun.sleep(120)
+  killSession()
+
+  const end = await handoff
+  expect(end.outcome).toBe("disconnected")
+  expect(end.storageState).toBeUndefined()
+  expect(await recorder.seen[0]?.settled).toBe("disconnected")
 })

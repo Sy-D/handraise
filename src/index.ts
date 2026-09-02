@@ -22,6 +22,12 @@
  * Needs `SOLARI_API_KEY` in the environment: the handoff page is served from a
  * Solari sandbox that handraise creates and destroys around the call.
  */
+export type {
+  ApprovalChannelHandoff,
+  ChannelHandoff,
+  HandoffChannel,
+  TakeoverChannelHandoff,
+} from "./channels"
 export { raiseHand } from "./core/raise-hand"
 export type { HandoffEvent } from "./events"
 export {
