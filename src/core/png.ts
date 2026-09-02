@@ -32,6 +32,16 @@ const CHANNELS = new Map<number, number>([
 /** Length + type + CRC around every chunk's payload. */
 const CHUNK_OVERHEAD = 12
 
+/**
+ * The largest image this will decode, in pixels.
+ *
+ * 64 megapixels is roughly an 8000x8000 screenshot: far past any viewport, and
+ * far short of what a dishonest IHDR could ask a decoder to allocate. It is
+ * checked before anything is inflated, because the header is the only part of
+ * a PNG that is cheap to believe.
+ */
+export const MAX_PIXELS = 64_000_000
+
 /** A decoded image in the one layout `jsQR` and `ImageData` agree on. */
 export interface RgbaImage {
   data: Uint8ClampedArray
@@ -67,11 +77,14 @@ function readHeader(bytes: Buffer): PngHeader {
       `unsupported PNG (colour type ${colourType}, ${depth} bits, interlace ${interlace})`,
     )
   }
-  return {
-    width: bytes.readUInt32BE(16),
-    height: bytes.readUInt32BE(20),
-    channels,
+  const width = bytes.readUInt32BE(16)
+  const height = bytes.readUInt32BE(20)
+  // Before anything is allocated or inflated: a header may claim four billion
+  // pixels each way, and every allocation below is sized from these two numbers.
+  if (width < 1 || height < 1 || width * height > MAX_PIXELS) {
+    fail(`the PNG claims ${width}x${height}, past the ${MAX_PIXELS}-pixel cap`)
   }
+  return { width, height, channels }
 }
 
 /** The image data, which a PNG may split over any number of IDAT chunks. */
@@ -168,10 +181,23 @@ function toRgba(pixels: Uint8Array, header: PngHeader): Uint8ClampedArray {
   return rgba
 }
 
-/** Decode a PNG to RGBA. Throws with a readable message on anything else. */
+/**
+ * Decode a PNG to RGBA. Throws with a readable message on anything else.
+ *
+ * The inflate is bounded by the header, which is the whole point of doing it
+ * in that order. A PNG's IHDR says exactly how many bytes its image data
+ * decompresses to — one filter byte plus one scanline per row — so a stream
+ * that inflates past that is not a large picture, it is a zip bomb. Measured
+ * without the bound: 815 KB of IDAT claiming an 8x8 image allocated 873 MB and
+ * then decoded happily, because the first 200 bytes were a valid 8x8 image.
+ * `scanPageForLinks` only ever feeds this Chromium's own screenshot, but
+ * `scanQrLinks` is exported and documented as taking a PNG from anywhere.
+ */
 export function decodePng(bytes: Buffer): RgbaImage {
   const header = readHeader(bytes)
-  const raw = inflateSync(collectImageData(bytes))
+  const raw = inflateSync(collectImageData(bytes), {
+    maxOutputLength: (header.width * header.channels + 1) * header.height,
+  })
   return {
     data: toRgba(unfilter(raw, header), header),
     width: header.width,

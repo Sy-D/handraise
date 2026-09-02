@@ -42,7 +42,7 @@ if (
 const qr = m.handoffQr(
   `https://example.preview.getsolari.com/?pt_token=${"x".repeat(240)}`,
 )
-if (!qr || !qr.includes("▄")) {
+if (!qr?.includes("▄")) {
   console.error("dist smoke: QR did not render under node")
   process.exit(1)
 }

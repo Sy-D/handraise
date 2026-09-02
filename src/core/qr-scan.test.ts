@@ -14,10 +14,12 @@
 import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
+import { deflateSync } from "node:zlib"
 import jsQR from "jsqr"
 import QRCode from "qrcode"
 
 import { decodePng, type RgbaImage } from "./png"
+import { NEVER_OPENABLE } from "./qr-fixtures"
 import {
   classifyLink,
   MAX_LINK_CHARS,
@@ -186,6 +188,12 @@ test("everything else is text, and stays readable as text", () => {
   }
 })
 
+test("a link that reads as one host and goes to another is not a url", () => {
+  for (const text of NEVER_OPENABLE) {
+    expect(classifyLink(text).kind).toBe("text")
+  }
+})
+
 test("a scheme hidden behind whitespace is not a url", () => {
   // The URL parser drops tabs and newlines, so it would report `https:` for a
   // string whose visible first line says something else entirely. What the
@@ -235,4 +243,49 @@ test("something that is not a PNG at all says so", () => {
   expect(() => decodePng(Buffer.from("not a png, just some bytes"))).toThrow(
     /not a PNG/,
   )
+})
+
+/** A PNG with a chosen IHDR and a chosen (already deflated) IDAT payload. */
+function forgePng(width: number, height: number, idat: Buffer): Buffer {
+  const chunk = (type: string, body: Buffer): Buffer => {
+    const head = Buffer.alloc(8)
+    head.writeUInt32BE(body.length, 0)
+    head.write(type, 4, "ascii")
+    // The CRC is never checked by this decoder, so zero is honest filler.
+    return Buffer.concat([head, body, Buffer.alloc(4)])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 2
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0)),
+  ])
+}
+
+test("a zip bomb is refused at the size its own header promised", () => {
+  // A tiny image whose IDAT decompresses to 64 MB. Without a bound the inflate
+  // allocates all of it and then decodes the first 200 bytes as a valid 8x8
+  // picture — 815 KB in, 873 MB of RSS, and no error at all. The header says
+  // how many bytes a PNG's image data comes to, so the inflate is capped by it.
+  const bomb = forgePng(8, 8, deflateSync(Buffer.alloc(64 * 1024 * 1024)))
+  expect(bomb.length).toBeLessThan(200_000)
+
+  const before = process.memoryUsage().rss
+  expect(() => decodePng(bomb)).toThrow()
+  const grew = (process.memoryUsage().rss - before) / (1024 * 1024)
+  // The bomb is 64 MB uncompressed; refusing it must not cost 64 MB.
+  expect(grew).toBeLessThan(32)
+})
+
+test("a header that claims more pixels than any screen is refused", () => {
+  // 65535x65535 is four billion pixels, and every allocation in the decoder is
+  // sized from these two numbers. Refused before a byte is inflated.
+  expect(() =>
+    decodePng(forgePng(65_535, 65_535, deflateSync(Buffer.alloc(64)))),
+  ).toThrow(/past the .* cap/)
 })

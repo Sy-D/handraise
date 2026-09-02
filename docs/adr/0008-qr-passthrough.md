@@ -133,6 +133,39 @@ real cloud-browser screenshot.
   the live e2e, and the README says as much rather than implying more.
 - A hostile page can put any string in a QR code and have a human read it on a
   phone. That is the residual risk, and it is bounded by the allowlist, by the
-  scheme re-check on the page, by `noreferrer`, and by the fact that opening it
-  is an explicit act by a person who can see the whole link — which is why the
-  sheet never truncates it.
+  page applying the whole rule again itself, by `noreferrer`, and by the fact
+  that opening it is an explicit act by a person who can see the whole link —
+  which is why the sheet never truncates it.
+
+  **"The whole link" has to mean the link that opens.** A raw payload beside an
+  anchor that resolves it is two strings, and the difference is invisible:
+  `https://аpple.com` with a Cyrillic а reads as apple.com and lands on
+  `xn--pple-43d.com`, and a U+202E override reverses the visible tail of a
+  path. So an openable link is shown as `new URL(text).href` — punycode host,
+  percent-encoded overrides — and the card says so when that differs from the
+  payload. Copy takes the same string. Nothing is truncated, so the argument
+  above still holds; it just stopped being false.
+
+- **Two of the five schemes deserve naming.** `tel:` accepts USSD
+  (`tel:*21*1234567890%23` classifies as openable), and while current Android
+  dialers make the human press call for those, this is the one entry whose
+  worst case is a device setting rather than a page. `otpauth:` enrols an
+  attacker-chosen TOTP secret in the human's authenticator — which is the
+  feature working exactly as designed, and exactly what a phisher wants from
+  it. Both stay on the list because a device-change flow genuinely uses them,
+  and both are on it knowingly.
+
+- **The decode blocks the event loop.** `scanImage` is synchronous, up to three
+  passes, about 320 ms of CPU on the path that finds nothing — and the frame
+  pump shares that loop, so the cast to the phone stalls for exactly that long
+  once per scan. Acceptable because a scan is a deliberate, rate-limited act by
+  a human who is looking at a still page; if scanning ever becomes automatic it
+  has to move off the loop first.
+
+- **`jsqr` is a bet, not just a dependency.** 1.4.0 is the last release
+  (January 2021) and `cozmo/jsQR` is archived. It is taken knowingly: zero
+  transitive dependencies, Apache-2.0, pure JavaScript with no `eval`, so a bad
+  decode is a crash or a stall and never an execution primitive. The alternative
+  QR decoders in the ecosystem are WASM or native, which trades an archived
+  dependency for a build step on every platform an agent runs on. If it has to
+  be replaced, `scanImage` is the only seam.

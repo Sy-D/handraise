@@ -98,7 +98,13 @@ function hasUnsafeCharacter(text: string): boolean {
 function isOpenable(text: string): boolean {
   if (text.length === 0 || hasUnsafeCharacter(text)) return false
   try {
-    return OPENABLE_SCHEMES.has(new URL(text).protocol)
+    const url = new URL(text)
+    // Credentials in the authority are the oldest way to make a link read as
+    // one host and go to another: everything before the `@` is a username, and
+    // a phone screen is exactly where that fits in the visible part. No
+    // device-change link has ever needed them.
+    if (url.username !== "" || url.password !== "") return false
+    return OPENABLE_SCHEMES.has(url.protocol)
   } catch {
     // Not a URL at all: a wifi credential, a vCard, a sentence.
     return false

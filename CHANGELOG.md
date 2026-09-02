@@ -31,9 +31,14 @@ returning `disconnected`. Both are under **Changed**.
 - **`scanQrLinks(png)` and `OPENABLE_SCHEMES` are exported.** The decoder is
   usable without a human: hand it a PNG screenshot, get back up to two
   `{ text, kind }`. `kind` is `"url"` only for `http:`, `https:`, `tel:`,
-  `mailto:` and `otpauth:`; everything else is `"text"` with a Copy button and
-  no anchor, and the phone re-checks the scheme itself rather than trusting a
-  label that crossed a socket a stranger holding the link can write to.
+  `mailto:` and `otpauth:` with no control characters and no credentials in the
+  authority; everything else is `"text"` with a Copy button and no anchor. The
+  phone applies that whole rule again itself rather than trusting a label that
+  crossed a socket a stranger holding the link can write to, and an openable
+  link is displayed, anchored and copied as the address it resolves to — so a
+  homograph host or a right-to-left override cannot show one address and open
+  another. The PNG decoder bounds its own inflate by the size the header
+  promised, so a crafted image cannot allocate a gigabyte.
 - **`HandoffEvent.qrScans` and `HandoffEvent.qrHits`.** Two new **required**
   number fields on the wide event — additive for callers, who receive the
   event rather than construct it, but a TypeScript consumer that builds a

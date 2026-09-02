@@ -226,11 +226,27 @@ wants — and the code is on that phone's screen, so it cannot be scanned.
 **Scan QR** asks the agent instead. It takes a fresh full-resolution screenshot
 of the page, decodes it, and sends back what each code said. The phone shows the
 link in full and offers **Open in new tab** — so the link is opened on the
-phone, which is the device the site was asking for. Only `http`, `https`,
-`tel:`, `mailto:` and `otpauth:` are openable; anything else is shown as text
-with a Copy button, and the agent itself never fetches any of it. Takeover mode
-only, one scan per 2 seconds, and a symbol below about 120 CSS pixels will not
-decode — scroll or zoom the remote page and scan again.
+phone, which is the device the site was asking for. Takeover mode only, one scan
+per 2 seconds, and a symbol below about 120 CSS pixels will not decode — scroll
+or zoom the remote page and scan again.
+
+The code came off a page nobody vetted, so:
+
+- Only `http`, `https`, `tel:`, `mailto:` and `otpauth:` are openable. Anything
+  else — including `javascript:` and `data:` — is shown as text with a Copy
+  button and no link. The agent classifies it and the phone checks it again,
+  because the handoff URL is a bearer credential and the socket behind it takes
+  messages from anyone holding it.
+- An openable link is shown **as the address it opens**, not as the payload:
+  punycode host, percent-encoded overrides, and a note when the two differ.
+  `https://аpple.com` with a Cyrillic а reads as apple.com and goes somewhere
+  else, and a human deciding whether to tap Open has to be looking at the real
+  one.
+- The agent process never fetches any of it. Opening is the human's act, in
+  their own browser.
+- `tel:` can carry a USSD code and `otpauth:` enrols a TOTP secret. Both are on
+  the list because device-change flows use them, and both are worth knowing
+  about before you tap.
 
 Measured: [`docs/measurements/05-qr.md`](docs/measurements/05-qr.md); the
 decisions are in [ADR 0008](docs/adr/0008-qr-passthrough.md).

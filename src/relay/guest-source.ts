@@ -444,9 +444,16 @@ function log(event, detail) {
  * type that is renamed in one place cannot survive in the other.
  */
 function renderPage() {
-  return PAGE.replace("__HANDRAISE_MODE__", HANDOFF_MODE).replace(
+  // Function replacements, so a \`$&\` or a \`$'\` in a substituted value stays a
+  // literal instead of becoming a back-reference that rewrites the page.
+  const vocabulary = JSON.stringify({
+    msg: MSG,
+    mode: MODE,
+    schemes: OPENABLE_SCHEMES,
+  })
+  return PAGE.replace("__HANDRAISE_MODE__", () => HANDOFF_MODE).replace(
     "__HANDRAISE_VOCAB__",
-    JSON.stringify({ msg: MSG, mode: MODE, schemes: OPENABLE_SCHEMES }),
+    () => vocabulary,
   )
 }
 
@@ -983,7 +990,12 @@ const PAGE = \`<!doctype html>
   #sheet {
     position: fixed;
     inset: 0;
-    z-index: 9;
+    /* Above the ending overlay, which is 10. The overlay is opaque, and a
+       handback taken before the human tapped Open would otherwise bury the
+       link this whole feature exists to deliver — with the button disabled,
+       the socket closing and no way to scan again. The sheet has its own Done
+       button, so the end screen is one tap away. */
+    z-index: 11;
     display: flex;
     align-items: flex-end;
     background: oklch(0.11 0 0 / 0.72);
@@ -1965,13 +1977,58 @@ const PAGE = \`<!doctype html>
    * against the allowlist the relay injected: "javascript:", "data:" and
    * everything else nobody thought of get a Copy button and no anchor.
    */
+  /**
+   * Whitespace and control characters, the same rule the agent applies.
+   *
+   * The URL parser deletes a tab or a newline without a word, so a payload
+   * that reads as one host parses as another. Rejecting it outright is what
+   * keeps the parse honest.
+   */
+  function hasUnsafeCharacter(value) {
+    for (var i = 0; i < value.length; i++) {
+      var code = value.charCodeAt(i)
+      if (code <= 0x20 || code === 0x7f) return true
+    }
+    return false
+  }
+
+  /**
+   * A link is openable only if this page says so.
+   *
+   * The agent already classified it, but that classification arrives over a
+   * socket anybody holding the handoff URL can write to, and the payload came
+   * off a page the agent did not choose. So the whole rule is applied again
+   * here — scheme, smuggled control characters, and credentials in the
+   * authority, which is the oldest way to make a link read as one host and go
+   * to another. Not just the scheme: half a lock is not two locks.
+   */
   function openable(link) {
-    if (!link || link.kind !== "url" || typeof link.text !== "string") return false
+    if (!link || link.kind !== "url") return false
+    if (link.text.length === 0 || hasUnsafeCharacter(link.text)) return false
     try {
-      return OPENABLE.indexOf(new URL(link.text).protocol) !== -1
+      var url = new URL(link.text)
+      if (url.username !== "" || url.password !== "") return false
+      return OPENABLE.indexOf(url.protocol) !== -1
     } catch (err) {
       return false
     }
+  }
+
+  /**
+   * What the card shows, and what Open and Copy use — one string, never two.
+   *
+   * The payload came out of a QR code drawn by a page nobody vetted, and the
+   * URL parser resolves things the eye cannot: a Cyrillic a in a host lands on
+   * a punycode domain, and a right-to-left override reverses the visible tail
+   * of a path. Showing the raw text next to an anchor that resolves it means
+   * the human reads one address and opens another. So an openable link is
+   * shown as its resolved form, and the card says so when the two differ.
+   * Nothing is truncated; the whole link is still on the screen.
+   */
+  function resolveLink(link) {
+    if (!openable(link)) return { shown: link.text, changed: false }
+    var href = new URL(link.text).href
+    return { shown: href, changed: href !== link.text }
   }
 
   function actionButton(label, run) {
@@ -2000,20 +2057,34 @@ const PAGE = \`<!doctype html>
     })
   }
 
+  function linkNote(card, message) {
+    var note = document.createElement("p")
+    note.className = "link-note"
+    note.textContent = message
+    card.appendChild(note)
+  }
+
   /** One card per code. textContent only: this string came off a hostile page. */
   function linkCard(link) {
     var card = document.createElement("div")
     card.className = "link"
+    var resolved = resolveLink(link)
     var text = document.createElement("p")
     text.className = "link-text"
-    text.textContent = link.text
+    text.textContent = resolved.shown
     card.appendChild(text)
     var actions = document.createElement("div")
     actions.className = "link-actions"
     if (openable(link)) {
+      if (resolved.changed) {
+        linkNote(
+          card,
+          "The code wrote this address differently. This is where it really goes."
+        )
+      }
       var open = document.createElement("a")
       open.className = "link-action"
-      open.href = link.text
+      open.href = resolved.shown
       open.target = "_blank"
       // noopener: the opened page must not get a handle on this one, which is
       // the tab holding a live handoff. noreferrer keeps the handoff URL — a
@@ -2022,14 +2093,34 @@ const PAGE = \`<!doctype html>
       open.textContent = "Open in new tab"
       actions.appendChild(open)
     } else {
-      var note = document.createElement("p")
-      note.className = "link-note"
-      note.textContent = "Not a link this page will open. Copy it instead."
-      card.appendChild(note)
+      linkNote(card, "Not a link this page will open. Copy it instead.")
     }
-    actions.appendChild(copyButton(link.text))
+    // Copy takes what is on the card, so what a human pastes elsewhere is the
+    // address they read here and not the one the code smuggled.
+    actions.appendChild(copyButton(resolved.shown))
     card.appendChild(actions)
     return card
+  }
+
+  /**
+   * The wire's array, parsed into cards this page can draw.
+   *
+   * A links message carrying a null, a number or an object with no text used
+   * to throw out of the message handler, which skipped endScan() and left the
+   * Scan QR button dead until its twelve-second deadline. Parse it here
+   * instead: anything that is not a payload is not a card.
+   */
+  function readLinks(raw) {
+    var links = []
+    if (!Array.isArray(raw)) return links
+    for (var i = 0; i < raw.length; i++) {
+      var entry = raw[i]
+      if (!entry || entry.text === undefined || entry.text === null) continue
+      var text = String(entry.text)
+      if (text.length === 0) continue
+      links.push({ text: text, kind: entry.kind === "url" ? "url" : "text" })
+    }
+    return links
   }
 
   function showLinks(links) {
@@ -2224,7 +2315,7 @@ const PAGE = \`<!doctype html>
     }
     else if (message.type === MSG.LINKS) {
       endScan()
-      showLinks(Array.isArray(message.links) ? message.links : [])
+      showLinks(readLinks(message.links))
     }
     else if (message.type === MSG.ENDED) {
       var ending = ENDINGS[message.outcome] || ["Session ended", "You can close this tab."]

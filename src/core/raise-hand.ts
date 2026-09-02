@@ -411,8 +411,10 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     qrScans += 1
     void scanPageForLinks(page)
       .then((links) => {
-        if (links.length > 0) qrHits += 1
+        // After the `over` check, not before it: a scan whose answer is thrown
+        // away because the handoff ended is not a hit anybody was told about.
         if (over) return undefined
+        if (links.length > 0) qrHits += 1
         return link?.send({ type: "links", links, source: "qr" })
       })
       // A screenshot fails when the page is closing, which is a handoff that

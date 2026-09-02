@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url"
 import { type Browser, chromium, type Page } from "playwright-core"
 import WebSocket from "ws"
 
+import { NEVER_OPENABLE } from "../src/core/qr-fixtures"
 import type {
   FocusRect,
   FrameMeta,
@@ -81,6 +82,8 @@ interface RelayLog {
 
 interface AgentClient {
   send(message: RelayMessage): void
+  /** Put bytes on the wire that the protocol has no way to describe. */
+  sendRaw(text: string): void
   next(): Promise<RelayMessage>
   /** Every message this socket has seen, in order. `next()` never consumes it,
    *  so a test can assert that something was sent *exactly once*. */
@@ -187,6 +190,9 @@ async function connectAgent(port: number): Promise<AgentClient> {
   return {
     send(message) {
       socket.send(JSON.stringify(message))
+    },
+    sendRaw(text) {
+      socket.send(text)
     },
     received,
     next() {
@@ -1392,11 +1398,21 @@ test("the reconnect loop gives up flushing once its deadline passes", async () =
 
 const QR_LINK = "https://verify.example.com/device?token=abc123"
 
-/** Wait for the result sheet to be on screen (or gone). */
+/**
+ * Wait for the result sheet to be on screen (or gone).
+ *
+ * When it is coming in, wait for the card to have finished rising as well: it
+ * starts a `translateY(100%)` below the fold, so between the `hidden` flip and
+ * the end of the transition its contents are outside the viewport and
+ * `elementFromPoint` over them answers null.
+ */
 async function waitForSheet(visible: boolean): Promise<void> {
   await page.waitForFunction((want: boolean) => {
     const sheet = document.getElementById("sheet")
-    return sheet ? !sheet.hidden === want : false
+    if (!sheet || !sheet.hidden !== want) return false
+    if (!want) return true
+    const card = document.getElementById("sheet-card")
+    return card ? card.getBoundingClientRect().bottom <= innerHeight + 1 : false
   }, visible)
 }
 
@@ -1509,34 +1525,127 @@ test("a scan that found nothing says so rather than showing an empty sheet", asy
   expect(consoleErrors).toEqual([])
 })
 
-test("a scheme the page may not open gets no anchor, whatever the agent called it", async () => {
+test("a payload the page may not open gets no anchor, whatever the agent called it", async () => {
   await showFrame()
   // Every one of these arrives labelled `kind: "url"`, which is the lie the
   // page has to survive: the handoff URL is a bearer credential and the socket
-  // behind it is reachable from any HTTP client, so this side re-checks the
-  // scheme itself instead of trusting the label.
-  const hostile = [
-    "javascript:alert(document.cookie)",
-    "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
-    "file:///etc/passwd",
-    "intent://scan/#Intent;scheme=zxing;end",
-  ]
+  // behind it is reachable from any HTTP client, so this side applies the whole
+  // rule again instead of trusting the label. The list is the core's own, so
+  // the two locks cannot drift into checking different things.
   agent.send({
     type: "links",
-    links: hostile.map((text) => ({ text, kind: "url" as const })),
+    links: NEVER_OPENABLE.map((text) => ({ text, kind: "url" as const })),
     source: "qr",
   })
   await waitForSheet(true)
 
-  expect(await sheetTexts()).toEqual(hostile)
+  expect(await sheetTexts()).toEqual([...NEVER_OPENABLE])
   // No anchor at all — not a disabled one, and not one with a neutered href.
   expect(await page.locator("#sheet-links a").count()).toBe(0)
   expect(await page.locator("#sheet-links button.link-action").count()).toBe(
-    hostile.length,
+    NEVER_OPENABLE.length,
   )
   expect(
     await page.locator("#sheet-links .link-note").first().textContent(),
   ).toContain("Not a link this page will open")
+  expect(consoleErrors).toEqual([])
+})
+
+test("an openable link is shown as the address it actually opens", async () => {
+  await showFrame()
+  // The first character is a Cyrillic a. The eye reads apple.com and the
+  // browser goes to xn--pple-43d.com, so showing the payload beside an anchor
+  // that resolves it shows the human one address and opens another.
+  const homograph = "https://аpple.com/verify?to=‮gnp.exe"
+  const resolved = new URL(homograph).href
+  expect(resolved).not.toBe(homograph)
+
+  agent.send({
+    type: "links",
+    links: [{ text: homograph, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  // Shown, anchored and copied: one string, and it is the resolved one.
+  expect(await sheetTexts()).toEqual([resolved])
+  expect(
+    await page.locator("#sheet-links a.link-action").getAttribute("href"),
+  ).toBe(resolved)
+  expect(
+    await page.locator("#sheet-links .link-note").first().textContent(),
+  ).toContain("wrote this address differently")
+  expect(consoleErrors).toEqual([])
+})
+
+test("an ordinary link is shown verbatim, with no note about it", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([QR_LINK])
+  expect(await page.locator("#sheet-links .link-note").count()).toBe(0)
+  expect(consoleErrors).toEqual([])
+})
+
+test("the result sheet stays reachable after the handoff ends", async () => {
+  await showFrame()
+  agent.send({
+    type: "links",
+    links: [{ text: QR_LINK, kind: "url" }],
+    source: "qr",
+  })
+  await waitForSheet(true)
+
+  // The feature's own happy path: the human reads the link and the handoff ends
+  // before they tap Open — they hand back, or it times out. The ending overlay
+  // is opaque and covers the whole screen, so if it wins the stacking order the
+  // link is gone, with the button disabled and no way to scan again.
+  agent.send({ type: "ended", outcome: "resolved" })
+  await waitForOverlay(page)
+
+  const onTop = await page.evaluate(() => {
+    const anchor = document.querySelector("#sheet-links a.link-action")
+    if (!anchor) return "no anchor"
+    const box = anchor.getBoundingClientRect()
+    const hit = document.elementFromPoint(
+      box.x + box.width / 2,
+      box.y + box.height / 2,
+    )
+    return hit?.closest("#sheet") ? "sheet" : (hit?.id ?? hit?.tagName ?? "?")
+  })
+  expect(onTop).toBe("sheet")
+  expect(consoleErrors).toEqual([])
+})
+
+test("a malformed links message neither throws nor wedges the button", async () => {
+  await showFrame()
+  await page.locator("#key-qr").click()
+  await page.waitForFunction(() => {
+    const button = document.getElementById("key-qr")
+    return button instanceof HTMLButtonElement && button.disabled
+  })
+
+  // A null, a number and an object with no text. This used to throw out of the
+  // message handler, which skipped the code that releases the button — leaving
+  // it dead for the full twelve-second deadline, with no sheet and no reason.
+  // Sent as bytes rather than as a typed message: the protocol has no way to
+  // describe this, and casting one into shape would be the same lie the page
+  // is being tested against.
+  agent.sendRaw(
+    '{"type":"links","links":[null,5,{"kind":"url"}],"source":"qr"}',
+  )
+  await waitForSheet(true)
+
+  expect(await sheetTexts()).toEqual([])
+  expect(await page.locator("#sheet-title").textContent()).toBe(
+    "No QR code found",
+  )
+  expect(await page.locator("#key-qr").isEnabled()).toBe(true)
   expect(consoleErrors).toEqual([])
 })
 
