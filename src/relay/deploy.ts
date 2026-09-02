@@ -107,17 +107,32 @@ function withToken(previewUrl: string, token: string | undefined): string {
   return url.toString()
 }
 
+/** `?pt_token=<value>`, in any case, with `:` or whitespace as it is proxied around. */
+const TOKEN_PARAM = /pt_token\s*[=:]\s*[^&;\s"'<>]+/gi
+
+/**
+ * The credential itself, wherever it appears — bare in prose ("invalid preview
+ * token pt_…"), or behind a `%3D` that the parameter rule above cannot see.
+ * Deliberately without `\b`: a percent-encoded `=` ends in a word character,
+ * so a word boundary would not match there.
+ */
+const TOKEN_VALUE = /pt_[A-Za-z0-9._~-]{16,}/g
+
 /**
  * Take the preview token out of anything that becomes an error message.
  *
  * Every URL handraise polls carries `?pt_token=…`, a live bearer credential
  * for the relay. A gateway or proxy that echoes the request URI in its error
- * body — a common default on 401 and 404 — would otherwise put that token into
- * an exception message, and exception messages end up in log aggregators.
- * Exported for `deploy.test.ts`.
+ * body — a common default on 401 and 404, and common percent-encoded inside a
+ * `?next=` parameter — would otherwise put that token into an exception
+ * message, and exception messages end up in log aggregators. Two rules,
+ * because the syntax around the credential varies and the credential does
+ * not. Exported for `deploy.test.ts`.
  */
 export function redactPreviewToken(text: string): string {
-  return text.replace(/pt_token=[^&\s"'<>]+/g, "pt_token=[redacted]")
+  return text
+    .replace(TOKEN_PARAM, "pt_token=[redacted]")
+    .replace(TOKEN_VALUE, "pt_[redacted]")
 }
 
 /**
@@ -192,7 +207,10 @@ export async function killSandbox(
   attempts: number = KILL_ATTEMPTS,
 ): Promise<void> {
   let lastError: unknown
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+  // At least one attempt: "could not destroy it after 0 attempts" would be a
+  // failure report for something that was never tried.
+  const budget = Math.max(1, attempts)
+  for (let attempt = 1; attempt <= budget; attempt++) {
     try {
       await sandbox.kill()
       return
@@ -200,13 +218,13 @@ export async function killSandbox(
       // A 404 means the sandbox is already gone — the goal, not a failure.
       if (error instanceof GatewayError && error.status === 404) return
       lastError = error
-      if (attempt < attempts)
+      if (attempt < budget)
         await sleep(Math.min(500 * 2 ** (attempt - 1), 4000))
     }
   }
   throw new Error(
     redactPreviewToken(
-      `handraise: could not destroy the relay sandbox after ${attempts} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
+      `handraise: could not destroy the relay sandbox after ${budget} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
     ),
     { cause: lastError },
   )
@@ -229,14 +247,23 @@ export async function waitForHealth(
   let lastAnswer = ""
   for (;;) {
     try {
-      const response = await fetch(healthUrl, { cache: "no-store" })
+      const response = await fetch(healthUrl, {
+        cache: "no-store",
+        // Without this the deadline is only checked *between* requests, and a
+        // preview route that accepts the connection and never answers — what
+        // a port that is not wired up yet looks like from outside — would
+        // hold the loop open for minutes with a live sandbox burning its idle
+        // window. The abort lands in the catch below and the deadline check
+        // ends the loop.
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      })
       const body = await response.text()
       if (response.ok && body === "ok") return
       // The body is the preview proxy's, not ours: an error page that echoes
       // the request URI would otherwise quote the live `pt_token` back at us.
-      lastAnswer = redactPreviewToken(
-        `HTTP ${response.status} ${body.slice(0, 80)}`,
-      )
+      // Redacted before it is cut, so no slice can leave a partial credential
+      // without its prefix.
+      lastAnswer = `HTTP ${response.status} ${redactPreviewToken(body).slice(0, 80)}`
     } catch (error) {
       // The port is not routable yet; the retry below is the whole mechanism.
       lastAnswer = redactPreviewToken(String(error))

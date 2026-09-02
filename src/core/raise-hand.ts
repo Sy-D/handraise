@@ -25,7 +25,7 @@ import type {
 } from "../channels"
 import { HandraiseError } from "../errors"
 import type { HandoffEvent } from "../events"
-import { type Logger, quietLogger } from "../logger"
+import { type Logger, quietLogger, safeLogger } from "../logger"
 import { printHandoffQr } from "../qr"
 import { startRelay } from "../relay/deploy"
 import type { AgentToHuman, HumanToAgent } from "../relay/protocol"
@@ -276,7 +276,10 @@ function notifyChannels(
  * fake page; `raiseHand` is the supported entry point.
  */
 export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
-  const { page, agentWsUrl, options, timeoutMs, logger } = run
+  const { page, agentWsUrl, options, timeoutMs } = run
+  // Wrapped here as well as in `raiseHand`, because this is the entry point
+  // the tests drive: from this line on, no log call can end a handoff.
+  const logger = safeLogger(run.logger)
   const mode: HandoffMode = options.mode ?? "takeover"
   const startedAt = Date.now()
   let framesSent = 0
@@ -639,7 +642,7 @@ function checkedPage(page: Page): void {
   } catch (cause) {
     throw new HandraiseError(
       "browser_unusable",
-      `handraise: this page cannot be handed to a human — reading its state failed, which is what a dead CDP connection does. Relaunch the session and retry. ${String(cause)}`,
+      `handraise: this page cannot be handed to a human — reading its state (page.isClosed(), page.context()) threw. A dead CDP connection does that, and so does a page-like object that is not a Playwright page. ${String(cause)}`,
       { cause },
     )
   }
@@ -662,7 +665,7 @@ export async function raiseHand(
   page: Page,
   options: RaiseHandOptions,
 ): Promise<HandoffResult> {
-  const logger = options.logger ?? quietLogger
+  const logger = safeLogger(options.logger ?? quietLogger)
   const mode = checkedMode(options)
   const apiKey = options.apiKey ?? process.env.SOLARI_API_KEY
   if (!apiKey) {
@@ -720,6 +723,11 @@ export async function raiseHand(
           : payload,
         logger,
       )
+        // `notifyWebhook` does not reject, and this is what makes that safe to
+        // rely on: nothing awaits this promise until the `finally`, minutes
+        // later, so a rejection would be unhandled for the whole handoff (node
+        // ends the process for that) and would then throw from the `finally`.
+        .catch(() => undefined)
     }
 
     end = await runHandoff({

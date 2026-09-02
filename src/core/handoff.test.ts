@@ -1480,3 +1480,43 @@ test("settled reports the outcome the caller gets, not the one the human gave", 
   expect(end.storageState).toBeUndefined()
   expect(await recorder.seen[0]?.settled).toBe("disconnected")
 })
+
+test("a logger that throws does not break the handoff", async () => {
+  // `logger` is a public option and it is the caller's object: a pino instance
+  // over a closed transport throws. Every call handraise makes to it sits on a
+  // failure path or inside a promise callback, so a throw would either lose
+  // the outcome (the wide event is logged before it is returned) or reject a
+  // promise nobody awaits, and node ends the process for that.
+  const port = await startRelayProcess()
+  const human = await connectHuman(port)
+  const cdp = fakeCdp()
+  const down = (): never => {
+    throw new Error("logger is down (EPIPE)")
+  }
+  const hostile: Logger = { debug: down, info: down, warn: down, error: down }
+  const events: HandoffEvent[] = []
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "the logger is hostile",
+      logger: hostile,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 5000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "hostile-logger",
+    relayColdStartMs: 5,
+    logger: hostile,
+  })
+
+  await until("the phone to connect", () => human.inbox.length >= 0)
+  human.send({ type: "handback" })
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  // The wide event still reaches the caller: `logger.info` throwing must not
+  // take `onEvent` with it.
+  expect(events).toHaveLength(1)
+})

@@ -10,7 +10,7 @@
  */
 import { expect, test } from "bun:test"
 import { createServer, type Server } from "node:http"
-import type { AddressInfo } from "node:net"
+import type { AddressInfo, Socket } from "node:net"
 import {
   ConcurrencyLimitError,
   GatewayError,
@@ -30,6 +30,9 @@ import {
 
 /** A port on which nothing listens, so no test here can reach a live gateway. */
 const CLOSED_PORT = "http://127.0.0.1:1"
+
+/** A token shaped like the real thing, long enough to be unmistakable in a diff. */
+const FAKE_TOKEN = `pt_${"a1b2c3d4".repeat(8)}`
 
 /**
  * The code of the `HandraiseError` `run` rejects with, or a sentence saying
@@ -84,7 +87,11 @@ async function startBusyGateway(): Promise<{ url: string; server: Server }> {
     response.end(
       JSON.stringify({
         code: "ConcurrencyLimitExceeded",
-        message: "Concurrency limit exceeded: 2 of 2 sessions in use",
+        // `mapGatewayError` puts this straight into the error's message, and
+        // the message goes into ours — so it is foreign text on a path a
+        // caller logs, and a gateway that quotes the request can put a
+        // credential in it.
+        message: `Concurrency limit exceeded: 2 of 2 sessions in use (request /sandboxes?pt_token=${FAKE_TOKEN})`,
       }),
     )
   })
@@ -131,6 +138,10 @@ test("a gateway at its session cap becomes concurrency_limit, not a raw 429", as
     // The SDK's own error is kept, so a caller that wants the HTTP status
     // still has it.
     expect(await causeNameOf(creating)).toBe(ConcurrencyLimitError.name)
+    // The gateway's own words are quoted into our message — redacted first.
+    const message = await messageOf(creating)
+    expect(message).toContain("concurrent session limit")
+    expect(message).not.toContain(FAKE_TOKEN)
   } finally {
     // In a `finally`: a failed expectation above must not leave a listening
     // socket behind for the rest of the run.
@@ -195,18 +206,17 @@ test("a sandbox that is already gone is not a failure", async () => {
   expect(await codeOf(killSandbox(vanished, 4))).toBe("nothing was thrown")
 })
 
-/** A token shaped like the real thing, long enough to be unmistakable in a diff. */
-const FAKE_TOKEN = `pt_${"a1b2c3d4".repeat(8)}`
-
 test("a proxy that echoes the request URI cannot leak the preview token", async () => {
   // Every URL handraise polls carries `?pt_token=…`, a live bearer credential
   // with an hour of life on it. This body is the one place a proxy's own text
   // reaches an exception message — and exception messages get logged.
   const proxy = await startEchoingProxy()
   try {
+    // Long enough that the proxy's 401 — not the per-request abort — is what
+    // the deadline finds in `lastAnswer`, however loaded the machine is.
     const waiting = waitForHealth(
       `${proxy.url}/healthz?pt_token=${FAKE_TOKEN}&role=human`,
-      200,
+      1500,
     )
 
     expect(await codeOf(waiting)).toBe("relay_not_ready")
@@ -221,25 +231,84 @@ test("a proxy that echoes the request URI cannot leak the preview token", async 
   }
 })
 
-test("redaction survives the shapes a token can appear in", () => {
-  expect(redactPreviewToken(`?pt_token=${FAKE_TOKEN}`)).toBe(
-    "?pt_token=[redacted]",
-  )
-  // Followed by another parameter, inside quotes, and inside a URL in prose —
-  // the three ways a proxy body or an SDK message carries one.
+test("redaction survives every form a token arrives in", () => {
+  // The forms a proxy body actually produces. Every one of these was a leak
+  // before the second rule; the plain `pt_token=` case never was, which is
+  // exactly why testing only that one proved nothing.
+  const leaks = [
+    `?pt_token=${FAKE_TOKEN}`,
+    `?pt_token=${FAKE_TOKEN}&role=human`,
+    `pt_token=${FAKE_TOKEN};role=human`,
+    `GET "/?pt_token=${FAKE_TOKEN}" failed`,
+    `fetch https://x.preview.getsolari.com/?pt_token=${FAKE_TOKEN} failed`,
+    // Percent-encoded inside a redirect parameter — a 302/401 default.
+    `?next=%2Fhealthz%3Fpt_token%3D${FAKE_TOKEN}`,
+    `%2Fhealthz%3Fpt_token%3D${FAKE_TOKEN}`,
+    // An auth proxy quoting the credential in prose, with no parameter at all.
+    `invalid preview token ${FAKE_TOKEN}`,
+    // An uppercased parameter name, an HTML-entity `=`, and a stray space.
+    `?PT_TOKEN=${FAKE_TOKEN}`,
+    `?pt_token&#61;${FAKE_TOKEN}`,
+    `pt_token= ${FAKE_TOKEN}`,
+    `pt_token=${FAKE_TOKEN}\nx-request-id: 7`,
+  ]
+
+  for (const leak of leaks) {
+    expect(redactPreviewToken(leak)).not.toContain(FAKE_TOKEN)
+  }
+
+  // The syntax around the credential survives, so the message still reads.
   expect(redactPreviewToken(`?pt_token=${FAKE_TOKEN}&role=human`)).toBe(
     "?pt_token=[redacted]&role=human",
   )
-  expect(redactPreviewToken(`GET "/?pt_token=${FAKE_TOKEN}" failed`)).toBe(
-    'GET "/?pt_token=[redacted]" failed',
+  expect(redactPreviewToken(`invalid preview token ${FAKE_TOKEN}`)).toBe(
+    "invalid preview token pt_[redacted]",
   )
-  expect(
-    redactPreviewToken(
-      `fetch https://x.preview.getsolari.com/?pt_token=${FAKE_TOKEN} failed`,
-    ),
-  ).toBe("fetch https://x.preview.getsolari.com/?pt_token=[redacted] failed")
   // Nothing else is touched.
   expect(redactPreviewToken("HTTP 502 upstream closed")).toBe(
     "HTTP 502 upstream closed",
   )
 })
+
+/**
+ * A server that accepts the connection and never answers — what a preview
+ * route that is not wired up yet looks like from outside. It is the case that
+ * a deadline checked only *between* requests can never end.
+ */
+async function startHangingServer(): Promise<{ url: string; stop(): void }> {
+  const open: Socket[] = []
+  const server = createServer((request) => {
+    // Hold the request: no write, no end, no close.
+    open.push(request.socket)
+  })
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve())
+  })
+  // SAFETY: as above — a TCP listener never has a string address.
+  const { port } = server.address() as AddressInfo
+  return {
+    url: `http://127.0.0.1:${port}`,
+    stop: () => {
+      for (const socket of open) socket.destroy()
+      server.close()
+    },
+  }
+}
+
+test("a public URL that accepts and never answers still hits the deadline", async () => {
+  // Without a per-request `signal` the loop suspends inside `fetch`: bun has
+  // no default request timeout at all and node's undici waits 300 s, so the
+  // sandbox would burn its idle window while `raiseHand` blocks — and the
+  // message would then state a deadline that was never enforced.
+  const hanging = await startHangingServer()
+  try {
+    const startedAt = Date.now()
+    const waiting = waitForHealth(`${hanging.url}/healthz`, 300)
+
+    expect(await codeOf(waiting)).toBe("relay_not_ready")
+    // Slack for the abort and one poll interval, not for a second request.
+    expect(Date.now() - startedAt).toBeLessThan(2000)
+  } finally {
+    hanging.stop()
+  }
+}, 15_000)

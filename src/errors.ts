@@ -26,7 +26,10 @@
  * - `missing_api_key` — no `options.apiKey` and no `SOLARI_API_KEY`.
  * - `invalid_mode` — `mode` was neither `"takeover"` nor `"approval"`.
  * - `empty_action` — `mode: "approval"` without a non-empty `action`.
- * - `browser_unusable` — the page's browser was already gone.
+ * - `browser_unusable` — the page is closed, or its browser has disconnected.
+ *   Checked before anything is created, from local state only: a Solari
+ *   session that has died server-side while the CDP socket is still up looks
+ *   alive here and still ends as the `disconnected` outcome.
  * - `relay_start_failed` — the relay sandbox could not be created or deployed;
  *   `cause` holds the SDK error.
  * - `concurrency_limit` — the Solari account is at its concurrent session cap

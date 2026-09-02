@@ -296,7 +296,14 @@ asked for anything yet. Everything after that is an `outcome`, never an
 exception. What it throws is a `HandraiseError` with a `code`: the code is the
 contract, the message is for whoever reads the log and may be reworded in any
 release. `isHandraiseError` narrows a `catch` binding, and `cause` keeps the
-original SDK, CDP or network error.
+original SDK, CDP or network error whenever there was one.
+
+The first thing `raiseHand` does is look at your page, before it creates
+anything: a page you have closed, or a browser you have disconnected, is
+refused as `browser_unusable` rather than paid for with a relay sandbox and a
+person's attention. It reads local state only, so a Solari session that has
+died server-side while the CDP socket is still open still looks alive — that
+one arrives as the `disconnected` outcome, as it always did.
 
 ```ts
 import { isHandraiseError, raiseHand } from "handraise"
@@ -315,17 +322,17 @@ try {
 | `missing_api_key` | No `options.apiKey` and no `SOLARI_API_KEY`. | Set one; handraise needs it to create the relay sandbox. |
 | `invalid_mode` | `mode` is neither `"takeover"` nor `"approval"`. | Fix the call. TypeScript already refuses it; this is for JavaScript callers. |
 | `empty_action` | `mode: "approval"` without a non-empty `action`. | Name the step the human says yes or no to. |
-| `browser_unusable` | The page is closed, or its browser has disconnected. | Open a new page or relaunch the session (restore `storageState` if you kept it) and retry. |
-| `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error. Retry; nothing was created. |
+| `browser_unusable` | The page is closed, or its browser has disconnected — checked before anything is created. | Open a new page or relaunch the session (restore `storageState` if you kept it) and retry. |
+| `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error. Retry. Nothing is left behind unless you also see `relay_release_failed` (below). |
 | `concurrency_limit` | Your Solari account is at its concurrent session cap (429). | Free a session, or wait and retry. The one relay failure that is purely temporary. |
 | `relay_not_ready` | The sandbox started but its public URL never answered. | Retry. Persisting means the preview proxy or the region is unhealthy. |
 
-There is deliberately no code for the one failure that happens *after* the
-human has answered: a relay sandbox that survives its own teardown. `raiseHand`
-logs `relay_release_failed` and returns the outcome, because the handoff
-already succeeded — but that sandbox's public URL stays reachable until its
-idle timeout, so watch for that log line and delete it from the Solari
-dashboard.
+There is deliberately no code for the one failure that is not the caller's to
+catch: a relay sandbox that survives its own teardown. `raiseHand` logs
+`relay_release_failed` and carries on — after a successful handoff it returns
+the outcome, and on a failed start it still throws `relay_start_failed`. Either
+way that sandbox's public URL stays reachable until its idle timeout, so watch
+for that log line and delete it from the Solari dashboard.
 
 ## What happens when things die
 

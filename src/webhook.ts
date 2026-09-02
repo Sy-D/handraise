@@ -7,7 +7,7 @@
  * integrations: a webhook the caller can point anywhere ages better than a
  * Slack client that needs a token and a scope.
  */
-import { type Logger, quietLogger } from "./logger"
+import { type Logger, quietLogger, safeLogger } from "./logger"
 import type { HandoffMode } from "./types"
 
 /** Body of the notification POST. */
@@ -30,12 +30,19 @@ const TIMEOUT_MS = 10_000
  * Notify the webhook. Failures are logged and swallowed: the handoff page
  * already exists by the time this runs, and a broken Slack URL must not cost
  * the caller a browser session.
+ *
+ * This promise never rejects. `raiseHand` fires it and only awaits it minutes
+ * later, so a rejection would sit unhandled for the whole handoff — an
+ * unhandled rejection ends the agent's process under node's default — and then
+ * throw out of a `finally`. A caller's logger is the one thing in here that
+ * can still throw, which is why it is wrapped rather than called directly.
  */
 export async function notifyWebhook(
   webhookUrl: string,
   payload: WebhookPayload,
   logger: Logger = quietLogger,
 ): Promise<void> {
+  const log = safeLogger(logger)
   try {
     const response = await fetch(webhookUrl, {
       method: "POST",
@@ -44,12 +51,12 @@ export async function notifyWebhook(
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
     if (!response.ok) {
-      logger.warn("webhook_rejected", {
+      log.warn("webhook_rejected", {
         status: response.status,
         statusText: response.statusText,
       })
     }
   } catch (error) {
-    logger.warn("webhook_failed", { error: String(error) })
+    log.warn("webhook_failed", { error: String(error) })
   }
 }
