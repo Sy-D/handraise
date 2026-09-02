@@ -620,23 +620,33 @@ function checkedMode(options: RaiseHandOptions): HandoffMode {
 }
 
 /**
- * Refuse a page whose browser is already gone, before a sandbox is created.
+ * Refuse a dead page before a sandbox is created.
  *
  * A dead session cannot be driven or screenshotted, so a handoff on one would
  * spend a relay sandbox, a QR code and a person's attention to end in
- * `disconnected`. Both halves are cheap and neither touches the network:
- * `context()` throws once the page is closed, and a browser that has lost its
- * connection says so.
+ * `disconnected`. Two questions, both answered from local state — neither
+ * touches the network: is this page closed, and is its browser still
+ * connected? `context()` is a field read and throws nothing in Playwright, so
+ * it is `isClosed()` that catches a closed page; the try/catch is for the page
+ * object that is not a working Playwright page at all.
  */
 function checkedPage(page: Page): void {
+  let closed: boolean
   let browser: Browser | null
   try {
+    closed = page.isClosed()
     browser = page.context().browser()
   } catch (cause) {
     throw new HandraiseError(
       "browser_unusable",
-      `handraise: this page cannot be handed to a human — reading its browser context failed, which is what a closed page or a dead CDP connection does. Relaunch the session and retry. ${String(cause)}`,
+      `handraise: this page cannot be handed to a human — reading its state failed, which is what a dead CDP connection does. Relaunch the session and retry. ${String(cause)}`,
       { cause },
+    )
+  }
+  if (closed) {
+    throw new HandraiseError(
+      "browser_unusable",
+      "handraise: this page is already closed, so there is nothing for a human to take over. Open a new page (its `storageState` from an earlier handoff, if you kept it, restores the human's work) and retry.",
     )
   }
   if (browser && !browser.isConnected()) {

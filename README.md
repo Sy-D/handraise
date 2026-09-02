@@ -315,11 +315,17 @@ try {
 | `missing_api_key` | No `options.apiKey` and no `SOLARI_API_KEY`. | Set one; handraise needs it to create the relay sandbox. |
 | `invalid_mode` | `mode` is neither `"takeover"` nor `"approval"`. | Fix the call. TypeScript already refuses it; this is for JavaScript callers. |
 | `empty_action` | `mode: "approval"` without a non-empty `action`. | Name the step the human says yes or no to. |
-| `browser_unusable` | The page's browser was already closed or disconnected. | Relaunch the session (restore `storageState` if you kept it) and retry. |
+| `browser_unusable` | The page is closed, or its browser has disconnected. | Open a new page or relaunch the session (restore `storageState` if you kept it) and retry. |
 | `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error. Retry; nothing was created. |
 | `concurrency_limit` | Your Solari account is at its concurrent session cap (429). | Free a session, or wait and retry. The one relay failure that is purely temporary. |
 | `relay_not_ready` | The sandbox started but its public URL never answered. | Retry. Persisting means the preview proxy or the region is unhealthy. |
-| `relay_kill_failed` | The relay sandbox survived every attempt to destroy it. | Its public URL stays reachable until the sandbox's idle timeout; delete it from the Solari dashboard. |
+
+There is deliberately no code for the one failure that happens *after* the
+human has answered: a relay sandbox that survives its own teardown. `raiseHand`
+logs `relay_release_failed` and returns the outcome, because the handoff
+already succeeded — but that sandbox's public URL stays reachable until its
+idle timeout, so watch for that log line and delete it from the Solari
+dashboard.
 
 ## What happens when things die
 

@@ -108,6 +108,19 @@ function withToken(previewUrl: string, token: string | undefined): string {
 }
 
 /**
+ * Take the preview token out of anything that becomes an error message.
+ *
+ * Every URL handraise polls carries `?pt_token=…`, a live bearer credential
+ * for the relay. A gateway or proxy that echoes the request URI in its error
+ * body — a common default on 401 and 404 — would otherwise put that token into
+ * an exception message, and exception messages end up in log aggregators.
+ * Exported for `deploy.test.ts`.
+ */
+export function redactPreviewToken(text: string): string {
+  return text.replace(/pt_token=[^&\s"'<>]+/g, "pt_token=[redacted]")
+}
+
+/**
  * Turn a failure from the SDK into the code the caller branches on.
  *
  * A 429 is the one worth telling apart: the account is at its concurrent
@@ -119,13 +132,17 @@ function relayStartError(cause: unknown): HandraiseError {
   if (cause instanceof ConcurrencyLimitError) {
     return new HandraiseError(
       "concurrency_limit",
-      `handraise: your Solari account is at its concurrent session limit, so the relay sandbox that gives the handoff its public URL could not be created. Free a session and retry. (${cause.message})`,
+      redactPreviewToken(
+        `handraise: your Solari account is at its concurrent session limit, so the relay sandbox that gives the handoff its public URL could not be created. Free a session and retry. (${cause.message})`,
+      ),
       { cause },
     )
   }
   return new HandraiseError(
     "relay_start_failed",
-    `handraise: the relay sandbox could not be started, so the handoff has no public URL and nobody has been asked for anything yet. ${String(cause)}`,
+    redactPreviewToken(
+      `handraise: the relay sandbox could not be started, so the handoff has no public URL and nobody has been asked for anything yet. ${String(cause)}`,
+    ),
     { cause },
   )
 }
@@ -164,7 +181,10 @@ export async function createSandbox(
  * Destroy the sandbox, retrying a transient failure.
  *
  * A swallowed failure would leave the public relay URL — and its last frame —
- * reachable until the idle timeout, so the last one is surfaced with a code.
+ * reachable until the idle timeout, so the last one is surfaced. Deliberately
+ * a plain `Error` and not a `HandraiseError`: both callers catch it and log
+ * `relay_release_failed`, so it can never reach a `catch` around `raiseHand`,
+ * and a code nobody can branch on is documentation for dead code.
  * `attempts` is a parameter for the same reason as in `createSandbox`.
  */
 export async function killSandbox(
@@ -184,9 +204,10 @@ export async function killSandbox(
         await sleep(Math.min(500 * 2 ** (attempt - 1), 4000))
     }
   }
-  throw new HandraiseError(
-    "relay_kill_failed",
-    `handraise: could not destroy the relay sandbox after ${attempts} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
+  throw new Error(
+    redactPreviewToken(
+      `handraise: could not destroy the relay sandbox after ${attempts} attempts; its public URL stays reachable until the idle timeout. Last error: ${String(lastError)}`,
+    ),
     { cause: lastError },
   )
 }
@@ -203,17 +224,22 @@ export async function waitForHealth(
   const deadline = Date.now() + timeoutMs
   // A deadline has no single cause, so what the URL last said is carried in
   // the message: "connection refused" and "502 from the preview proxy" are
-  // different problems with the same code.
-  let lastAnswer = "nothing was tried"
+  // different problems with the same code. The loop always writes it before it
+  // checks the deadline; the initial value only satisfies definite assignment.
+  let lastAnswer = ""
   for (;;) {
     try {
       const response = await fetch(healthUrl, { cache: "no-store" })
       const body = await response.text()
       if (response.ok && body === "ok") return
-      lastAnswer = `HTTP ${response.status} ${body.slice(0, 80)}`
+      // The body is the preview proxy's, not ours: an error page that echoes
+      // the request URI would otherwise quote the live `pt_token` back at us.
+      lastAnswer = redactPreviewToken(
+        `HTTP ${response.status} ${body.slice(0, 80)}`,
+      )
     } catch (error) {
       // The port is not routable yet; the retry below is the whole mechanism.
-      lastAnswer = String(error)
+      lastAnswer = redactPreviewToken(String(error))
     }
     if (Date.now() >= deadline) {
       throw new HandraiseError(
@@ -267,8 +293,8 @@ export async function startRelay(
   let killed = false
   const kill = async (): Promise<void> => {
     if (killed) return
-    // Throws `relay_kill_failed` if it cannot: the caller must not believe the
-    // relay is gone when it is not.
+    // Throws if it cannot: the caller must not believe the relay is gone when
+    // it is not. Both callers log it as `relay_release_failed`.
     await killSandbox(sandbox)
     killed = true
   }

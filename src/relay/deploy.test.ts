@@ -20,7 +20,13 @@ import {
 
 import { isHandraiseError } from "../errors"
 import { noopLogger } from "../logger"
-import { createSandbox, killSandbox, startRelay, waitForHealth } from "./deploy"
+import {
+  createSandbox,
+  killSandbox,
+  redactPreviewToken,
+  startRelay,
+  waitForHealth,
+} from "./deploy"
 
 /** A port on which nothing listens, so no test here can reach a live gateway. */
 const CLOSED_PORT = "http://127.0.0.1:1"
@@ -57,6 +63,16 @@ async function causeNameOf(run: Promise<unknown>): Promise<string> {
   }
 }
 
+/** The message `run` rejects with, whatever class it is. */
+async function messageOf(run: Promise<unknown>): Promise<string> {
+  try {
+    await run
+    return "nothing was thrown"
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
+
 /**
  * A gateway that answers `POST /sandboxes` the way the real one does when the
  * account is at its session cap: 429 with `code: "ConcurrencyLimitExceeded"`,
@@ -81,22 +97,45 @@ async function startBusyGateway(): Promise<{ url: string; server: Server }> {
   return { url: `http://127.0.0.1:${port}`, server }
 }
 
+/**
+ * A preview proxy that refuses the request and quotes the request line back —
+ * what several proxies do by default on a 401 or a 404, and the one path on
+ * which a live `pt_token` could reach an error message.
+ */
+async function startEchoingProxy(): Promise<{ url: string; server: Server }> {
+  const server = createServer((request, response) => {
+    response.writeHead(401, { "content-type": "text/plain" })
+    response.end(`Not authorised for GET ${request.url}`)
+  })
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve())
+  })
+  // SAFETY: as above — a TCP listener never has a string address.
+  const { port } = server.address() as AddressInfo
+  return { url: `http://127.0.0.1:${port}`, server }
+}
+
 test("a gateway at its session cap becomes concurrency_limit, not a raw 429", async () => {
   const gateway = await startBusyGateway()
-  const client = new SolariClient({
-    apiKey: "not-a-real-key",
-    baseUrl: gateway.url,
-  })
+  try {
+    const client = new SolariClient({
+      apiKey: "not-a-real-key",
+      baseUrl: gateway.url,
+    })
 
-  // One attempt: the shipped budget of six exists to wait out a busy account,
-  // and waiting it out here would only prove that `setTimeout` works.
-  const creating = createSandbox(client, 60_000, 1)
+    // One attempt: the shipped budget of six exists to wait out a busy
+    // account, and waiting it out here would only prove `setTimeout` works.
+    const creating = createSandbox(client, 60_000, 1)
 
-  expect(await codeOf(creating)).toBe("concurrency_limit")
-  // The SDK's own error is kept, so a caller that wants the HTTP status still
-  // has it.
-  expect(await causeNameOf(creating)).toBe(ConcurrencyLimitError.name)
-  gateway.server.close()
+    expect(await codeOf(creating)).toBe("concurrency_limit")
+    // The SDK's own error is kept, so a caller that wants the HTTP status
+    // still has it.
+    expect(await causeNameOf(creating)).toBe(ConcurrencyLimitError.name)
+  } finally {
+    // In a `finally`: a failed expectation above must not leave a listening
+    // socket behind for the rest of the run.
+    gateway.server.close()
+  }
 })
 
 test("a gateway that cannot be reached at all becomes relay_start_failed", async () => {
@@ -122,7 +161,7 @@ test("a public URL that never answers becomes relay_not_ready", async () => {
   expect(await codeOf(waiting)).toBe("relay_not_ready")
 })
 
-test("a relay sandbox that will not die becomes relay_kill_failed", async () => {
+test("a relay sandbox that will not die is surfaced, not swallowed", async () => {
   let attempts = 0
   const stubborn: Pick<Sandbox, "kill"> = {
     kill: async () => {
@@ -135,9 +174,13 @@ test("a relay sandbox that will not die becomes relay_kill_failed", async () => 
   // test, not the backoff.
   const killing = killSandbox(stubborn, 2)
 
-  expect(await codeOf(killing)).toBe("relay_kill_failed")
+  // Deliberately not a coded error: both callers catch this and log
+  // `relay_release_failed`, so it can never reach a `catch` around
+  // `raiseHand`, and a code nobody can branch on would be dead API surface.
+  await expect(killing).rejects.toThrow(/could not destroy the relay sandbox/)
+  expect(await codeOf(killing)).toStartWith("not a HandraiseError")
   expect(attempts).toBe(2)
-  expect(await causeNameOf(killing)).toBe(GatewayError.name)
+  expect(await causeNameOf(killing)).toStartWith("not a HandraiseError")
 })
 
 test("a sandbox that is already gone is not a failure", async () => {
@@ -150,4 +193,53 @@ test("a sandbox that is already gone is not a failure", async () => {
   }
 
   expect(await codeOf(killSandbox(vanished, 4))).toBe("nothing was thrown")
+})
+
+/** A token shaped like the real thing, long enough to be unmistakable in a diff. */
+const FAKE_TOKEN = `pt_${"a1b2c3d4".repeat(8)}`
+
+test("a proxy that echoes the request URI cannot leak the preview token", async () => {
+  // Every URL handraise polls carries `?pt_token=…`, a live bearer credential
+  // with an hour of life on it. This body is the one place a proxy's own text
+  // reaches an exception message — and exception messages get logged.
+  const proxy = await startEchoingProxy()
+  try {
+    const waiting = waitForHealth(
+      `${proxy.url}/healthz?pt_token=${FAKE_TOKEN}&role=human`,
+      200,
+    )
+
+    expect(await codeOf(waiting)).toBe("relay_not_ready")
+    const message = await messageOf(waiting)
+    expect(message).not.toContain(FAKE_TOKEN)
+    expect(message).toContain("pt_token=[redacted]")
+    // The status is still there: it is the difference between "not routable
+    // yet" and "the token is wrong".
+    expect(message).toContain("HTTP 401")
+  } finally {
+    proxy.server.close()
+  }
+})
+
+test("redaction survives the shapes a token can appear in", () => {
+  expect(redactPreviewToken(`?pt_token=${FAKE_TOKEN}`)).toBe(
+    "?pt_token=[redacted]",
+  )
+  // Followed by another parameter, inside quotes, and inside a URL in prose —
+  // the three ways a proxy body or an SDK message carries one.
+  expect(redactPreviewToken(`?pt_token=${FAKE_TOKEN}&role=human`)).toBe(
+    "?pt_token=[redacted]&role=human",
+  )
+  expect(redactPreviewToken(`GET "/?pt_token=${FAKE_TOKEN}" failed`)).toBe(
+    'GET "/?pt_token=[redacted]" failed',
+  )
+  expect(
+    redactPreviewToken(
+      `fetch https://x.preview.getsolari.com/?pt_token=${FAKE_TOKEN} failed`,
+    ),
+  ).toBe("fetch https://x.preview.getsolari.com/?pt_token=[redacted] failed")
+  // Nothing else is touched.
+  expect(redactPreviewToken("HTTP 502 upstream closed")).toBe(
+    "HTTP 502 upstream closed",
+  )
 })

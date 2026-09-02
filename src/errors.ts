@@ -32,8 +32,11 @@
  * - `concurrency_limit` — the Solari account is at its concurrent session cap
  *   (HTTP 429). The one relay failure that is worth retrying later.
  * - `relay_not_ready` — the sandbox started but its public URL never answered.
- * - `relay_kill_failed` — the relay sandbox survived every attempt to destroy
- *   it, so its public URL stays reachable until the idle timeout.
+ *
+ * There is deliberately no code for a relay sandbox that survives its own
+ * teardown: `raiseHand` catches that one, logs `relay_release_failed` and
+ * returns the outcome, because by then the human has already answered. Every
+ * code above is one a caller can actually catch.
  */
 export type HandraiseErrorCode =
   | "missing_api_key"
@@ -43,7 +46,6 @@ export type HandraiseErrorCode =
   | "relay_start_failed"
   | "concurrency_limit"
   | "relay_not_ready"
-  | "relay_kill_failed"
 
 /**
  * Everything handraise throws on purpose. `cause` carries the original SDK,

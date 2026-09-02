@@ -26,7 +26,12 @@ import type {
 import type { HandoffEvent } from "../events"
 import { type Logger, noopLogger } from "../logger"
 import type { RelayMessage } from "../relay/protocol"
-import type { HandoffMode, RaiseHandOptions, StorageState } from "../types"
+import type {
+  HandoffMode,
+  HandoffResult,
+  RaiseHandOptions,
+  StorageState,
+} from "../types"
 import { raiseHand, runHandoff } from "./raise-hand"
 import type { ScreencastFrame } from "./screencast"
 
@@ -224,6 +229,8 @@ function fakePage(
   let page: Page
   const pagePartial: Partial<Page> = {
     context: () => context,
+    // A live page, which is what `raiseHand` checks before it starts anything.
+    isClosed: () => false,
     // SAFETY: approval mode calls screenshot() for its one frame and reads the
     // viewport for that frame's metadata; neither result is used as anything else.
     screenshot: (async () => {
@@ -622,30 +629,70 @@ test("a handoff without an API key is refused, with a code", async () => {
   })
 })
 
-test("a page whose browser is gone is refused before a sandbox is created", async () => {
-  // The page died between the agent's last step and its call for help — a
-  // Solari session's ~10-minute hard lifetime makes this ordinary. Starting a
-  // relay for it would spend a sandbox and a person's attention on a session
-  // nobody can drive.
-  const dead: Partial<Page> = {
-    context: () => {
+/** Ask for a handoff on `page`, against a gateway that cannot answer. */
+function askOn(page: Page): Promise<HandoffResult> {
+  return raiseHand(page, {
+    reason: "Aurora Bank is asking for a 2FA code",
+    apiKey: "not-a-real-key",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+}
+
+/**
+ * A page with exactly what the pre-flight guard reads, and modelled on what a
+ * real Playwright page does: `context()` keeps answering on a closed page (it
+ * is a field read), so `isClosed()` is the only thing that can report one.
+ */
+function pageThatIs(closed: boolean, connected: boolean): Page {
+  const browserPartial: Partial<Browser> = { isConnected: () => connected }
+  const contextPartial: Partial<BrowserContext> = {
+    // SAFETY: the guard reads only `browser()` off the context.
+    browser: () => browserPartial as Browser,
+  }
+  const pagePartial: Partial<Page> = {
+    isClosed: () => closed,
+    // SAFETY: the guard reads only `context().browser()` on the page.
+    context: () => contextPartial as BrowserContext,
+  }
+  // SAFETY: the guard touches `isClosed` and `context` and nothing else; it
+  // refuses before any other member could be reached.
+  return pagePartial as Page
+}
+
+test("a closed page is refused before a sandbox is created", async () => {
+  // The agent closed the page — or its own step raced a `page.close()` —
+  // while the browser is still connected. Starting a relay for it would spend
+  // a sandbox and a person's attention on a page nobody can drive.
+  await expect(askOn(pageThatIs(true, true))).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "browser_unusable",
+  })
+})
+
+test("a page whose state cannot be read at all is refused too", async () => {
+  // Not a Playwright page any more: a stub, a proxy over a dead CDP
+  // connection, a page from a browser object that has been torn down. The
+  // guard may not turn that into an unhandled TypeError.
+  const broken: Partial<Page> = {
+    isClosed: () => {
       throw new Error("Target page, context or browser has been closed")
     },
   }
 
-  const asking = raiseHand(
-    // SAFETY: the refusal under test reads only `context()`, which is the one
-    // member this page has.
-    dead as Page,
-    {
-      reason: "Aurora Bank is asking for a 2FA code",
-      apiKey: "not-a-real-key",
-      baseUrl: CLOSED_PORT,
-      logger: noopLogger,
-    },
-  )
+  // SAFETY: the refusal under test reads only `isClosed()`, which is the one
+  // member this page has.
+  await expect(askOn(broken as Page)).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "browser_unusable",
+  })
+})
 
-  await expect(asking).rejects.toMatchObject({
+test("an open page whose browser has disconnected is refused too", async () => {
+  // The Solari session hit its ~10-minute hard lifetime while the agent was
+  // still working. The page is not closed and `context()` answers — only the
+  // browser is gone, which is the case this guard exists for.
+  await expect(askOn(pageThatIs(false, false))).rejects.toMatchObject({
     name: "HandraiseError",
     code: "browser_unusable",
   })

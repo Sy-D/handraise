@@ -23,11 +23,10 @@ const COVERED_BY = {
   invalid_mode: "handoff.test.ts — an unknown mode is refused",
   empty_action:
     "handoff.test.ts and tool.test.ts — a blank approval action is refused",
-  browser_unusable: "handoff.test.ts — a page whose context is gone is refused",
+  browser_unusable: "handoff.test.ts — a closed or orphaned page is refused",
   relay_start_failed: "deploy.test.ts — an unreachable gateway",
   concurrency_limit: "deploy.test.ts — a gateway at its session cap",
   relay_not_ready: "deploy.test.ts — a public URL that never answers",
-  relay_kill_failed: "deploy.test.ts — a sandbox that will not die",
 } satisfies Record<HandraiseErrorCode, string>
 
 test("every code names the test that triggers it", () => {
