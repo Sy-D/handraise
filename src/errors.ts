@@ -27,7 +27,7 @@
  * - `invalid_mode` — `mode` was neither `"takeover"` nor `"approval"`.
  * - `empty_action` — `mode: "approval"` without a non-empty `action`.
  * - `invalid_option` — an option was present but unusable, which today means
- *   a `humanGoneGraceMs` that is not a finite number of at least 1000 ms.
+ *   a `humanGoneGraceMs` outside 5000–2147483647 ms.
  * - `browser_unusable` — the page is closed, or its browser has disconnected.
  *   Checked before anything is created, from local state only: a Solari
  *   session that has died server-side while the CDP socket is still up looks

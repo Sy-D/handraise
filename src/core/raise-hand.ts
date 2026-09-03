@@ -95,7 +95,9 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647
  * timer, and a handoff somebody answered would be reported as a timeout.
  *
  * Only reached when the news is stale; a live departure always has the whole
- * grace ahead of it.
+ * grace ahead of it. Measured rather than guessed: the relay writes the
+ * presence report and the buffered answer back to back on one socket, and the
+ * gap between them is 0 ms; the floor tolerates 240 ms of it.
  */
 const BACKDATED_GRACE_FLOOR_MS = 250
 
@@ -276,10 +278,19 @@ export function watchPresence(
       // When it happened, not when we heard: `sinceMs` is how stale the news
       // is, and both the timestamp and what is left of the grace are measured
       // from the departure itself.
-      leftMs = Math.max(0, Date.now() - startedAt - sinceMs)
+      //
+      // Clamped to the age of the handoff first. The number is a relay-local
+      // delta, so there is no clock skew between two machines to correct — but
+      // a wall-clock step inside that sandbox would otherwise report an
+      // absence older than the handoff, which arms the floor and ends a
+      // handoff with a human possibly still on it. Nothing that happened
+      // before this handoff started is news about it.
+      const elapsed = Date.now() - startedAt
+      const staleness = Math.min(Math.max(0, sinceMs), elapsed)
+      leftMs = elapsed - staleness
       timer = setTimeout(
         onGone,
-        Math.max(BACKDATED_GRACE_FLOOR_MS, graceMs - sinceMs),
+        Math.max(BACKDATED_GRACE_FLOOR_MS, graceMs - staleness),
       )
     },
     everSeen: () => everSeen,

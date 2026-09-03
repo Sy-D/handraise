@@ -154,8 +154,14 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
   // The ending, while `sendFinal` is waiting for its receipt. A socket can die
   // between the local write and the relay's store, and this connection then
   // reconnects inside the ack window — which is the whole justification for
-  // waiting. The reconnect carries the ending again; the relay stores the same
-  // ending twice without complaint and acks each one.
+  // waiting. The reconnect carries the ending again.
+  //
+  // Sending it twice is expected and safe: the relay's store is an assignment
+  // (`lastEnded = payload`) and it acks each copy, while a second ack outside
+  // an active waiter resolves nothing. A socket that was already down when
+  // `sendFinal` was called takes both routes — the delivery poll and this
+  // re-send — so the phone can be told the same ending twice, which is the
+  // ending it is already showing.
   let pendingEnding: AgentToHuman | null = null
 
   const send = (message: AgentToHuman | Heartbeat): Promise<void> =>

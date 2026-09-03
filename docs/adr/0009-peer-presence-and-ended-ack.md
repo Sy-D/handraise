@@ -40,8 +40,8 @@ messages, both relay→agent, in a new `RelayToAgent` union next to the two peer
 unions in `src/relay/protocol.ts`:
 
 ```jsonc
-{ "type": "presence", "human": true }   // on every connect/replace/close,
-                                        // and once right after an agent connects
+// on every connect/replace/close, and once right after an agent connects
+{ "type": "presence", "human": true, "seen": true, "sinceMs": 0 }
 { "type": "ended_ack" }                 // once `ended` has been stored
 ```
 
@@ -62,8 +62,54 @@ unions in `src/relay/protocol.ts`:
   `endedEarly` so the two kinds of timeout are still distinguishable.
 
 **`sendFinal` waits up to 2 s for `ended_ack`** before `raiseHand` kills the
-sandbox. Without an ack it proceeds exactly as before, and
-`stats().endedAcked` records which of the two happened.
+sandbox, **re-sending the ending on any reconnect inside that window**.
+Without an ack it proceeds exactly as before, and `stats().endedAcked` records
+which of the two happened.
+
+### What the report carries, and why it is not just a boolean
+
+A current state alone loses a whole class of visit. The agent's socket goes
+down — the 60 s proxy cut, a reconnect backoff — and a human opens the link,
+looks at it and closes it again before the agent is back. Both announcements
+find no agent and are dropped, and what the reconnecting agent is then told,
+`human: false`, is also exactly what a link nobody has ever opened says. The
+handoff would wait out the full `timeoutMs` and the event would report that
+nobody came.
+
+So the relay keeps the two facts that survive an outage — has a human ever been
+here (`seen`), and how long the current state has held (`sinceMs`) — and sends
+them with every report. Both are optional on the wire, so an older relay still
+speaks this protocol and an agent that receives neither behaves exactly as it
+did before they existed. The core leaves `never_seen` on `seen`, and runs both
+the grace and `humanLeftMs` from when the human actually left rather than from
+when it heard about it. `sinceMs` is clamped into `[0, handoff age]` first: it
+is a relay-local delta, so there is no clock skew between machines to correct,
+but a wall-clock step inside that sandbox would otherwise describe an absence
+older than the handoff.
+
+**The report goes out before any buffered terminal answer.** The relay already
+holds a `handback` or an `approve` given while the agent was away. An answer
+settles the handoff, and a settled handoff refuses everything it learns
+afterwards — so announced second, a visit that happened during the outage would
+still be reported as a handoff nobody ever opened. Announced first, and a
+backdated grace that is already expired could settle the handoff as `timeout`
+in the same breath, losing a race to the answer one frame behind it. Hence a
+floor of **250 ms** on a backdated grace: the relay writes both frames back to
+back on one socket, measured 0 ms apart, and the floor tolerates 240 ms of
+that gap — three orders of magnitude of margin for a race that is otherwise a
+coin flip on which tick the second frame lands in.
+
+### Why the ending is re-sent, and not merely written once
+
+The two seconds `sendFinal` waits are justified by the connection coming back
+inside them — so it has to carry the ending when it does. A socket that dies
+between the local write and the relay's store would otherwise leave `lastEnded`
+unset with the agent none the wiser: the phone stays on "Reconnecting…" and the
+next viewer of the link is told nothing, which is the failure this ADR exists
+to close. The ending is held for the duration of the wait and re-sent from
+every reconnect until the ack lands. Sending it twice is safe by construction:
+the relay's store is an assignment, it acks each copy, and a second ack outside
+an active waiter resolves nothing.
 
 ## Alternatives
 
@@ -115,7 +161,13 @@ sandbox. Without an ack it proceeds exactly as before, and
   there cancels a grace it may have started while its own socket was down.
 - **The relay's message set is no longer two peers only.** `RelayToAgent` is a
   third direction, and the vocabulary test now spans three unions; the phone
-  never sees either message.
+  never sees either message. Both test harnesses classify relay-originated
+  traffic off that union rather than off a hand-written list, so a third member
+  does not compile until they say what to do with it.
+- **The relay keeps two more facts for the length of a handoff**, and neither
+  is about the page: whether a human has ever connected, and when that last
+  changed. They are the only state that survives an agent outage, and they are
+  scrubbed with the sandbox like everything else.
 - **Everyone already holding the link is told; somebody who arrives after the
   answer still may not be.** The ack fixes the part that was broken — the
   ending is stored and relayed before anything is destroyed, and the live e2e

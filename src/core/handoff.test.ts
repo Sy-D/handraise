@@ -952,6 +952,36 @@ test("a departure the agent only hears about later is counted from when it happe
     })
 })
 
+test("a relay whose clock jumps cannot shorten the grace", async () => {
+  // `sinceMs` is a relay-local delta, so there is no cross-machine skew to
+  // worry about — but a wall-clock step inside the sandbox is still a number
+  // this side has no reason to trust. Staleness can never exceed the age of
+  // the handoff itself, and it is never negative.
+  let gone = 0
+  const forward = watchPresence(2_000, Date.now(), () => {
+    gone += 1
+  })
+  forward.saw(true, true, 0)
+  // The clock jumped forward: the relay reports a departure six minutes ago,
+  // on a handoff that is milliseconds old.
+  forward.saw(false, true, 500_000)
+  expect(forward.leftMs() ?? -1).toBeGreaterThanOrEqual(0)
+  expect(forward.leftMs() ?? -1).toBeLessThan(200)
+
+  // And backwards, which would otherwise write a departure in the future.
+  const backward = watchPresence(2_000, Date.now(), () => undefined)
+  backward.saw(true, true, 0)
+  backward.saw(false, true, -60_000)
+  expect(backward.leftMs() ?? -1).toBeGreaterThanOrEqual(0)
+  expect(backward.leftMs() ?? -1).toBeLessThan(200)
+
+  // The full grace, not the 250 ms floor a backdated report is armed with.
+  await Bun.sleep(500)
+  expect(gone).toBe(0)
+  await Bun.sleep(1_800)
+  expect(gone).toBe(1)
+}, 15000)
+
 test("a whole visit during an agent outage still counts, and the grace runs from the real departure", async () => {
   const port = await startRelayProcess()
   const cdp = fakeCdp()

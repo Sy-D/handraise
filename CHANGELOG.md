@@ -66,7 +66,9 @@ and the rejected alternatives.
   hold the door open. Against a relay that cannot answer, teardown proceeds
   exactly as before.
 - **`invalid_option`**, an eighth `HandraiseErrorCode`. Today it is a
-  `humanGoneGraceMs` that is not a finite number of at least 1000 ms. Checked
+  `humanGoneGraceMs` outside 5 000–2 147 483 647 ms — below the floor the
+  phone's own reconnect would end handoffs, and above the ceiling a Node timer
+  collapses to one millisecond. Checked
   before any sandbox exists, like the mode checks, and refused rather than
   clamped: a caller who asks for a 10 ms grace has misunderstood the option,
   and silently substituting a minute would hide that until a handoff ended on a
