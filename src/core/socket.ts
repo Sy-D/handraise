@@ -52,12 +52,17 @@ export interface RelayConnectionOptions {
   /** Called on every successful connect, including reconnects. */
   onOpen?: () => void
   /**
-   * Called with whether a human is connected to the relay: once shortly after
-   * every connect, and then on every change. The relay is the only party that
-   * can see the phone's socket — it answers the heartbeats itself — so this is
-   * the sole signal that a tab was closed.
+   * Called with what the relay knows about the human: whether one is connected
+   * now, whether one ever was, and how old that news is in ms. Once shortly
+   * after every connect, and then on every change. The relay is the only party
+   * that can see the phone's socket — it answers the heartbeats itself — so
+   * this is the sole signal that a tab was closed.
+   *
+   * `seen` and `sinceMs` are normalised here: a relay too old to send them
+   * reports the current state as everything it knows, which is what this
+   * callback did before they existed.
    */
-  onPresence?: (human: boolean) => void
+  onPresence?: (human: boolean, seen: boolean, sinceMs: number) => void
   /** Heartbeat period. Defaults to the protocol's 20 s. */
   heartbeatMs?: number
 }
@@ -136,8 +141,13 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
   // Set while `sendFinal` is waiting for the receipt, and called by the
   // `ended_ack` branch of `handle`. Null at every other moment, so a stray ack
   // — a relay that answers twice, a reconnect that replays one — resolves
-  // nothing.
+  // nothing but is still latched below.
   let acknowledgeEnded: (() => void) | null = null
+  // The latch. Set the moment an ack arrives, waiter or no waiter: on a fast
+  // link the relay can store the ending and answer before the local send
+  // callback has resumed `sendFinal`, and an ack that fell into that gap used
+  // to be thrown away — teardown then waited its full two seconds and called
+  // an ending the relay was holding unacknowledged.
   let endedAcked = false
 
   const send = (message: AgentToHuman | Heartbeat): Promise<void> =>
@@ -178,6 +188,10 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
   /** Wait for `ended_ack`, or for the ack deadline, whichever comes first. */
   const waitForAck = (): Promise<void> =>
     new Promise<void>((resolve) => {
+      if (endedAcked) {
+        resolve()
+        return
+      }
       const giveUp = setTimeout(() => {
         acknowledgeEnded = null
         resolve()
@@ -185,7 +199,6 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       acknowledgeEnded = () => {
         clearTimeout(giveUp)
         acknowledgeEnded = null
-        endedAcked = true
         resolve()
       }
     })
@@ -208,9 +221,16 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
         // the phone closes its socket the instant it renders the ending, so
         // the last thing this connection hears is a departure from a handoff
         // that is already over. The core refuses it too (`watchPresence.stop`).
-        if (!shuttingDown) options.onPresence?.(message.human)
+        if (!shuttingDown) {
+          options.onPresence?.(
+            message.human,
+            message.seen ?? message.human,
+            message.sinceMs ?? 0,
+          )
+        }
         return
       case "ended_ack":
+        endedAcked = true
         acknowledgeEnded?.()
         return
       case "tap":

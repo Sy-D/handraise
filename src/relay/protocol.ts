@@ -147,7 +147,26 @@ export type HumanToAgent =
  * that a second viewer of the link regularly lost.
  */
 export type RelayToAgent =
-  | { type: "presence"; human: boolean }
+  | {
+      type: "presence"
+      /** Whether a human socket is connected to the relay right now. */
+      human: boolean
+      /**
+       * Whether one ever was. Optional so an older relay still speaks this
+       * protocol; absent means "this relay cannot say", and the agent falls
+       * back to `human`. It exists because a whole visit can begin and end
+       * while the agent's own socket is down, and a bare current state cannot
+       * carry an absence that started and finished in that gap.
+       */
+      seen?: boolean
+      /**
+       * How long the relay has been in this state, in ms. Zero on a live
+       * change; on the report a reconnecting agent gets, it is how stale the
+       * news is — which is what lets the agent run the grace from when the
+       * human actually left rather than from when it heard about it.
+       */
+      sinceMs?: number
+    }
   | { type: "ended_ack" }
 
 /**

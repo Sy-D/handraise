@@ -432,6 +432,43 @@ test("a relay that is gone costs the close grace, and not an ack on top of it", 
   expect(waited).toBeLessThan(CLOSE_GRACE_MS + 500)
 }, 15000)
 
+test("an acknowledgement that lands before sendFinal is waiting still counts", async () => {
+  // A relay on a fast link can store the ending and answer before the local
+  // send callback has even resumed the caller. The receipt was armed after
+  // that callback, so the answer fell into a gap: teardown then waited its
+  // full two seconds and reported the ending as unacknowledged — while the
+  // relay had it. This relay acks exactly once, so a second `ended` cannot
+  // paper over the gap.
+  const fake = await startFakeRelay()
+  const connection = track(
+    connectRelay({
+      url: `ws://127.0.0.1:${fake.port}/ws?role=agent`,
+      onMessage: () => undefined,
+      heartbeatMs: 60_000,
+    }),
+  )
+  await until("the socket to open", () => connection.isOpen())
+  const relaySocket = fake.sockets[0]
+  if (!relaySocket) throw new Error("the fake relay accepted no socket")
+  let acks = 0
+  relaySocket.on("message", () => {
+    if (acks > 0) return
+    acks += 1
+    relaySocket.send(JSON.stringify({ type: "ended_ack" }))
+  })
+
+  await connection.send({ type: "ended", outcome: "approved" })
+  await until("the relay to answer", () => acks === 1)
+  await Bun.sleep(100)
+
+  const startedAt = Date.now()
+  await connection.sendFinal({ type: "ended", outcome: "approved" })
+  const waited = Date.now() - startedAt
+
+  expect(connection.stats().endedAcked).toBe(true)
+  expect(waited).toBeLessThan(500)
+}, 15000)
+
 test("close() ends the handoff and stops reconnecting", async () => {
   const fake = await startFakeRelay()
   let opens = 0

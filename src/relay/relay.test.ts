@@ -59,6 +59,8 @@ interface Client {
    * on a forwarded message that happened to look right.
    */
   fromRelay(): Promise<RelayMessage>
+  /** Every message type this socket has seen, in the order it arrived. */
+  order: string[]
   closed: Promise<number>
   socket: WebSocket
 }
@@ -151,9 +153,11 @@ async function connect(port: number, role: "agent" | "human"): Promise<Client> {
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=${role}`)
   const routed = mailbox()
   const own = mailbox()
+  const order: string[] = []
 
   socket.on("message", (raw: Buffer) => {
     const message = parse(raw.toString("utf8"))
+    order.push(message.type)
     if (RELAY_ORIGINATED.has(message.type)) own.deliver(message)
     else routed.deliver(message)
   })
@@ -175,6 +179,7 @@ async function connect(port: number, role: "agent" | "human"): Promise<Client> {
     },
     next: () => routed.next(`message for role=${role}`),
     fromRelay: () => own.next(`relay message for role=${role}`),
+    order,
   }
 }
 
@@ -545,13 +550,22 @@ test("the agent is told when the human arrives and when they leave", async () =>
   const agent = await connect(relay.port, "agent")
   // Nobody has scanned the code yet, and the agent is told exactly that: the
   // first presence is the current state, not the first change.
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: false })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
 
   const human = await connect(relay.port, "human")
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: true })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: true,
+  })
 
   human.socket.close()
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: false })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
 })
 
 test("an agent that connects while the human is there is told so at once", async () => {
@@ -559,36 +573,60 @@ test("an agent that connects while the human is there is told so at once", async
   // The human scanned the QR code before the agent's socket was up, which is
   // the ordinary race on a fast phone.
   const agent = await connect(relay.port, "agent")
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: true })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: true,
+  })
 
   // And a reconnecting agent — the 60 s proxy cut — starts from the truth
   // rather than from what it believed before the cut.
   agent.socket.close()
   await waitForLog(relay, "peer closed", { role: "agent" })
   const second = await connect(relay.port, "agent")
-  expect(await second.fromRelay()).toEqual({ type: "presence", human: true })
+  expect(await second.fromRelay()).toMatchObject({
+    type: "presence",
+    human: true,
+  })
   human.socket.close()
-  expect(await second.fromRelay()).toEqual({ type: "presence", human: false })
+  expect(await second.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
 })
 
 test("a phone replaced by a second one is a leave and a join, not silence", async () => {
   const agent = await connect(relay.port, "agent")
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: false })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
   const first = await connect(relay.port, "human")
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: true })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: true,
+  })
 
   // A second holder of the link opens it; the relay keeps one human socket, so
   // the first is closed. The agent must not be left believing nobody is there.
   await connect(relay.port, "human")
   expect(await first.closed).toBeGreaterThan(0)
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: false })
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: true })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: true,
+  })
 })
 
 test("presence is for the agent only and is never sent to the phone", async () => {
   const agent = await connect(relay.port, "agent")
   const human = await connect(relay.port, "human")
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: false })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
 
   agent.send({ type: "state", reason: "the first thing the phone hears" })
   expect(await human.next()).toEqual({
@@ -599,9 +637,15 @@ test("presence is for the agent only and is never sent to the phone", async () =
 
 test("the relay acknowledges the ending once it has stored it", async () => {
   const agent = await connect(relay.port, "agent")
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: false })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
   const human = await connect(relay.port, "human")
-  expect(await agent.fromRelay()).toEqual({ type: "presence", human: true })
+  expect(await agent.fromRelay()).toMatchObject({
+    type: "presence",
+    human: true,
+  })
 
   agent.send({ type: "ended", outcome: "approved" })
   expect(await agent.fromRelay()).toEqual({ type: "ended_ack" })
@@ -619,9 +663,74 @@ test("an agent that reconnects before sending the ending is acknowledged too", a
   await waitForLog(relay, "peer closed", { role: "agent" })
 
   const second = await connect(relay.port, "agent")
-  expect(await second.fromRelay()).toEqual({ type: "presence", human: false })
+  expect(await second.fromRelay()).toMatchObject({
+    type: "presence",
+    human: false,
+  })
   second.send({ type: "ended", outcome: "timeout" })
   expect(await second.fromRelay()).toEqual({ type: "ended_ack" })
+})
+
+test("a whole visit that happened while the agent was away is still reported", async () => {
+  const first = await connect(relay.port, "agent")
+  expect(await first.fromRelay()).toEqual({
+    type: "presence",
+    human: false,
+    seen: false,
+    sinceMs: expect.any(Number),
+  })
+  first.socket.close()
+  await waitForLog(relay, "peer closed", { role: "agent" })
+
+  // The whole visit happens with nobody listening: a human opens the link,
+  // looks at a dead handoff and closes it again. A bare current state cannot
+  // carry this — both announcements are dropped, and "nobody is here" is what
+  // an unopened link says too.
+  const human = await connect(relay.port, "human")
+  human.socket.close()
+  await waitForLog(relay, "peer closed", { role: "human" })
+  await Bun.sleep(300)
+
+  const second = await connect(relay.port, "agent")
+  const report = await second.fromRelay()
+  expect(report).toMatchObject({ type: "presence", human: false, seen: true })
+  // And how stale the news is, so the agent can run its grace from when the
+  // human actually left rather than from when it heard about it.
+  const sinceMs = report.type === "presence" ? (report.sinceMs ?? -1) : -1
+  expect(sinceMs).toBeGreaterThanOrEqual(250)
+  expect(sinceMs).toBeLessThan(5_000)
+})
+
+test("the reconnecting agent hears the presence before the answer it was holding", async () => {
+  const first = await connect(relay.port, "agent")
+  await first.fromRelay()
+  first.socket.close()
+  await waitForLog(relay, "peer closed", { role: "agent" })
+
+  const human = await connect(relay.port, "human")
+  human.send({ type: "handback" })
+  await Bun.sleep(50)
+  human.socket.close()
+  await waitForLog(relay, "peer closed", { role: "human" })
+
+  const second = await connect(relay.port, "agent")
+  expect(await second.next()).toEqual({ type: "handback" })
+  // Order, not just arrival: the answer settles the handoff, and everything
+  // the agent learns after that is refused. If the presence came second, the
+  // event would report a handoff nobody ever opened.
+  expect(second.order).toEqual(["presence", "handback"])
+})
+
+test("a live presence change is fresh news, not stale", async () => {
+  const agent = await connect(relay.port, "agent")
+  await agent.fromRelay()
+  await connect(relay.port, "human")
+  const arrival = await agent.fromRelay()
+
+  expect(arrival).toMatchObject({ type: "presence", human: true, seen: true })
+  const sinceMs = arrival.type === "presence" ? (arrival.sinceMs ?? -1) : -1
+  expect(sinceMs).toBeGreaterThanOrEqual(0)
+  expect(sinceMs).toBeLessThan(250)
 })
 
 // --- B1: a terminal human message survives an agent reconnect --------------

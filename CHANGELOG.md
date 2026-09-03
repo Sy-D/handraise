@@ -50,6 +50,13 @@ and the rejected alternatives.
   apart: `endedEarly: true` is somebody who came and left; `humanSeen: false`
   is a link that never reached anyone. Two different problems, two different
   fixes.
+- **The presence report carries what an absent agent missed**: `seen` (has a
+  human ever been here) and `sinceMs` (how old this news is), both optional so
+  an older relay still speaks the protocol. A whole visit can begin and end
+  while the agent's socket is down — the proxy's 60 s cut, a reconnect backoff
+  — and a bare current state cannot tell that apart from a link nobody ever
+  opened. The agent uses `sinceMs` to run the grace from the moment the human
+  actually left rather than from the moment it heard about it.
 - **`{ "type": "ended_ack" }` from the relay**, sent once it has stored the
   ending for whoever opens the link next. `sendFinal` waits up to 2 s for it
   before `raiseHand` destroys the sandbox. Without it the ending was written to
@@ -85,6 +92,10 @@ and the rejected alternatives.
   unions in step now spans all three.
 - **`RelayConnectionStats` carries `endedAcked`** (internal to the package),
   and `raiseHand` logs one `ended_ack` line with it and the wait it cost.
+- **`HandoffResult.durationMs` is frozen at settlement**, the same number the
+  wide event has always carried. It used to be measured after teardown, so the
+  ending's receipt, the CDP detach and the relay's destruction were counted as
+  time the human took. Nobody waited for those.
 
 ## [0.6.0] - 2026-09-02
 

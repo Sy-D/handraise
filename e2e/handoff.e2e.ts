@@ -784,6 +784,10 @@ try {
     "the wide event says a human was there",
   )
   check(
+    abandonedResult.durationMs === presenceEvent?.durationMs,
+    `the result reports the time the human took, not the teardown after it (${abandonedResult.durationMs}ms vs ${presenceEvent?.durationMs}ms)`,
+  )
+  check(
     presenceEvent?.endedEarly === true,
     "the wide event says the handoff ended early",
   )

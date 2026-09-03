@@ -73,6 +73,29 @@ const DEFAULT_HUMAN_GONE_GRACE_MS = 60_000
 const MIN_HUMAN_GONE_GRACE_MS = 1_000
 
 /**
+ * The largest delay a Node timer holds. One millisecond more and it fires
+ * immediately (the value is truncated to a signed 32-bit integer), so a
+ * caller asking for a three-week grace would get one that ends the handoff on
+ * the first blink. Refused rather than silently honoured as 1 ms.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+/**
+ * The shortest grace a *backdated* absence is ever armed with.
+ *
+ * A reconnecting agent is told the presence state first and handed whatever
+ * the relay buffered for it second — the handback the human gave while the
+ * socket was down, typically. Those are separate frames and therefore possibly
+ * separate ticks, so an absence that is already past its grace must not settle
+ * in the same breath as the reconnect: the answer would lose a race with a
+ * timer, and a handoff somebody answered would be reported as a timeout.
+ *
+ * Only reached when the news is stale; a live departure always has the whole
+ * grace ahead of it.
+ */
+const BACKDATED_GRACE_FLOOR_MS = 250
+
+/**
  * Cap on the `storageState()` capture. It is a CDP round trip, and the Solari
  * browser session may die in the very same instant the human hands back, which
  * would leave the call hanging and `raiseHand` never returning — holding the
@@ -177,8 +200,11 @@ type Presence = "never_seen" | "present" | "gone"
 
 /** The presence state machine of one handoff. */
 interface PresenceWatch {
-  /** Feed it the relay's `presence` message. */
-  saw(human: boolean): void
+  /**
+   * Feed it the relay's `presence` message: the current state, whether a human
+   * was ever there, and how old that news is.
+   */
+  saw(human: boolean, seen: boolean, sinceMs: number): void
   /** Whether a human was ever connected. */
   everSeen(): boolean
   /** When the human last disappeared, in ms since the handoff started. */
@@ -214,7 +240,7 @@ export function watchPresence(
   onGone: () => void,
 ): PresenceWatch {
   let presence: Presence = "never_seen"
-  let seen = false
+  let everSeen = false
   let leftMs: number | undefined
   let timer: ReturnType<typeof setTimeout> | null = null
   let stopped = false
@@ -225,22 +251,34 @@ export function watchPresence(
   }
 
   return {
-    saw(human) {
+    saw(human, seen, sinceMs) {
       if (stopped) return
+      if (seen) everSeen = true
       if (human) {
-        seen = true
+        everSeen = true
         presence = "present"
         clear()
         return
       }
-      // A departure only means something after an arrival, and only the first
-      // one starts the clock.
-      if (presence !== "present") return
+      // A departure only means something after an arrival — but the arrival
+      // does not have to be one this agent saw. A whole visit can begin and
+      // end while the agent's socket is down, and the relay reports that as
+      // "nobody here, somebody was, this long ago".
+      if (!everSeen) return
+      // Only the first report starts the clock. A reconnecting agent is told
+      // the state afresh, and that says nothing new about the human.
+      if (presence === "gone") return
       presence = "gone"
-      leftMs = Date.now() - startedAt
-      timer = setTimeout(onGone, graceMs)
+      // When it happened, not when we heard: `sinceMs` is how stale the news
+      // is, and both the timestamp and what is left of the grace are measured
+      // from the departure itself.
+      leftMs = Math.max(0, Date.now() - startedAt - sinceMs)
+      timer = setTimeout(
+        onGone,
+        Math.max(BACKDATED_GRACE_FLOOR_MS, graceMs - sinceMs),
+      )
     },
-    everSeen: () => seen,
+    everSeen: () => everSeen,
     leftMs: () => leftMs,
     stop() {
       stopped = true
@@ -251,6 +289,13 @@ export function watchPresence(
 
 interface HandoffEnd {
   outcome: HandoffOutcome
+  /**
+   * How long the human had, frozen at settlement — the same number the wide
+   * event carries. Teardown happens after it: the ending's receipt, the CDP
+   * detach, the socket close. None of that is time anybody waited for a human,
+   * and before this was returned the caller's `durationMs` included it.
+   */
+  durationMs: number
   storageState?: StorageState
 }
 
@@ -485,11 +530,13 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   const refreshFocus = (): void => {
     // One probe at a time. A fast typist would otherwise queue a CDP round
     // trip per keystroke, all of them answering the same question.
-    if (probing || terminal) return
+    if (probing || terminal || over) return
     probing = true
     void probeFocus(page)
       .then((focus) => {
-        if (terminal) return
+        // A probe is a CDP round trip, so the handoff can settle while one is
+        // in flight; nothing about the page may go on the wire after that.
+        if (terminal || over) return
         const json = JSON.stringify(focus)
         if (json === lastFocusJson) return
         lastFocusJson = json
@@ -563,6 +610,13 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   }
 
   const onHuman = (message: HumanToAgent): void => {
+    // Nothing the human sends means anything once this is over, and one of
+    // them would still do something: the relay goes on routing until the agent
+    // socket closes, and teardown can wait seconds — on a QR scan in flight,
+    // on the ending's receipt — with a live input path behind it. The `answer`
+    // that ends a handoff is refused here too; `answerHandoff` refused it
+    // anyway, and "first answer wins" is the relay's rule as well.
+    if (over) return
     const ending = endingFor(mode, message.type)
     if (ending) {
       answerHandoff(ending, "relay")
@@ -621,8 +675,8 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     // about the person. Not after the handoff has settled: the phone closes
     // its socket as soon as it is told how this ended, and that is not a human
     // walking away from anything.
-    onPresence: (human) => {
-      if (!over) presence.saw(human)
+    onPresence: (human, seen, sinceMs) => {
+      if (!over) presence.saw(human, seen, sinceMs)
     },
     // The relay replays the last state to a late joiner, but re-sending on
     // every reconnect costs one small message and covers the case where the
@@ -802,8 +856,8 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
   if (firstError !== undefined) event.error = firstError
   emitHandoffEvent(options, logger, event)
 
-  if (storageState === undefined) return { outcome: finalOutcome }
-  return { outcome: finalOutcome, storageState }
+  if (storageState === undefined) return { outcome: finalOutcome, durationMs }
+  return { outcome: finalOutcome, durationMs, storageState }
 }
 
 /** The two modes, as a runtime value. */
@@ -854,10 +908,14 @@ function checkedMode(options: RaiseHandOptions): HandoffMode {
 function checkedGrace(options: RaiseHandOptions): number {
   const grace = options.humanGoneGraceMs
   if (grace === undefined) return DEFAULT_HUMAN_GONE_GRACE_MS
-  if (!Number.isFinite(grace) || grace < MIN_HUMAN_GONE_GRACE_MS) {
+  if (
+    !Number.isFinite(grace) ||
+    grace < MIN_HUMAN_GONE_GRACE_MS ||
+    grace > MAX_TIMER_DELAY_MS
+  ) {
     throw new HandraiseError(
       "invalid_option",
-      `handraise: humanGoneGraceMs must be a finite number of at least ${MIN_HUMAN_GONE_GRACE_MS} ms (got ${String(grace)}). It is how long a handoff keeps waiting after the human's phone disappears, and the preview proxy cuts an idle socket every 60 s — a shorter grace would end handoffs on the reconnect that follows.`,
+      `handraise: humanGoneGraceMs must be a number between ${MIN_HUMAN_GONE_GRACE_MS} and ${MAX_TIMER_DELAY_MS} ms (got ${String(grace)}). It is how long a handoff keeps waiting after the human's phone disappears: below the floor it would end handoffs on the reconnect that follows the proxy's 60 s cut, and above the ceiling a Node timer collapses to one millisecond, which ends them at once.`,
     )
   }
   return grace
@@ -944,9 +1002,8 @@ export async function raiseHand(
   )
 
   const startedAt = Date.now()
-  let endedAt = startedAt
   let webhook: Promise<void> = Promise.resolve()
-  let end: HandoffEnd = { outcome: "disconnected" }
+  let end: HandoffEnd = { outcome: "disconnected", durationMs: 0 }
 
   try {
     try {
@@ -996,12 +1053,11 @@ export async function raiseHand(
     })
   } catch (error) {
     // runHandoff does not throw, so this only fires on an unexpected fault; the
-    // handoff event is emitted inside runHandoff, on every ordinary path.
+    // handoff event is emitted inside runHandoff, on every ordinary path. There
+    // is no settlement to report a duration from, so this path measures its own.
     logger.error("handoff_failed", { error: String(error) })
+    end = { outcome: end.outcome, durationMs: Date.now() - startedAt }
   } finally {
-    // Captured before teardown: durationMs is the time the human had, not the
-    // time the sandbox took to shut down afterwards.
-    endedAt = Date.now()
     await webhook
     await relay.kill().catch((error) => {
       logger.error("relay_release_failed", { error: String(error) })
@@ -1010,7 +1066,9 @@ export async function raiseHand(
 
   const result: HandoffResult = {
     outcome: end.outcome,
-    durationMs: endedAt - startedAt,
+    // The handoff's own measurement, not this function's: `endedAt` is taken
+    // after the relay teardown, which is nobody's waiting time.
+    durationMs: end.durationMs,
     url: relay.humanUrl,
   }
   if (end.storageState) result.storageState = end.storageState

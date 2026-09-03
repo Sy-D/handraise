@@ -395,6 +395,7 @@ try {
 | `missing_api_key` | No `options.apiKey` and no `SOLARI_API_KEY`. | Set one; handraise needs it to create the relay sandbox. |
 | `invalid_mode` | `mode` is neither `"takeover"` nor `"approval"`. | Fix the call. TypeScript already refuses it; this is for JavaScript callers. |
 | `empty_action` | `mode: "approval"` without a non-empty `action`. | Name the step the human says yes or no to. |
+| `invalid_option` | An option is present but unusable. Today: `humanGoneGraceMs` outside 1000–2147483647 ms (above that a Node timer collapses to 1 ms). | Fix the value. Refused rather than clamped, because a grace that is silently something else ends handoffs you did not expect to end. |
 | `browser_unusable` | The page is closed, or its browser has disconnected — checked before anything is created. | Open a new page or relaunch the session (restore `storageState` if you kept it) and retry. |
 | `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error, redacted. Retry. Nothing is left behind unless you also see `relay_release_failed` (below). |
 | `concurrency_limit` | Your Solari account is at its concurrent session cap (429). | Free a session, or wait and retry. The one relay failure that is purely temporary. |

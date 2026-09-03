@@ -230,21 +230,51 @@ let lastScanAt = 0
 let announcedHuman = null
 
 /**
- * Tell the agent whether a human is connected, when that has changed.
+ * The presence history an absent agent missed, which is all of it that matters:
+ * whether a human was ever here, and when the state last changed.
+ *
+ * A bare current state is not enough. An agent's socket can be down for
+ * seconds — the proxy's 60 s cut, a reconnect backoff — and a human can open
+ * the link, read the page and close it inside that gap. Both announcements
+ * find no agent and are dropped, and "nobody is here" is also what a link
+ * nobody ever opened says. These two fields are the difference.
+ */
+let humanEverSeen = false
+let humanStateSince = Date.now()
+/** The last state these two were computed against. */
+let lastHumanState = false
+
+/**
+ * Tell the agent what is known about the human, when that has changed.
  *
  * Called on every connect, replace and close of the human socket, and once
  * right after an agent connects. Deduplicated against the last value sent, so
  * a stale socket finishing its close does not report a departure that already
  * happened — but never suppressed for a new agent, whose \`announcedHuman\` is
- * null.
+ * null, and whose report therefore carries the history above.
+ *
+ * The bookkeeping happens before the agent is looked up, because the case this
+ * exists for is the one where there is no agent to tell.
  */
 function announcePresence() {
-  const agent = peers.get("agent")
-  if (!agent) return
   const human = peers.has("human")
-  if (human === announcedHuman) return
+  if (human !== lastHumanState) {
+    lastHumanState = human
+    humanStateSince = Date.now()
+    if (human) humanEverSeen = true
+  }
+  const agent = peers.get("agent")
+  if (!agent || human === announcedHuman) return
   announcedHuman = human
-  sendText(agent, JSON.stringify({ type: MSG.PRESENCE, human }))
+  sendText(
+    agent,
+    JSON.stringify({
+      type: MSG.PRESENCE,
+      human,
+      seen: humanEverSeen,
+      sinceMs: Date.now() - humanStateSince,
+    }),
+  )
 }
 
 /**
@@ -705,17 +735,22 @@ server.on("upgrade", (req, socket, head) => {
     }
   }
 
+  // Whether there is a human on the other side, and what this socket missed.
+  // For a new agent that is the current state plus the history; for a new phone
+  // it is the change the agent has been waiting for.
+  //
+  // Before the buffered answer below, and that order is load-bearing: the
+  // answer settles the handoff, and a settled handoff refuses everything it
+  // learns afterwards. Announced second, a visit that happened during the
+  // outage would be reported as a handoff nobody ever opened.
+  announcePresence()
+
   // A reconnecting agent that missed the human's handback/abort while it was
   // away gets it now, so the handoff resolves instead of falsely timing out.
   if (role === "agent" && pendingForAgent) {
     write(peer, pendingForAgent, OP_TEXT)
     pendingForAgent = null
   }
-
-  // Whether there is a human on the other side. For a new agent this is the
-  // current state; for a new phone it is the change the agent has been waiting
-  // for. Last, so an agent's replay reaches it in the order it was buffered.
-  announcePresence()
 })
 
 // Keeps every hop between the phone, the preview proxy and this process warm.
