@@ -26,7 +26,12 @@ import {
 
 const MAX_BACKOFF_MS = 8_000
 const BASE_BACKOFF_MS = 500
-const CLOSE_GRACE_MS = 2_000
+/**
+ * How long a terminal message waits for a reconnect, and how long `close()`
+ * waits for the close handshake. Exported for the tests that pin what a relay
+ * which is gone for good costs.
+ */
+export const CLOSE_GRACE_MS = 2_000
 
 /**
  * How long `sendFinal` waits for `ended_ack` before it stops caring.
@@ -145,12 +150,13 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       live.send(JSON.stringify(message), () => resolve())
     })
 
-  const deliverFinal = (message: AgentToHuman): Promise<void> =>
-    new Promise<void>((resolve) => {
+  /** Write `message`, waiting out a reconnect. Resolves true if it went out. */
+  const deliverFinal = (message: AgentToHuman): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
       const trySend = (): boolean => {
         const live = socket
         if (!live || live.readyState !== WebSocket.OPEN) return false
-        live.send(JSON.stringify(message), () => resolve())
+        live.send(JSON.stringify(message), () => resolve(true))
         return true
       }
       if (trySend()) return
@@ -159,7 +165,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       // cleanup is never blocked.
       const giveUp = setTimeout(() => {
         clearInterval(poll)
-        resolve()
+        resolve(false)
       }, CLOSE_GRACE_MS)
       const poll = setInterval(() => {
         if (trySend()) {
@@ -185,8 +191,10 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
     })
 
   const sendFinal = async (message: AgentToHuman): Promise<void> => {
-    await deliverFinal(message)
-    await waitForAck()
+    // No receipt for a message that was never written. The relay is gone —
+    // that is the `disconnected` path — and two more seconds of waiting for it
+    // to say so is teardown the caller pays for nothing.
+    if (await deliverFinal(message)) await waitForAck()
   }
 
   const handle = (message: RelayMessage): void => {
@@ -195,9 +203,12 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
         void send({ type: "pong" })
         return
       case "presence":
-        // The relay's own report, not a human message: it is delivered even
-        // after `close()` has been called, because nothing acts on it then.
-        options.onPresence?.(message.human)
+        // The relay's own report, not a human message — and dropped once the
+        // handoff is shutting down, for the same reason a human message is:
+        // the phone closes its socket the instant it renders the ending, so
+        // the last thing this connection hears is a departure from a handoff
+        // that is already over. The core refuses it too (`watchPresence.stop`).
+        if (!shuttingDown) options.onPresence?.(message.human)
         return
       case "ended_ack":
         acknowledgeEnded?.()

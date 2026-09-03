@@ -772,6 +772,10 @@ try {
     `it ended on the absence, not on the wait (${abandonedResult.durationMs}ms of ${PRESENCE_TIMEOUT_MS}ms)`,
   )
   check(
+    timings.endedAfterLeaveMs >= PRESENCE_GRACE_MS,
+    `it waited the grace out first (${timings.endedAfterLeaveMs}ms of ${PRESENCE_GRACE_MS}ms)`,
+  )
+  check(
     timings.endedAfterLeaveMs < PRESENCE_GRACE_MS + 15_000,
     `and it ended within the grace plus teardown (${timings.endedAfterLeaveMs}ms)`,
   )

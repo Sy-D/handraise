@@ -183,7 +183,10 @@ interface PresenceWatch {
   everSeen(): boolean
   /** When the human last disappeared, in ms since the handoff started. */
   leftMs(): number | undefined
-  /** Stop the grace timer. Idempotent, and called on every teardown path. */
+  /**
+   * Stop watching: clear any pending grace, and ignore every later report.
+   * Idempotent, and called on every teardown path.
+   */
   stop(): void
 }
 
@@ -196,8 +199,16 @@ interface PresenceWatch {
  * as anything else would end healthy handoffs. The clock is not restarted
  * either when a second `presence: false` arrives — a reconnecting *agent* is
  * told the state afresh, and that report says nothing new about the human.
+ *
+ * After `stop()` nothing is recorded and nothing is armed. That is not
+ * tidiness: the phone closes its socket the moment it renders the ending, so
+ * the last report of almost every handoff is a departure that arrives while
+ * the agent's own socket is still closing. Acting on it armed a grace-long
+ * timer nobody would ever clear — the process hung for a minute after
+ * `raiseHand` had resolved — and recorded a `humanLeftMs` for a human who was
+ * there to the end.
  */
-function watchPresence(
+export function watchPresence(
   graceMs: number,
   startedAt: number,
   onGone: () => void,
@@ -206,6 +217,7 @@ function watchPresence(
   let seen = false
   let leftMs: number | undefined
   let timer: ReturnType<typeof setTimeout> | null = null
+  let stopped = false
 
   const clear = (): void => {
     if (timer) clearTimeout(timer)
@@ -214,6 +226,7 @@ function watchPresence(
 
   return {
     saw(human) {
+      if (stopped) return
       if (human) {
         seen = true
         presence = "present"
@@ -229,7 +242,10 @@ function watchPresence(
     },
     everSeen: () => seen,
     leftMs: () => leftMs,
-    stop: clear,
+    stop() {
+      stopped = true
+      clear()
+    },
   }
 }
 
@@ -602,8 +618,12 @@ export async function runHandoff(run: HandoffRun): Promise<HandoffEnd> {
     onMessage: onHuman,
     // The relay's own report, and the only way to learn that a tab was closed:
     // it answers the heartbeats itself, so silence on this socket says nothing
-    // about the person.
-    onPresence: (human) => presence.saw(human),
+    // about the person. Not after the handoff has settled: the phone closes
+    // its socket as soon as it is told how this ended, and that is not a human
+    // walking away from anything.
+    onPresence: (human) => {
+      if (!over) presence.saw(human)
+    },
     // The relay replays the last state to a late joiner, but re-sending on
     // every reconnect costs one small message and covers the case where the
     // relay restarted underneath us.

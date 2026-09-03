@@ -117,7 +117,7 @@ sandbox. Without an ack it proceeds exactly as before, and
   answer still may not be.** The ack fixes the part that was broken — the
   ending is stored and relayed before anything is destroyed, and the live e2e
   asserts it against a viewer who is watching when a channel answers and is
-  told 254 ms later. It does not make the link outlive the handoff: measured in
+  told 306 ms later. It does not make the link outlive the handoff: measured in
   the same run, the preview URL stops serving about a second after an approval
   is answered, and a fresh HTTPS plus WebSocket handshake from Germany to
   us-west costs about as much again, so a viewer who starts opening the link

@@ -67,9 +67,15 @@ export interface HandoffEvent {
    */
   humanSeen: boolean
   /**
-   * When the human's phone last disappeared, in ms since the handoff started.
-   * Absent while one was connected at the end, and on a handoff nobody opened.
-   * A reconnect overwrites it, so it is the last departure, not the first.
+   * When the human's phone last disappeared while the handoff was running, in
+   * ms since it started — whether or not the phone came back.
+   *
+   * A reconnect overwrites it, so it is the last departure and not the first,
+   * and a `resolved` handoff can carry one: the socket dropped at the 60 s
+   * proxy cut, came back a second later, and the human handed back. It is
+   * absent on a handoff nobody opened and on one whose phone never dropped,
+   * and a departure after the handoff has ended is not recorded at all.
+   * `endedEarly` is the field that says the human was gone at the end.
    */
   humanLeftMs?: number
   /**

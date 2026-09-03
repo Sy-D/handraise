@@ -63,12 +63,18 @@ and the rejected alternatives.
   clamped: a caller who asks for a 10 ms grace has misunderstood the option,
   and silently substituting a minute would hide that until a handoff ended on a
   network blip in production.
-- **A live e2e case for each half.** A scripted human opens the handoff, waits
-  for a frame and closes the socket without answering — the run asserts the
-  handoff ends on the absence rather than on the wait, with `endedEarly: true`.
-  And in both approval rounds, a second viewer opens the same link right after
-  the answer and is now *asserted* to be told how it ended; that was a logged
-  observation before, and the observation was that they saw nothing.
+- **A live e2e case for each half.** A scripted human opens the handoff and
+  closes the socket without answering — the run asserts the handoff ends on the
+  absence rather than on the wait, after the grace, with `endedEarly: true`.
+  For the ending, two assertions that used to be a log line: the answering
+  phone is told over the wire in both approval rounds, and a second holder of
+  the link who never answered — connected, watching, while a channel decides —
+  is told how it ended, 306 ms after the answer in the run these notes were
+  written from. Somebody who only *starts* opening the link after the answer is
+  measured and not asserted: the sandbox stops serving about a second later,
+  which is roughly what a fresh HTTPS and WebSocket handshake costs.
+  [ADR 0009](docs/adr/0009-peer-presence-and-ended-ack.md) says why that window
+  is not worth a live sandbox.
 
 ### Changed
 

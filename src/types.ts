@@ -53,6 +53,12 @@ export interface HandoffOptions {
    *
    * A handoff nobody ever opened is not affected — that is the ordinary wait,
    * and it runs for the full `timeoutMs`.
+   *
+   * Raise it when the human is expected to leave the page: a screen that locks
+   * or a tab that is backgrounded long enough can lose the socket without the
+   * reconnect firing, and reading an SMS or fetching a hardware key on the
+   * same phone is exactly that. Sixty seconds covers the proxy's own cut, not
+   * a person putting their phone in their pocket.
    */
   humanGoneGraceMs?: number
   /** Print a scannable QR code for the handoff URL to the terminal. Default: true. */

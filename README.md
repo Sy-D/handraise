@@ -315,7 +315,7 @@ await raiseHand(page, {
 | `mode` | `"takeover"` \| `"approval"` | `"takeover"` | `takeover` hands the live browser over; `approval` shows one screenshot and asks for a yes or a no. |
 | `action` | `string` | *required in approval mode* | The exact step being decided, e.g. "Submit $12,430 vendor payment to Acme GmbH". A type error if `mode` is `"approval"` and it is missing. |
 | `timeoutMs` | `number` | 5 minutes | How long to wait for the human. |
-| `humanGoneGraceMs` | `number` | 60s | How long to keep waiting after the human's phone disappears. A handoff nobody ever opened is unaffected and waits out `timeoutMs`. Minimum 1000; the default is one proxy-cut-and-reconnect. |
+| `humanGoneGraceMs` | `number` | 60s | How long to keep waiting after the human's phone disappears. A handoff nobody ever opened is unaffected and waits out `timeoutMs`. Minimum 1000; the default covers one proxy-cut-and-reconnect. Raise it if the human is expected to leave the page — a locked screen can lose the socket. |
 | `webhookUrl` | `string` | — | Generic JSON POST when the link is ready. |
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
 | `channels` | `HandoffChannel[]` | — | Where else to announce it. In approval mode a channel also gets the screenshot and can answer. See [Channels](#channels). |

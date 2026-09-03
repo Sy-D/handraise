@@ -33,7 +33,7 @@ import type {
   RaiseHandOptions,
   StorageState,
 } from "../types"
-import { raiseHand, runHandoff } from "./raise-hand"
+import { raiseHand, runHandoff, watchPresence } from "./raise-hand"
 import type { ScreencastFrame } from "./screencast"
 
 const SERVER_PATH = fileURLToPath(
@@ -807,6 +807,72 @@ test("an approval whose human walks away ends early too", async () => {
   expect(event.mode).toBe("approval")
   expect(event.endedEarly).toBe(true)
   expect(event.humanSeen).toBe(true)
+}, 20000)
+
+test("a watch that has been stopped records nothing and arms nothing", () => {
+  let gone = 0
+  const watch = watchPresence(50, Date.now(), () => {
+    gone += 1
+  })
+  watch.saw(true)
+  watch.stop()
+  // The ordinary teardown: the phone closes its socket the instant it renders
+  // the ending, the relay reports that, and the report arrives while the
+  // agent's own socket is still finishing its close handshake. It is not a
+  // departure from a handoff that is already over.
+  watch.saw(false)
+
+  expect(watch.leftMs()).toBeUndefined()
+  return Bun.sleep(150).then(() => {
+    expect(gone).toBe(0)
+  })
+})
+
+test("a stopped watch leaves no timer holding the process open", async () => {
+  // The cost of the bug this pins was invisible from inside the process: the
+  // stale timer's callback did nothing, it just kept the event loop alive for
+  // the whole grace — a minute of hang at exit for a CLI agent, after
+  // `raiseHand` had already resolved. So the assertion is the exit itself.
+  const root = fileURLToPath(new URL("../../", import.meta.url))
+  const probe = Bun.spawn(
+    [
+      "bun",
+      "-e",
+      'import { watchPresence } from "./src/core/raise-hand"; const w = watchPresence(60_000, Date.now(), () => undefined); w.saw(true); w.stop(); w.saw(false)',
+    ],
+    { cwd: root, stdout: "ignore", stderr: "ignore" },
+  )
+  const outcome = await Promise.race([
+    probe.exited,
+    Bun.sleep(6000).then(() => "still running after 6s" as const),
+  ])
+  probe.kill()
+  expect(outcome).toBe(0)
+}, 15000)
+
+test("a human who leaves after answering never left", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const human = await connectHuman(port)
+
+  const handoff = presenceHandoff(port, cdp.cdp, 60_000, 30_000, events)
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+  human.send({ type: "handback" })
+  // What a real phone does the moment it has answered.
+  human.close()
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.humanSeen).toBe(true)
+  expect(event.endedEarly).toBe(false)
+  // Not a departure: it happened after the handoff was over, and reporting it
+  // would tell an alert that watches this field the opposite of the truth.
+  expect(event.humanLeftMs).toBeUndefined()
 }, 20000)
 
 test("the ending is acknowledged by the relay before the sandbox could be killed", async () => {

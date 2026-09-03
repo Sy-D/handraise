@@ -19,6 +19,7 @@ import WebSocket, { WebSocketServer } from "ws"
 import type { HumanToAgent, RelayMessage } from "../relay/protocol"
 import type { HandoffMode } from "../types"
 import {
+  CLOSE_GRACE_MS,
   connectRelay,
   ENDED_ACK_TIMEOUT_MS,
   type RelayConnection,
@@ -102,6 +103,8 @@ interface FakeRelay {
   /** One entry per accepted connection. */
   sockets: WebSocket[]
   send(message: RelayMessage): void
+  /** Take the whole relay away, so a reconnect has nothing to find. */
+  stop(): Promise<void>
 }
 
 /** A bare WebSocket server: no relay semantics, full control over the socket. */
@@ -138,6 +141,11 @@ async function startFakeRelay(): Promise<FakeRelay> {
     send(message) {
       sockets.at(-1)?.send(JSON.stringify(message))
     },
+    stop: () =>
+      new Promise<void>((resolve) => {
+        for (const socket of sockets) socket.terminate()
+        server.close(() => resolve())
+      }),
   }
 }
 
@@ -398,6 +406,31 @@ test("a relay that never acknowledges the ending costs two seconds, not the hand
   expect(waited).toBeGreaterThanOrEqual(ENDED_ACK_TIMEOUT_MS - 50)
   expect(waited).toBeLessThan(ENDED_ACK_TIMEOUT_MS + 1500)
 }, 10000)
+
+test("a relay that is gone costs the close grace, and not an ack on top of it", async () => {
+  // The `disconnected` path: the sandbox died under the handoff, so the ending
+  // cannot be written at all. Waiting for a receipt for a message that was
+  // never sent doubled the teardown of the one handoff whose caller is already
+  // having a bad time.
+  const fake = await startFakeRelay()
+  const connection = track(
+    connectRelay({
+      url: `ws://127.0.0.1:${fake.port}/ws?role=agent`,
+      onMessage: () => undefined,
+      heartbeatMs: 60_000,
+    }),
+  )
+  await until("the socket to open", () => connection.isOpen())
+  await fake.stop()
+  await until("the socket to go down", () => !connection.isOpen())
+
+  const startedAt = Date.now()
+  await connection.sendFinal({ type: "ended", outcome: "disconnected" })
+  const waited = Date.now() - startedAt
+
+  expect(connection.stats().endedAcked).toBe(false)
+  expect(waited).toBeLessThan(CLOSE_GRACE_MS + 500)
+}, 15000)
 
 test("close() ends the handoff and stops reconnecting", async () => {
   const fake = await startFakeRelay()
