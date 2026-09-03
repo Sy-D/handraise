@@ -130,6 +130,21 @@ immediately so you can drive it; [`demo/approval.ts`](demo/approval.ts) asks
 you to approve a payment; [`demo/github-2fa.ts`](demo/github-2fa.ts) does the
 real 2FA wall and keeps the session the handoff earned.
 
+## The series
+
+handraise is one of four packages built on the same measurements, each in its
+own repo with its own benchmark:
+
+| Package | What it does |
+|---|---|
+| [`handraise-telegram`](https://github.com/Sy-D/handraise-telegram) | The approval arrives in a Telegram chat as the screenshot with Approve/Deny; long-polled, no public endpoint. |
+| [`handraise-slack`](https://github.com/Sy-D/handraise-slack) | The same in a Slack channel over Socket Mode; no request URL to host. |
+| [`outlive`](https://github.com/Sy-D/outlive) | Solari browser sessions end after ~600 s. `outlive(solari, task)` checkpoints, notices the death on the connection, relaunches and re-enters your task. Baseline 0/5, outlive 5/5. |
+
+Both adapters are `HandoffChannel` implementations of the hook above, live-tested
+with a person pressing the button. The cookbook example is
+[`browser-human-handoff-ts`](https://github.com/solari-sdk/solari-cookbook/pull/24).
+
 ## What this actually is
 
 handraise is a **resumable interrupt primitive for autonomous agents** — the
