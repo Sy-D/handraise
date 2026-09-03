@@ -77,7 +77,9 @@ export interface RelayConnection {
   /**
    * Send a terminal message (the `ended` frame), waiting up to the close grace
    * period for a reconnect to finish if the socket is momentarily down, and
-   * then up to `ENDED_ACK_TIMEOUT_MS` for the relay's `ended_ack`. The human's
+   * then up to `ENDED_ACK_TIMEOUT_MS` for the relay's `ended_ack` — re-sending
+   * the ending on any reconnect inside that window, because a socket that dies
+   * between the write and the relay's store is exactly what the wait is for. The human's
    * phone hangs on "Reconnecting…" forever if this is dropped, so it is worth
    * the short wait that `send` deliberately refuses for stale frames — and the
    * caller destroys the sandbox next, so "written" is not the same as
@@ -149,6 +151,12 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
   // to be thrown away — teardown then waited its full two seconds and called
   // an ending the relay was holding unacknowledged.
   let endedAcked = false
+  // The ending, while `sendFinal` is waiting for its receipt. A socket can die
+  // between the local write and the relay's store, and this connection then
+  // reconnects inside the ack window — which is the whole justification for
+  // waiting. The reconnect carries the ending again; the relay stores the same
+  // ending twice without complaint and acks each one.
+  let pendingEnding: AgentToHuman | null = null
 
   const send = (message: AgentToHuman | Heartbeat): Promise<void> =>
     new Promise<void>((resolve) => {
@@ -204,10 +212,13 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
     })
 
   const sendFinal = async (message: AgentToHuman): Promise<void> => {
+    // Held for the reconnect handler above, for as long as this is waiting.
+    pendingEnding = message
     // No receipt for a message that was never written. The relay is gone —
     // that is the `disconnected` path — and two more seconds of waiting for it
     // to say so is teardown the caller pays for nothing.
     if (await deliverFinal(message)) await waitForAck()
+    pendingEnding = null
   }
 
   const handle = (message: RelayMessage): void => {
@@ -262,6 +273,9 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       attempt = 0
       opens += 1
       options.onOpen?.()
+      // Last, so the ending is the final thing this socket carries.
+      const ending = pendingEnding
+      if (ending && !endedAcked) live.send(JSON.stringify(ending))
     })
     live.on("message", (data: WebSocket.RawData) => {
       const message = parse(toText(data))

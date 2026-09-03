@@ -33,7 +33,8 @@ and the rejected alternatives.
   reconnecting agent starts from the truth. It is the only signal there can be
   — the relay answers the heartbeats itself, so a pong proves the relay is
   alive and says nothing about the person.
-- **`humanGoneGraceMs`, default 60 000 ms.** Once a human has been there and
+- **`humanGoneGraceMs`, default 60 000 ms, accepted between 5 000 and
+  2 147 483 647.** Once a human has been there and
   their phone has been gone for the whole grace, the handoff ends instead of
   waiting out `timeoutMs`. A phone that comes back inside the grace resets it,
   which is what makes 60 s the right default: the preview proxy cuts an idle

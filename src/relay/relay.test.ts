@@ -65,8 +65,20 @@ interface Client {
   socket: WebSocket
 }
 
-/** What the relay says for itself; everything else on the wire was forwarded. */
-const RELAY_ORIGINATED = new Set<string>(["presence", "ended_ack"])
+/**
+ * What the relay says for itself; everything else on the wire was forwarded.
+ *
+ * Keyed by `RelayToAgent` rather than spelled out, for the reason `WIRE_NAMES`
+ * below is a mapped type: a third member of that union would otherwise be
+ * classified as peer traffic here, and would fail some unrelated test with a
+ * confusing message instead of this one.
+ */
+const RELAY_ORIGINATED = new Set<string>(
+  Object.keys({
+    presence: true,
+    ended_ack: true,
+  } satisfies Record<RelayToAgent["type"], true>),
+)
 
 interface Mailbox {
   deliver(message: RelayMessage): void

@@ -66,11 +66,15 @@ const RELAY_SLACK_MS = 5 * 60_000
 const DEFAULT_HUMAN_GONE_GRACE_MS = 60_000
 
 /**
- * The floor under `humanGoneGraceMs`. A second is already shorter than the
- * reconnect it has to survive; below it the option would be a way to ask for
- * handoffs that end on a network blip.
+ * The floor under `humanGoneGraceMs`.
+ *
+ * Five seconds, and not the one second the reconnect nominally takes: measured
+ * against the real relay, a 1 000 ms grace ended a healthy handoff on the
+ * first 60 s proxy cut — the phone was back a second later, and a second was
+ * exactly the budget. The floor has to clear the reconnect it exists to
+ * survive, with room for a slow one, so it is five times it.
  */
-const MIN_HUMAN_GONE_GRACE_MS = 1_000
+const MIN_HUMAN_GONE_GRACE_MS = 5_000
 
 /**
  * The largest delay a Node timer holds. One millisecond more and it fires

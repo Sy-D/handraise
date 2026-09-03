@@ -315,7 +315,7 @@ await raiseHand(page, {
 | `mode` | `"takeover"` \| `"approval"` | `"takeover"` | `takeover` hands the live browser over; `approval` shows one screenshot and asks for a yes or a no. |
 | `action` | `string` | *required in approval mode* | The exact step being decided, e.g. "Submit $12,430 vendor payment to Acme GmbH". A type error if `mode` is `"approval"` and it is missing. |
 | `timeoutMs` | `number` | 5 minutes | How long to wait for the human. |
-| `humanGoneGraceMs` | `number` | 60s | How long to keep waiting after the human's phone disappears. A handoff nobody ever opened is unaffected and waits out `timeoutMs`. Minimum 1000; the default covers one proxy-cut-and-reconnect. Raise it if the human is expected to leave the page — a locked screen can lose the socket. |
+| `humanGoneGraceMs` | `number` | 60s | How long to keep waiting after the human's phone disappears. A handoff nobody ever opened is unaffected and waits out `timeoutMs`. Range 5000–2147483647, and the floor is a floor rather than a safe value — the default is what covers a proxy cut plus the phone's reconnect. Raise it if the human is expected to leave the page: a locked screen can lose the socket. |
 | `webhookUrl` | `string` | — | Generic JSON POST when the link is ready. |
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
 | `channels` | `HandoffChannel[]` | — | Where else to announce it. In approval mode a channel also gets the screenshot and can answer. See [Channels](#channels). |
@@ -395,7 +395,7 @@ try {
 | `missing_api_key` | No `options.apiKey` and no `SOLARI_API_KEY`. | Set one; handraise needs it to create the relay sandbox. |
 | `invalid_mode` | `mode` is neither `"takeover"` nor `"approval"`. | Fix the call. TypeScript already refuses it; this is for JavaScript callers. |
 | `empty_action` | `mode: "approval"` without a non-empty `action`. | Name the step the human says yes or no to. |
-| `invalid_option` | An option is present but unusable. Today: `humanGoneGraceMs` outside 1000–2147483647 ms (above that a Node timer collapses to 1 ms). | Fix the value. Refused rather than clamped, because a grace that is silently something else ends handoffs you did not expect to end. |
+| `invalid_option` | An option is present but unusable. Today: `humanGoneGraceMs` outside 5000–2147483647 ms (below that the phone's own reconnect ends handoffs; above it a Node timer collapses to 1 ms). | Fix the value. Refused rather than clamped, because a grace that is silently something else ends handoffs you did not expect to end. |
 | `browser_unusable` | The page is closed, or its browser has disconnected — checked before anything is created. | Open a new page or relaunch the session (restore `storageState` if you kept it) and retry. |
 | `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error, redacted. Retry. Nothing is left behind unless you also see `relay_release_failed` (below). |
 | `concurrency_limit` | Your Solari account is at its concurrent session cap (429). | Free a session, or wait and retry. The one relay failure that is purely temporary. |

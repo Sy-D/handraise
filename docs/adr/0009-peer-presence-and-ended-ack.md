@@ -51,7 +51,10 @@ unions in `src/relay/protocol.ts`:
   scanned is a handoff nobody has been asked to answer yet, and the full
   `timeoutMs` is the honest budget for it.
 - `present → gone` starts a clock: `humanGoneGraceMs`, default **60 000 ms**,
-  validated as a finite number of at least 1000 ms (`invalid_option`).
+  accepted between 5 000 and 2 147 483 647 ms (`invalid_option` outside that).
+  The floor is five times the phone's reconnect because one times it was
+  measured failing: a 1 000 ms grace ended a healthy handoff on the first proxy
+  cut. The ceiling is Node's largest timer delay, above which it becomes 1 ms.
 - A reconnect inside the grace cancels it. It does not shorten it, and a second
   `presence: false` does not restart it.
 - When the grace runs out, the handoff ends with the **existing** outcome

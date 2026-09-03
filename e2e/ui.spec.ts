@@ -32,6 +32,7 @@ import type {
   FrameMeta,
   HumanToAgent,
   RelayMessage,
+  RelayToAgent,
 } from "../src/relay/protocol"
 import type { HandoffMode } from "../src/types"
 
@@ -93,8 +94,17 @@ interface AgentClient {
   close(): void
 }
 
-/** What the relay says for itself, rather than forwarding from the phone. */
-const RELAY_ORIGINATED = new Set<string>(["presence", "ended_ack"])
+/**
+ * What the relay says for itself, rather than forwarding from the phone. Keyed
+ * by the protocol union, so a third member does not compile until this harness
+ * knows whether to count it as something the page sent.
+ */
+const RELAY_ORIGINATED = new Set<string>(
+  Object.keys({
+    presence: true,
+    ended_ack: true,
+  } satisfies Record<RelayToAgent["type"], true>),
+)
 
 interface Box {
   x: number

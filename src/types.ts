@@ -54,6 +54,12 @@ export interface HandoffOptions {
    * A handoff nobody ever opened is not affected — that is the ordinary wait,
    * and it runs for the full `timeoutMs`.
    *
+   * The accepted range is 5 000 to 2 147 483 647 ms. The floor is a floor and
+   * not a recommendation: a grace of one second — which is what the phone's
+   * reconnect takes — was measured ending a healthy handoff on the first proxy
+   * cut. Anything below the default is for tests, and for humans you expect to
+   * answer in seconds.
+   *
    * Raise it when the human is expected to leave the page: a screen that locks
    * or a tab that is backgrounded long enough can lose the socket without the
    * reconnect firing, and reading an SMS or fetching a hardware key on the

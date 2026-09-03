@@ -1104,6 +1104,34 @@ test("a grace that is not a usable number is refused before anything is created"
     code: "invalid_option",
   })
 
+  // One below the floor. The floor is not a formality: measured against the
+  // real relay, a 1 000 ms grace ended a healthy handoff on the first 60 s
+  // proxy cut, because the phone's reconnect takes about a second.
+  const tooTight = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    humanGoneGraceMs: 4_999,
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+  await expect(tooTight).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "invalid_option",
+  })
+
+  // And the floor itself: accepted, so the guard fails on the relay rather
+  // than on the option.
+  const atTheFloor = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    humanGoneGraceMs: 5_000,
+    apiKey: "not-a-real-key",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+  await expect(atTheFloor).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "relay_start_failed",
+  })
+
   // And the last value that is still a timer: accepted, so the guard fails on
   // the relay rather than on the option.
   const largest = raiseHand(fakePage(fakeCdp().cdp), {
