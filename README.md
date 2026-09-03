@@ -445,7 +445,11 @@ have is the second mode: an approval is a yes-or-no on one screenshot, no
 live session exposed at all, answerable from a chat channel. Nor do they have
 an answer to a device-change check — a QR code a phone is asked to scan, on
 the phone's own screen — which handraise reads off the page and hands over as
-a link. Its scope stops at the handoff, not wall detection
+a link. Among the other things built on Solari so far — parallel browser
+fleets that price flights or read listing sites, a zero-shot benchmark, a
+voice-driven desktop agent — handraise and its series are the ones you install
+rather than watch: an `npm install` and one call, measured, with the failure
+modes written down. Its scope stops at the handoff, not wall detection
 ([`docs/adr/0005`](docs/adr/0005-handoff-not-wall-detection.md)).
 
 ## Security
