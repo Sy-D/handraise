@@ -1,3 +1,19 @@
+# Three jobs.
+#
+# `check` is the build gate: typecheck, lint, tests, build, and a smoke run of
+# the shipped artifact under node.
+#
+# `secrets` greps the tracked tree for credential shapes — Solari keys, preview
+# tokens, JWTs, Slack, Telegram and Discord tokens, and any tracked `.env` — and
+# fails on a hit. Its allowlist is empty by design and the patterns are written
+# so they do not match their own source, so "we never commit secrets" is checked
+# rather than asserted.
+#
+# `generated` regenerates every generated file — the embedded relay server, the
+# embedded test app, and the measured numbers in README.md and
+# benchmarks/README.md — and then fails on `git diff --exit-code`. A stale embed
+# or a benchmark figure typed by hand therefore cannot merge.
+
 name: ci
 
 on:
@@ -18,7 +34,7 @@ jobs:
         run: bunx playwright-core install --with-deps chromium
       - name: typecheck
         run: bun run typecheck
-      - name: lint (biome + oxlint + relay embed sync)
+      - name: lint (biome + oxlint + embed/number sync)
         run: bun run lint
       - name: unit + integration tests
         run: bun test src/ test-app/ e2e/ui.spec.ts
@@ -38,3 +54,32 @@ jobs:
       # e2e (bun run test:e2e) is intentionally not run in CI: it needs a real
       # SOLARI_API_KEY and spends plan quota. It is the pre-publish gate, run
       # locally against the live API.
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # A gate nobody has watched fire is a gate nobody has tested: this runs
+      # every pattern against a live sample and against known-good lines from
+      # this repo, and fails if a pattern has gone blind.
+      - name: secret scan can still fail
+        run: scripts/scan-secrets.sh --self-test
+      - name: no credential shapes in the tracked tree
+        run: scripts/scan-secrets.sh
+
+  generated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      # No `bun install`: all three generators read files and write files, and
+      # import nothing outside node: and bun: builtins. The job is ~15 s.
+      - name: regenerate every generated file
+        run: |
+          bun scripts/embed-guest.ts
+          bun test-app/embed-app.ts
+          bun scripts/render-measured.ts
+      - name: generated files are in sync with their sources
+        run: git diff --exit-code
