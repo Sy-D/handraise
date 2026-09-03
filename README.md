@@ -39,9 +39,11 @@ returns. Set `SOLARI_API_KEY`; handraise uses it to create the relay sandbox.
 Measured against the live API, method and raw data in
 [`benchmarks/`](benchmarks/README.md):
 
+<!-- generated:readme-headline — bun scripts/render-measured.ts -->
 - **19/20 blocked workflows rescued** (baseline 0/20).
 - **30/30 handoffs resolved** in the latency benchmark.
 - **3.5 s median** from raise to live on the phone.
+<!-- /generated:readme-headline -->
 
 ## Approval mode
 
@@ -465,20 +467,24 @@ Solari plan, one fresh relay sandbox each, a scripted human on the public
 WebSocket, measured from Germany against the default (us-west) endpoint.
 **30/30 resolved, zero reconnects, zero leaked sandboxes.**
 
+<!-- generated:readme-latency — bun scripts/render-measured.ts -->
 | | p50 | p75 | worst of 30 |
 |---|---|---|---|
 | Agent raises its hand → the phone shows the live page | 3.5s | 3.6s | 3.7s |
 | — of which: relay sandbox cold start | 2.7s | 2.7s | 2.9s |
 | Input round trip through the relay (150 samples) | 186ms | 191ms | 286ms |
+<!-- /generated:readme-latency -->
 
 The number that matters more than any latency is what handraise does to
 workflows that would otherwise fail. `bun run bench:rescue`: 40 runs against a
 live portal with a real TOTP wall, interleaved arms, one completion test:
 
+<!-- generated:readme-rescue — bun scripts/render-measured.ts -->
 | | completed | median human time |
 |---|---|---|
 | baseline agent (no human available) | 0/20 | — |
 | with handraise | **19/20** | 5.5s |
+<!-- /generated:readme-rescue -->
 
 The 0/20 baseline is the design fact, not a crippled agent: it tried, and a
 machine cannot know a TOTP code. The 5.5s is a scripted human — the machine
@@ -491,10 +497,12 @@ side by side: 20 workflows against one live portal, interleaved takeover,
 approval, takeover, on 2026-09-02. A takeover needs the browser driven; an
 approval needs one decision, and every fourth one here was a denial.
 
+<!-- generated:readme-mixed — bun scripts/render-measured.ts -->
 | | completed | to visible | frames | bytes | relay sandbox |
 |---|---|---|---|---|---|
 | takeover — the human drives | 10/10 | 4718ms | 14 | 142 KB | 10.7s |
 | approval — the human decides | 10/10 | 4896ms | 1 | 25 KB | 5.3s |
+<!-- /generated:readme-mixed -->
 
 Medians over the completed runs. A denied approval counts as completed: the
 decision was delivered, and the bench then loads the account page and requires

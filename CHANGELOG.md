@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **CI fails on a committed secret.** `scripts/scan-secrets.sh` greps the
+  tracked tree for Solari live keys, port-preview tokens, JWTs, Slack, Telegram
+  and Discord tokens, and for any tracked `.env`. Its allowlist is empty and the
+  patterns do not match their own source, so nothing is exempt. It ships with a
+  `--self-test` that CI runs first, because a gate nobody has watched fire is a
+  gate nobody has tested.
+- **CI fails on a stale generated file.** A `generated` job regenerates the
+  embedded relay server, the embedded test app and the measured numbers in
+  `README.md` and `benchmarks/README.md`, then runs `git diff --exit-code`.
+- **The measured numbers are generated.** `scripts/render-measured.ts` renders
+  the tables and headline counts in `README.md` and `benchmarks/README.md` from
+  `benchmarks/*.json`, inside `<!-- generated:… -->` blocks. A figure typed by
+  hand no longer merges. `bun run lint` checks the same thing locally.
+
 ## [0.7.0] - 2026-09-03
 
 The handoff now knows whether anybody is on the other side, and the ending is

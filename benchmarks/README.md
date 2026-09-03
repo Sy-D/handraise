@@ -32,13 +32,16 @@ MIXED_N=4 bun run bench:mixed      # a short run
 
 Each writes its JSON back into this directory, overwriting the committed file.
 
+<!-- generated:bench-latency-heading — bun scripts/render-measured.ts -->
 ## Handoff latency — 30 handoffs, 30 resolved
+<!-- /generated:bench-latency-heading -->
 
 30 consecutive real handoffs, run one at a time, one fresh relay sandbox each,
 with a scripted human on the public WebSocket. Measured from Germany against
 the default (us-west) endpoint on 2026-09-01. **30/30 resolved, zero
 reconnects, zero failures, zero leaked sandboxes.**
 
+<!-- generated:bench-latency-table — bun scripts/render-measured.ts -->
 | Metric | p50 | p75 | worst |
 |---|---|---|---|
 | `stuckToVisibleMs` — `raiseHand()` → first frame at the human | 3532 | 3594 | 3746 |
@@ -46,6 +49,7 @@ reconnects, zero failures, zero leaked sandboxes.**
 | `firstFrameMs` — same frame, timed agent-side | 644 | 664 | 679 |
 | `inputRttMs` — human → relay → human, 150 samples | 186 | 191 | 286 |
 | `handoffDurationMs` — whole handoff live, scripted human | 2031 | 2065 | 2183 |
+<!-- /generated:bench-latency-table -->
 
 All values in milliseconds. `stuckToVisibleMs` is the honest end-to-end number:
 it is measured on the human's socket, not the agent's. Cold start is ~75% of
@@ -57,17 +61,21 @@ input round trip sits on the network RTT floor from Germany to the us-west edge
 relay with your region. `handoffDurationMs` is the machine floor of a handoff,
 not a human's reading pace.
 
+<!-- generated:bench-rescue-heading — bun scripts/render-measured.ts -->
 ## Rescue rate — 19 of 20 blocked workflows completed
+<!-- /generated:bench-rescue-heading -->
 
 One workflow run 2×20 times against one live portal with a real RFC 6238 TOTP
 wall: sign in, reach the account page. The arms are interleaved (baseline i,
 handraise i, baseline i+1, …) so both see the same browser ages, the same
 network minute and the same app state.
 
+<!-- generated:bench-rescue-table — bun scripts/render-measured.ts -->
 | | completed | median handoff |
 |---|---|---|
 | baseline — no human, no access to the shared secret | 0/20 | — |
 | with handraise | **19/20** | 5490 ms |
+<!-- /generated:bench-rescue-table -->
 
 The 0/20 baseline is a design fact, not a crippled agent: it submits the form,
 scrapes the page for a code, reloads and retries, and it never touches the
@@ -86,7 +94,9 @@ The counting is load-bearing rather than decorative, and that is testable:
 test, and the table must then read 20/20 for the baseline and 0/20 for
 handraise.
 
+<!-- generated:bench-mixed-heading — bun scripts/render-measured.ts -->
 ## Mixed workload — 20 of 20 workflows completed, and what each mode cost
+<!-- /generated:bench-mixed-heading -->
 
 The first two benches ask about one mode. This one runs both against the same
 Aurora Bank instance, interleaved (takeover, approval, takeover, …), on
@@ -100,10 +110,12 @@ Aurora Bank instance, interleaved (takeover, approval, takeover, …), on
   decision. A scripted human sees one screenshot and the action in words, and
   answers. Every fourth approval is denied (2 of 10 here).
 
+<!-- generated:bench-mixed-table — bun scripts/render-measured.ts -->
 | | completed | time to visible p50 / p75 | handoff p50 / p75 | frames | bytes | inputs | relay-sandbox s |
 |---|---|---|---|---|---|---|---|
 | takeover | 10/10 | 4718 / 4808 ms | 6927 / 7202 ms | 14 | 142 KB | 8 | 10.7 |
 | approval | 10/10 | 4896 / 4977 ms | 2063 / 2084 ms | 1 | 25 KB | 0 | 5.3 |
+<!-- /generated:bench-mixed-table -->
 
 All per-handoff figures are medians over the runs that completed, and the two
 time columns measure different spans:
