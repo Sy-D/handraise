@@ -33,7 +33,7 @@ import type {
   RaiseHandOptions,
   StorageState,
 } from "../types"
-import { raiseHand, runHandoff } from "./raise-hand"
+import { raiseHand, runHandoff, watchPresence } from "./raise-hand"
 import type { ScreencastFrame } from "./screencast"
 
 const SERVER_PATH = fileURLToPath(
@@ -97,6 +97,8 @@ function startRelayProcess(mode: HandoffMode = "takeover"): Promise<number> {
 async function connectHuman(port: number): Promise<{
   inbox: RelayMessage[]
   send(message: RelayMessage): void
+  /** Close the tab, the way a human who has given up does: no message first. */
+  close(): void
 }> {
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ws?role=human`)
   const inbox: RelayMessage[] = []
@@ -113,6 +115,7 @@ async function connectHuman(port: number): Promise<{
   return {
     inbox,
     send: (message) => socket.send(JSON.stringify(message)),
+    close: () => socket.close(),
   }
 }
 
@@ -368,6 +371,10 @@ test("a full handoff emits exactly one wide event with plausible fields", async 
   expect(event.reconnects).toBe(0)
   expect(event.storageStateCaptured).toBe(true)
   expect(event.firstFrameMs ?? -1).toBeGreaterThanOrEqual(0)
+  // What the caller is handed is the time the human took, frozen at the same
+  // instant the event's is — not that plus the ack, the CDP detach and the
+  // socket close, which the caller never waited for.
+  expect(end.durationMs).toBe(event.durationMs)
   // No secret ever rides along in the wide event.
   expect(JSON.stringify(event)).not.toContain("pt_token")
 })
@@ -625,6 +632,549 @@ test("the approval screenshot is not re-published once the handoff is over", asy
   expect(ending?.filter((message) => message.type === "frame")).toEqual([])
   // It really did reconnect: the first connection was cut on the frame.
   expect(relay.connections.length).toBeGreaterThan(1)
+}, 20000)
+
+// --- 0.7.0: the human who was there and went ------------------------------
+
+/**
+ * A takeover against the real relay, with the presence grace turned down to
+ * something a test can wait for. The wait itself stays long, because the whole
+ * point is that the handoff ends before it.
+ */
+function presenceHandoff(
+  port: number,
+  cdp: CDPSession,
+  graceMs: number,
+  timeoutMs: number,
+  events: HandoffEvent[],
+): Promise<{ outcome: string }> {
+  return runHandoff({
+    page: fakePage(cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "Aurora Bank is asking for a 2FA code",
+      humanGoneGraceMs: graceMs,
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "presence",
+    relayColdStartMs: 3,
+    logger: noopLogger,
+  })
+}
+
+test("a human who was there and then closed the tab ends the handoff early", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const human = await connectHuman(port)
+
+  const startedAt = Date.now()
+  const handoff = presenceHandoff(port, cdp.cdp, 400, 30_000, events)
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+  cdp.emitFrame(FRAME)
+  await until("the phone to see a frame", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+
+  // No handback, no abort: the tab is simply gone, which before this release
+  // cost the agent the whole `timeoutMs`.
+  human.close()
+  const end = await handoff
+  const waited = Date.now() - startedAt
+
+  // The existing outcome, deliberately: a handoff nobody finished is a
+  // timeout, whether the wait ran out or the human walked away from it.
+  expect(end.outcome).toBe("timeout")
+  expect(waited).toBeLessThan(10_000)
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.outcome).toBe("timeout")
+  expect(event.humanSeen).toBe(true)
+  expect(event.endedEarly).toBe(true)
+  expect(event.humanLeftMs ?? -1).toBeGreaterThanOrEqual(0)
+  expect(event.humanLeftMs ?? Infinity).toBeLessThanOrEqual(event.durationMs)
+}, 20000)
+
+test("a phone that comes back inside the grace keeps the handoff alive", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const first = await connectHuman(port)
+
+  const handoff = presenceHandoff(port, cdp.cdp, 1500, 30_000, events)
+  await until("the phone to see the reason", () =>
+    first.inbox.some((message) => message.type === "state"),
+  )
+
+  // The 60 s proxy cut, and the phone's own reconnect a moment later.
+  first.close()
+  await Bun.sleep(300)
+  const second = await connectHuman(port)
+  await until("the phone to see the reason again", () =>
+    second.inbox.some((message) => message.type === "state"),
+  )
+
+  // Well past the grace, had it not been reset by the reconnect.
+  await Bun.sleep(1800)
+  second.send({ type: "handback" })
+  const end = await handoff
+
+  expect(end.outcome).toBe("resolved")
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.humanSeen).toBe(true)
+  expect(event.endedEarly).toBe(false)
+}, 20000)
+
+test("a handoff nobody ever opened waits the whole timeout", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+
+  const startedAt = Date.now()
+  // A grace far shorter than the wait: a QR code nobody scanned must not be
+  // read as a human who left, or every unattended handoff would end at once.
+  const end = await presenceHandoff(port, cdp.cdp, 200, 1200, events)
+  const waited = Date.now() - startedAt
+
+  expect(end.outcome).toBe("timeout")
+  expect(waited).toBeGreaterThanOrEqual(1200)
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.humanSeen).toBe(false)
+  expect(event.endedEarly).toBe(false)
+  expect(event.humanLeftMs).toBeUndefined()
+}, 20000)
+
+test("a grace longer than what is left of the wait changes nothing", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const human = await connectHuman(port)
+
+  const handoff = presenceHandoff(port, cdp.cdp, 30_000, 1200, events)
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+  human.close()
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  // Seen and gone, but the wait ran out first, so this is an ordinary timeout.
+  expect(event.humanSeen).toBe(true)
+  expect(event.endedEarly).toBe(false)
+  expect(event.humanLeftMs ?? -1).toBeGreaterThanOrEqual(0)
+}, 20000)
+
+test("an approval whose human walks away ends early too", async () => {
+  const port = await startRelayProcess("approval")
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const human = await connectHuman(port)
+
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      mode: "approval",
+      reason: "The agent may not move money without a human",
+      action: "Transfer EUR 12,430.00 to Acme GmbH",
+      humanGoneGraceMs: 400,
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 30_000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "presence-approval",
+    relayColdStartMs: 3,
+    logger: noopLogger,
+  })
+
+  await until("the phone to see the screenshot", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  // Leaving a decision open is exactly as informative as leaving a browser
+  // open: nobody is coming back, and the agent should not wait five minutes.
+  human.close()
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.mode).toBe("approval")
+  expect(event.endedEarly).toBe(true)
+  expect(event.humanSeen).toBe(true)
+}, 20000)
+
+test("a watch that has been stopped records nothing and arms nothing", () => {
+  let gone = 0
+  const watch = watchPresence(50, Date.now(), () => {
+    gone += 1
+  })
+  watch.saw(true, true, 0)
+  watch.stop()
+  // The ordinary teardown: the phone closes its socket the instant it renders
+  // the ending, the relay reports that, and the report arrives while the
+  // agent's own socket is still finishing its close handshake. It is not a
+  // departure from a handoff that is already over.
+  watch.saw(false, true, 0)
+
+  expect(watch.leftMs()).toBeUndefined()
+  return Bun.sleep(150).then(() => {
+    expect(gone).toBe(0)
+  })
+})
+
+test("a stopped watch leaves no timer holding the process open", async () => {
+  // The cost of the bug this pins was invisible from inside the process: the
+  // stale timer's callback did nothing, it just kept the event loop alive for
+  // the whole grace — a minute of hang at exit for a CLI agent, after
+  // `raiseHand` had already resolved. So the assertion is the exit itself.
+  const root = fileURLToPath(new URL("../../", import.meta.url))
+  const probe = Bun.spawn(
+    [
+      "bun",
+      "-e",
+      'import { watchPresence } from "./src/core/raise-hand"; const w = watchPresence(60_000, Date.now(), () => undefined); w.saw(true, true, 0); w.stop(); w.saw(false, true, 0)',
+    ],
+    { cwd: root, stdout: "ignore", stderr: "ignore" },
+  )
+  const outcome = await Promise.race([
+    probe.exited,
+    Bun.sleep(6000).then(() => "still running after 6s" as const),
+  ])
+  probe.kill()
+  expect(outcome).toBe(0)
+}, 15000)
+
+test("a human who leaves after answering never left", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  const human = await connectHuman(port)
+
+  const handoff = presenceHandoff(port, cdp.cdp, 60_000, 30_000, events)
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+  human.send({ type: "handback" })
+  // What a real phone does the moment it has answered.
+  human.close()
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.humanSeen).toBe(true)
+  expect(event.endedEarly).toBe(false)
+  // Not a departure: it happened after the handoff was over, and reporting it
+  // would tell an alert that watches this field the opposite of the truth.
+  expect(event.humanLeftMs).toBeUndefined()
+}, 20000)
+
+test("the ending is acknowledged by the relay before the sandbox could be killed", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const lines: string[] = []
+  const recording: Logger = {
+    debug: () => undefined,
+    info: (event, fields) => lines.push(`${event} ${JSON.stringify(fields)}`),
+    warn: () => undefined,
+    error: () => undefined,
+  }
+
+  const human = await connectHuman(port)
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: { reason: "Aurora Bank is asking for a 2FA code" },
+    timeoutMs: 10_000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "ack",
+    relayColdStartMs: 3,
+    logger: recording,
+  })
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+  human.send({ type: "abort" })
+  await handoff
+
+  // The line the live e2e reads its timing off — and its `acked` field is the
+  // whole point: `false` there means the ending raced the kill exactly as it
+  // did before this release, which a test that only looks for the event name
+  // would call a pass.
+  const ack = lines.find((line) => line.startsWith("ended_ack "))
+  expect(ack ?? "no ended_ack line").toContain('"acked":true')
+}, 20000)
+
+/** Evict the handoff's agent socket the way a second agent process would. */
+async function forceAgentOutage(port: number): Promise<void> {
+  const impostor = new WebSocket(`ws://127.0.0.1:${port}/ws?role=agent`)
+  await new Promise<void>((resolve, reject) => {
+    impostor.once("open", () => resolve())
+    impostor.once("error", reject)
+  })
+  // Closing it leaves no agent at all, which is the state under test: the
+  // handoff's own socket is down and backing off.
+  impostor.close()
+}
+
+test("a departure the agent only hears about later is counted from when it happened", () => {
+  let gone = 0
+  // A handoff that started five seconds ago.
+  const watch = watchPresence(1_000, Date.now() - 5_000, () => {
+    gone += 1
+  })
+  // The relay's report to a reconnecting agent: nobody is here, somebody was,
+  // and that has been true for 800 ms.
+  watch.saw(false, true, 800)
+
+  expect(watch.everSeen()).toBe(true)
+  expect(watch.leftMs() ?? -1).toBeGreaterThanOrEqual(4_100)
+  expect(watch.leftMs() ?? -1).toBeLessThanOrEqual(4_300)
+  // 200 ms of the grace are left, and the floor gives the reconnect a beat to
+  // deliver whatever else it is holding first.
+  return Bun.sleep(120)
+    .then(() => {
+      expect(gone).toBe(0)
+      return Bun.sleep(400)
+    })
+    .then(() => {
+      expect(gone).toBe(1)
+    })
+})
+
+test("a relay whose clock jumps cannot shorten the grace", async () => {
+  // `sinceMs` is a relay-local delta, so there is no cross-machine skew to
+  // worry about — but a wall-clock step inside the sandbox is still a number
+  // this side has no reason to trust. Staleness can never exceed the age of
+  // the handoff itself, and it is never negative.
+  let gone = 0
+  const forward = watchPresence(2_000, Date.now(), () => {
+    gone += 1
+  })
+  forward.saw(true, true, 0)
+  // The clock jumped forward: the relay reports a departure six minutes ago,
+  // on a handoff that is milliseconds old.
+  forward.saw(false, true, 500_000)
+  expect(forward.leftMs() ?? -1).toBeGreaterThanOrEqual(0)
+  expect(forward.leftMs() ?? -1).toBeLessThan(200)
+
+  // And backwards, which would otherwise write a departure in the future.
+  const backward = watchPresence(2_000, Date.now(), () => undefined)
+  backward.saw(true, true, 0)
+  backward.saw(false, true, -60_000)
+  expect(backward.leftMs() ?? -1).toBeGreaterThanOrEqual(0)
+  expect(backward.leftMs() ?? -1).toBeLessThan(200)
+
+  // The full grace, not the 250 ms floor a backdated report is armed with.
+  await Bun.sleep(500)
+  expect(gone).toBe(0)
+  await Bun.sleep(1_800)
+  expect(gone).toBe(1)
+}, 15000)
+
+test("a whole visit during an agent outage still counts, and the grace runs from the real departure", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+
+  const startedAt = Date.now()
+  const handoff = presenceHandoff(port, cdp.cdp, 1500, 20_000, events)
+  await Bun.sleep(300)
+  await forceAgentOutage(port)
+
+  // The human opens the link, sees a handoff nobody is driving, and closes it
+  // — all of it while the agent's socket is down and backing off. Both
+  // announcements find no agent; only the history the relay keeps survives.
+  const visitor = await connectHuman(port)
+  await Bun.sleep(80)
+  const leftAt = Date.now()
+  visitor.close()
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.humanSeen).toBe(true)
+  expect(event.endedEarly).toBe(true)
+  // The grace ran from the departure, not from the reconnect that reported it.
+  expect(Date.now() - leftAt).toBeLessThan(4_000)
+  expect(event.humanLeftMs ?? -1).toBeGreaterThan(leftAt - startedAt - 400)
+  expect(event.humanLeftMs ?? -1).toBeLessThan(leftAt - startedAt + 400)
+}, 30000)
+
+test("an answer given during an agent outage still resolves the handoff", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+
+  // A grace shorter than the outage, so the departure the reconnecting agent
+  // hears about is already past it. The answer is one frame behind that
+  // report, and it must not lose a race to a timer.
+  const handoff = presenceHandoff(port, cdp.cdp, 400, 20_000, events)
+  await Bun.sleep(300)
+  await forceAgentOutage(port)
+
+  const visitor = await connectHuman(port)
+  visitor.send({ type: "handback" })
+  await Bun.sleep(50)
+  visitor.close()
+
+  const end = await handoff
+  expect(end.outcome).toBe("resolved")
+  const event = events[0]
+  if (!event) throw new Error("no event")
+  expect(event.humanSeen).toBe(true)
+  expect(event.endedEarly).toBe(false)
+}, 30000)
+
+test("input that arrives after the grace ended the handoff never reaches the page", async () => {
+  const port = await startRelayProcess()
+  const cdp = fakeCdp()
+  const events: HandoffEvent[] = []
+  // A slow screenshot, so the QR scan below is still in flight when the grace
+  // settles the handoff: teardown waits for it, and that wait is the window in
+  // which a phone that comes back could still be routed to a live page.
+  const handoff = runHandoff({
+    page: fakePage(cdp.cdp, 1500),
+    agentWsUrl: `ws://127.0.0.1:${port}/ws?role=agent`,
+    options: {
+      reason: "Aurora Bank is asking for a 2FA code",
+      humanGoneGraceMs: 300,
+      logger: noopLogger,
+      onEvent: (event) => events.push(event),
+    },
+    timeoutMs: 30_000,
+    url: "https://relay.example/?pt_token=x",
+    handoffId: "late-input",
+    relayColdStartMs: 3,
+    logger: noopLogger,
+  })
+
+  const human = await connectHuman(port)
+  await until("the phone to see the reason", () =>
+    human.inbox.some((message) => message.type === "state"),
+  )
+  cdp.emitFrame(FRAME)
+  await until("the phone to see a frame", () =>
+    human.inbox.some((message) => message.type === "frame"),
+  )
+  human.send({ type: "tap", fx: 400, fy: 250 })
+  await until("the tap to dispatch as a mouse event", () =>
+    cdp.calls.includes("Input.dispatchMouseEvent"),
+  )
+  const dispatches = (): number =>
+    cdp.calls.filter((call) => call === "Input.dispatchMouseEvent").length
+  const before = dispatches()
+
+  human.send({ type: "scanqr" })
+  await Bun.sleep(100)
+  // Gone, and the grace ends the handoff while the scan is still in flight.
+  human.close()
+  await Bun.sleep(600)
+
+  // Somebody opens the link again and taps at a page the agent has already
+  // moved on from. Before 0.7.0 the only guard here was "a terminal message
+  // arrived", and a grace timeout is not one.
+  const late = await connectHuman(port)
+  for (let i = 0; i < 5; i++) late.send({ type: "tap", fx: 100, fy: 100 })
+
+  const end = await handoff
+  expect(end.outcome).toBe("timeout")
+  expect(dispatches()).toBe(before)
+  expect(events[0]?.inputsApplied).toBe(1)
+}, 30000)
+
+test("a grace that is not a usable number is refused before anything is created", async () => {
+  const asking = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    // Below the floor: a grace this short would end a handoff on the gap
+    // between a proxy cut and the phone's own reconnect.
+    humanGoneGraceMs: 10,
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+
+  await expect(asking).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "invalid_option",
+  })
+
+  const infinite = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    humanGoneGraceMs: Number.POSITIVE_INFINITY,
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+  await expect(infinite).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "invalid_option",
+  })
+
+  // One past the largest delay a Node timer can hold. It is finite and far
+  // above the floor, and Node silently collapses it to 1 ms — a request for a
+  // three-week grace that ends the handoff on the first blink.
+  const overflowed = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    humanGoneGraceMs: 2_147_483_648,
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+  await expect(overflowed).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "invalid_option",
+  })
+
+  // One below the floor. The floor is not a formality: measured against the
+  // real relay, a 1 000 ms grace ended a healthy handoff on the first 60 s
+  // proxy cut, because the phone's reconnect takes about a second.
+  const tooTight = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    humanGoneGraceMs: 4_999,
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+  await expect(tooTight).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "invalid_option",
+  })
+
+  // And the floor itself: accepted, so the guard fails on the relay rather
+  // than on the option.
+  const atTheFloor = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    humanGoneGraceMs: 5_000,
+    apiKey: "not-a-real-key",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+  await expect(atTheFloor).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "relay_start_failed",
+  })
+
+  // And the last value that is still a timer: accepted, so the guard fails on
+  // the relay rather than on the option.
+  const largest = raiseHand(fakePage(fakeCdp().cdp), {
+    reason: "Aurora Bank is asking for a 2FA code",
+    humanGoneGraceMs: 2_147_483_647,
+    apiKey: "not-a-real-key",
+    baseUrl: CLOSED_PORT,
+    logger: noopLogger,
+  })
+  await expect(largest).rejects.toMatchObject({
+    name: "HandraiseError",
+    code: "relay_start_failed",
+  })
 }, 20000)
 
 test("an approval with a blank action is refused before a relay is started", async () => {
@@ -1400,7 +1950,7 @@ test("settled resolves with the outcome when the phone answers", async () => {
   if (!raised) throw new Error("the channel was not notified")
 
   human.send({ type: "deny" })
-  expect(await handoff).toEqual({ outcome: "denied" })
+  expect(await handoff).toMatchObject({ outcome: "denied" })
   // This is the whole point: the channel is told the phone answered, without
   // having been the one who was asked.
   expect(await raised.settled).toBe("denied")

@@ -315,6 +315,7 @@ await raiseHand(page, {
 | `mode` | `"takeover"` \| `"approval"` | `"takeover"` | `takeover` hands the live browser over; `approval` shows one screenshot and asks for a yes or a no. |
 | `action` | `string` | *required in approval mode* | The exact step being decided, e.g. "Submit $12,430 vendor payment to Acme GmbH". A type error if `mode` is `"approval"` and it is missing. |
 | `timeoutMs` | `number` | 5 minutes | How long to wait for the human. |
+| `humanGoneGraceMs` | `number` | 60s | How long to keep waiting after the human's phone disappears. A handoff nobody ever opened is unaffected and waits out `timeoutMs`. Range 5000–2147483647, and the floor is a floor rather than a safe value — the default is what covers a proxy cut plus the phone's reconnect. Raise it if the human is expected to leave the page: a locked screen can lose the socket. |
 | `webhookUrl` | `string` | — | Generic JSON POST when the link is ready. |
 | `onUrl` | `(url) => void` | — | Called with the handoff URL. |
 | `channels` | `HandoffChannel[]` | — | Where else to announce it. In approval mode a channel also gets the screenshot and can answer. See [Channels](#channels). |
@@ -339,7 +340,7 @@ await raiseHand(page, {
 | `aborted` | takeover | The human looked and could not solve it. Do not retry the same step. |
 | `approved` | approval | Carry out the action. |
 | `denied` | approval | Do not carry out the action. |
-| `timeout` | both | Nobody answered within `timeoutMs`. |
+| `timeout` | both | Nobody answered — either `timeoutMs` ran out, or a human who was there closed the tab and stayed away for `humanGoneGraceMs`. The wide event's `endedEarly` and `humanSeen` say which. |
 | `disconnected` | both | The browser session died mid-handoff. |
 
 ### `scanQrLinks(png): ScannedLink[]`
@@ -394,6 +395,7 @@ try {
 | `missing_api_key` | No `options.apiKey` and no `SOLARI_API_KEY`. | Set one; handraise needs it to create the relay sandbox. |
 | `invalid_mode` | `mode` is neither `"takeover"` nor `"approval"`. | Fix the call. TypeScript already refuses it; this is for JavaScript callers. |
 | `empty_action` | `mode: "approval"` without a non-empty `action`. | Name the step the human says yes or no to. |
+| `invalid_option` | An option is present but unusable. Today: `humanGoneGraceMs` outside 5000–2147483647 ms (below that the phone's own reconnect ends handoffs; above it a Node timer collapses to 1 ms). | Fix the value. Refused rather than clamped, because a grace that is silently something else ends handoffs you did not expect to end. |
 | `browser_unusable` | The page is closed, or its browser has disconnected — checked before anything is created. | Open a new page or relaunch the session (restore `storageState` if you kept it) and retry. |
 | `relay_start_failed` | The relay sandbox could not be created or deployed. | Read `cause` — it is the Solari SDK's own error, redacted. Retry. Nothing is left behind unless you also see `relay_release_failed` (below). |
 | `concurrency_limit` | Your Solari account is at its concurrent session cap (429). | Free a session, or wait and retry. The one relay failure that is purely temporary. |
@@ -413,7 +415,8 @@ tool, so every row here is measured rather than hoped for.
 
 | Failure | Outcome |
 |---|---|
-| Human never shows | Clean `timeout`, relay destroyed |
+| Human never shows | Clean `timeout` after `timeoutMs`, relay destroyed |
+| Human opens it, then closes the tab | `timeout` one grace later, not five minutes later — the relay reports the phone's socket, and the event says `endedEarly: true` |
 | Browser session dies mid-handoff | `disconnected`, not an exception |
 | Relay WebSocket drops | 20s heartbeats, reconnect, last frame replayed |
 | Agent process killed | Sandbox lifecycle kill, no orphaned URL |
@@ -529,9 +532,6 @@ with `isTrusted: true`.
 
 ## Limitations (v1)
 
-- If the human silently closes the tab, the agent can't tell — it waits until
-  `timeoutMs`. (The relay answers heartbeats itself; peer presence is a v2
-  protocol change.)
 - Solari's $20 plan allows 2 concurrent sandboxes; each active handoff uses
   one. Two simultaneous handoffs is the plan-tier ceiling.
 - An approval shows the page as it was when the agent asked. If the page
@@ -548,7 +548,6 @@ with `isTrusted: true`.
 ## Contributing
 
 Small, focused PRs welcome. Good first issues: a Python port, a
-`needHuman` tool export for more agent frameworks, wall-detection heuristics,
-peer-presence in the relay protocol.
+`needHuman` tool export for more agent frameworks, wall-detection heuristics.
 
 MIT

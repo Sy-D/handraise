@@ -26,6 +26,8 @@
  * - `missing_api_key` — no `options.apiKey` and no `SOLARI_API_KEY`.
  * - `invalid_mode` — `mode` was neither `"takeover"` nor `"approval"`.
  * - `empty_action` — `mode: "approval"` without a non-empty `action`.
+ * - `invalid_option` — an option was present but unusable, which today means
+ *   a `humanGoneGraceMs` outside 5000–2147483647 ms.
  * - `browser_unusable` — the page is closed, or its browser has disconnected.
  *   Checked before anything is created, from local state only: a Solari
  *   session that has died server-side while the CDP socket is still up looks
@@ -45,6 +47,7 @@ export type HandraiseErrorCode =
   | "missing_api_key"
   | "invalid_mode"
   | "empty_action"
+  | "invalid_option"
   | "browser_unusable"
   | "relay_start_failed"
   | "concurrency_limit"

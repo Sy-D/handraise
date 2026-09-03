@@ -25,7 +25,7 @@ import { Solari } from "@solarisdk/browser"
 import type { Page } from "playwright-core"
 
 import type { HandoffEvent } from "../src/events"
-import { raiseHand } from "../src/index"
+import { type Logger, raiseHand } from "../src/index"
 import { previewPath, startTestApp } from "../test-app/deploy"
 import { msUntilNextStep, totp } from "../test-app/totp"
 import { openHandoffPage } from "./human-sim"
@@ -44,6 +44,9 @@ declare global {
 const FAULT = process.env.HANDRAISE_E2E_FAULT ?? ""
 const VIEWPORT = { width: 1280, height: 800 }
 const TIMEOUT_CASE_MS = 8_000
+/** The presence case: a wait nobody would sit through, and a short grace. */
+const PRESENCE_TIMEOUT_MS = 90_000
+const PRESENCE_GRACE_MS = 5_000
 
 const started = Date.now()
 const timings: Record<string, number> = {}
@@ -53,6 +56,82 @@ type LogDetail = Record<string, string | number | boolean | undefined>
 
 function log(event: string, detail: LogDetail = {}): void {
   console.log(JSON.stringify({ t: Date.now() - started, event, ...detail }))
+}
+
+/**
+ * A logger that keeps the one line this file measures — the relay's receipt for
+ * the ending — and shouts about anything that went wrong. Everything else
+ * handraise says is already covered by the wide event.
+ */
+interface AckWatcher {
+  logger: Logger
+  /** The `ended_ack` lines handraise logged, as JSON. */
+  lines: string[]
+}
+
+function ackWatcher(): AckWatcher {
+  const lines: string[] = []
+  return {
+    lines,
+    logger: {
+      debug: () => undefined,
+      info: (event, fields) => {
+        if (event === "ended_ack") lines.push(JSON.stringify(fields))
+      },
+      warn: (event, fields) =>
+        console.error(JSON.stringify({ warn: event, fields })),
+      error: (event, fields) =>
+        console.error(JSON.stringify({ error: event, fields })),
+    },
+  }
+}
+
+/** Whether the relay confirmed it had stored the ending before the kill. */
+function acked(lines: string[]): boolean {
+  return lines.some((line) => line.includes('"acked":true'))
+}
+
+/**
+ * Open the link the way somebody who was not watching would, *after* the
+ * answer, and report what they are told about the ending.
+ *
+ * Measured, not asserted, and the comment at the call site says why: the relay
+ * holds the ending (that part is now guaranteed — the agent waits for the
+ * relay's receipt before it kills anything), but the sandbox it is held in is
+ * being destroyed, and opening a fresh HTTPS connection plus a WebSocket
+ * upgrade to us-west takes about as long as the teardown does. What this
+ * number says is how wide that remaining window is.
+ */
+async function lateViewerEnding(
+  humanUrl: string,
+  deadlineMs = 3_000,
+): Promise<string | null> {
+  const deadline = Date.now() + deadlineMs
+  let attempts = 0
+  while (Date.now() < deadline) {
+    attempts += 1
+    const openedAt = Date.now()
+    try {
+      const viewer = await openHandoffPage(humanUrl)
+      log("late_viewer_connected", {
+        attempt: attempts,
+        ms: Date.now() - openedAt,
+      })
+      const until = Math.min(deadline, Date.now() + 2_000)
+      while (Date.now() < until && !viewer.ending()) await Bun.sleep(50)
+      const ending = viewer.ending()
+      await viewer.close()
+      if (ending) return ending
+    } catch (error) {
+      log("late_viewer_refused", {
+        attempt: attempts,
+        ms: Date.now() - openedAt,
+        error: String(error).slice(0, 80),
+      })
+      await Bun.sleep(150)
+    }
+  }
+  return null
 }
 
 function check(condition: boolean, what: string): void {
@@ -358,12 +437,14 @@ try {
     const askedAt = Date.now()
     let approvalUrl = ""
     let event: HandoffEvent | undefined
+    const ack = ackWatcher()
     const asking = raiseHand(page, {
       mode: "approval",
       reason: "The agent may not move money without a human",
       action: APPROVAL_ACTION,
       qr: false,
       timeoutMs: 60_000,
+      logger: ack.logger,
       onUrl: (url) => {
         approvalUrl = url
       },
@@ -421,6 +502,13 @@ try {
     if (answer === "approve") await human.approve()
     else await human.deny()
 
+    // Somebody else opens the same link, right after the answer and while the
+    // sandbox is being torn down. Until 0.7.0 they saw a blank page: the
+    // `ended` lost its race with the kill, so the relay had nothing to replay.
+    // The agent now waits for the relay's receipt before it kills anything,
+    // which is what makes this an assertion instead of a log line.
+    const lateEnding = await lateViewerEnding(approvalUrl)
+
     const result = await asking
     pending = null
     timings[`approval${answer}Ms`] = Date.now() - askedAt
@@ -453,16 +541,23 @@ try {
       event?.framesSent === 1 + (event?.reconnects ?? 0),
       `the wide event counts one frame per connection (${event?.framesSent} frames, ${event?.reconnects} reconnects)`,
     )
-    // Deliberately observed and not asserted. The ending is relayed while the
-    // relay sandbox is already being destroyed, and an approval tears down in
-    // milliseconds — there is no storageState capture to hold the door open,
-    // as there is in the takeover case above, which does assert it. A phone
-    // that answered does not depend on this message: it shows its own ending
-    // the moment the human taps. A second viewer of the link does, and that
-    // path is covered offline, where the relay is not being killed underneath
-    // it: relay.test.ts "a human who joins after the handoff ended sees the
-    // ending, not the frame" and the ui.spec terminal-overlay tests.
     log("phone_ending", { seen: human.ending() ?? "none", expected })
+    check(
+      acked(ack.lines),
+      `the relay stored the ending and said so before the kill (${ack.lines.join(",") || "no ended_ack line"})`,
+    )
+    // Was an observation until 0.7.0, for the reason the ack now removes: the
+    // ending was written to a socket whose sandbox was already being deleted,
+    // so whether it was ever relayed was a race. The phone that answered does
+    // not need it — it shows its own ending the moment the human taps — but
+    // every *other* holder of the link does, and this is the message they are
+    // all served from.
+    check(
+      human.ending() === expected,
+      `the answering phone was told over the wire that it ended as ${expected} (saw ${human.ending() ?? "nothing"})`,
+    )
+    // Measured, not asserted. See lateViewerEnding.
+    log("late_viewer", { seen: lateEnding ?? "none", expected })
     await human.close()
 
     const gone = await fetch(approvalUrl, { cache: "no-store" })
@@ -473,16 +568,33 @@ try {
   await askApproval("approve")
   await askApproval("deny")
 
-  // --- An approval answered by a channel, not by the phone ---------------
+  // --- An approval answered by a channel, while somebody watches the link -
   //
   // The path a Telegram or Slack adapter takes: handraise hands the channel
-  // the screenshot and an `answer()`, and nobody opens the link at all. The
-  // in-process channel here stands in for the adapter; what is under test is
-  // the core's side of it against the real relay.
+  // the screenshot and an `answer()`, and nobody has to open the link at all.
+  // The in-process channel here stands in for the adapter; what is under test
+  // is the core's side of it against the real relay.
+  //
+  // And the second half of what 0.7.0 fixes. Somebody else *is* holding the
+  // link — two people were sent it, which is the whole reason it is a URL —
+  // and they did not answer. Before the relay acknowledged the ending, that
+  // person watched the handoff be decided and were told nothing: the `ended`
+  // was written to a socket whose sandbox was already being destroyed. Here
+  // the viewer is connected before the answer and must be told how it ended.
   const channelAt = Date.now()
   let channelUrl = ""
   let channelEvent: HandoffEvent | undefined
   let channelShot = 0
+  const channelAck = ackWatcher()
+  // The channel's `answer`, handed out when the adapter is notified and called
+  // once the watching viewer is on the link.
+  let handAnswer: (answer: (decision: "approve" | "deny") => boolean) => void =
+    () => undefined
+  const answerReady = new Promise<(decision: "approve" | "deny") => boolean>(
+    (resolve) => {
+      handAnswer = resolve
+    },
+  )
   const channelAnswered = raiseHand(page, {
     mode: "approval",
     reason: "The agent may not move money without a human",
@@ -492,6 +604,7 @@ try {
     onUrl: (url) => {
       channelUrl = url
     },
+    logger: channelAck.logger,
     onEvent: (raised) => {
       channelEvent = raised
     },
@@ -508,20 +621,49 @@ try {
             raised.url === channelUrl && channelUrl !== "",
             "the channel is handed the same link the phone would open",
           )
-          check(
-            raised.answer("approve") === true,
-            "the channel's first answer settles the handoff",
-          )
-          check(
-            raised.answer("deny") === false,
-            "a second answer from the channel is refused",
-          )
+          handAnswer(raised.answer)
         },
       },
     ],
   })
   pending = channelAnswered
+
+  const answerFromChannel = await answerReady
+  // The bystander: they opened the link, they are looking at the screenshot,
+  // and they are not the one who decides.
+  const watcher = await openHandoffPage(channelUrl)
+  await watcher.waitForFrame()
+  const answeredAt = Date.now()
+  check(
+    answerFromChannel("approve") === true,
+    "the channel's first answer settles the handoff",
+  )
+  check(
+    answerFromChannel("deny") === false,
+    "a second answer from the channel is refused",
+  )
+
+  const watcherDeadline = Date.now() + 15_000
+  while (!watcher.ending() && Date.now() < watcherDeadline) await Bun.sleep(50)
+  timings.watcherToldMs = Date.now() - answeredAt
+  log("watcher_told", {
+    seen: watcher.ending() ?? "none",
+    ms: timings.watcherToldMs,
+    endedAck: channelAck.lines[0] ?? "none",
+  })
+  check(
+    watcher.ending() === "approved",
+    `a second holder of the link who never answered is told it ended as approved (saw ${watcher.ending() ?? "nothing"})`,
+  )
+  await watcher.close()
+
   const channelResult = await channelAnswered
+  // After the handoff has returned, because that is when the line is written:
+  // the watcher above is told at the same moment the agent hears the receipt.
+  check(
+    acked(channelAck.lines),
+    `the relay stored the ending and said so before the kill (${channelAck.lines.join(",") || "no ended_ack line"})`,
+  )
   pending = null
   timings.channelApprovalMs = Date.now() - channelAt
   log("channel_approval_done", {
@@ -552,6 +694,116 @@ try {
   check(
     channelGone.status !== 200,
     `the channel-answered relay is gone (${channelGone.status})`,
+  )
+
+  // --- The human who was there and went ----------------------------------
+  //
+  // The gap this release closes. A human opens the handoff, looks at it, and
+  // closes the tab without answering — no handback, no abort, nothing on the
+  // wire. The relay is the only party that can see that socket go (it answers
+  // the heartbeats itself), so before 0.7.0 the agent sat out the whole
+  // `timeoutMs`: five minutes by default, against a browser session with a
+  // ten-minute life.
+  // A fresh paint first. A CDP screencast delivers a frame when the page
+  // composites one, and this page has been sitting still through three
+  // approvals — what is under test here is the socket, not the picture, but a
+  // handoff that never paints is a confusing way to prove it.
+  await page.goto(previewPath(app.url, "/qr"), {
+    waitUntil: "domcontentloaded",
+    timeout: 30_000,
+  })
+
+  const presenceAt = Date.now()
+  let presenceUrl = ""
+  let presenceEvent: HandoffEvent | undefined
+  const presenceAck = ackWatcher()
+  const abandoned = raiseHand(page, {
+    reason: "Aurora Bank is asking for a 2FA code",
+    qr: false,
+    timeoutMs: PRESENCE_TIMEOUT_MS,
+    humanGoneGraceMs: PRESENCE_GRACE_MS,
+    logger: presenceAck.logger,
+    onUrl: (url) => {
+      presenceUrl = url
+    },
+    onEvent: (raised) => {
+      presenceEvent = raised
+    },
+  })
+  pending = abandoned
+
+  while (presenceUrl === "") await Bun.sleep(50)
+  const leaver = await openHandoffPage(presenceUrl)
+  // The phone is *there*, which is the fact under test: the relay reports the
+  // socket, and the agent hears about it whether or not a frame has painted.
+  const shownDeadline = Date.now() + 30_000
+  while (leaver.reason() === "" && Date.now() < shownDeadline) {
+    await Bun.sleep(100)
+  }
+  check(
+    leaver.reason() === "Aurora Bank is asking for a 2FA code",
+    `the phone is on the handoff (${leaver.reason() || "nothing shown"})`,
+  )
+  log("presence_phone_open", { frames: leaver.frameCount() })
+  const leftAt = Date.now()
+  await leaver.close()
+
+  const abandonedResult = await abandoned
+  pending = null
+  timings.presenceCaseMs = Date.now() - presenceAt
+  timings.endedAfterLeaveMs = Date.now() - leftAt
+  log("presence_case", {
+    outcome: abandonedResult.outcome,
+    durationMs: abandonedResult.durationMs,
+    afterLeaveMs: timings.endedAfterLeaveMs,
+    humanSeen: presenceEvent?.humanSeen,
+    humanLeftMs: presenceEvent?.humanLeftMs,
+    endedEarly: presenceEvent?.endedEarly,
+    endedAck: presenceAck.lines[0] ?? "none",
+    ms: timings.presenceCaseMs,
+  })
+
+  check(
+    abandonedResult.outcome === "timeout",
+    `a human who walked away ends the handoff as timeout (${abandonedResult.outcome})`,
+  )
+  check(
+    abandonedResult.durationMs < PRESENCE_TIMEOUT_MS / 2,
+    `it ended on the absence, not on the wait (${abandonedResult.durationMs}ms of ${PRESENCE_TIMEOUT_MS}ms)`,
+  )
+  check(
+    timings.endedAfterLeaveMs >= PRESENCE_GRACE_MS,
+    `it waited the grace out first (${timings.endedAfterLeaveMs}ms of ${PRESENCE_GRACE_MS}ms)`,
+  )
+  check(
+    timings.endedAfterLeaveMs < PRESENCE_GRACE_MS + 15_000,
+    `and it ended within the grace plus teardown (${timings.endedAfterLeaveMs}ms)`,
+  )
+  check(
+    presenceEvent?.humanSeen === true,
+    "the wide event says a human was there",
+  )
+  check(
+    abandonedResult.durationMs === presenceEvent?.durationMs,
+    `the result reports the time the human took, not the teardown after it (${abandonedResult.durationMs}ms vs ${presenceEvent?.durationMs}ms)`,
+  )
+  check(
+    presenceEvent?.endedEarly === true,
+    "the wide event says the handoff ended early",
+  )
+  check(
+    (presenceEvent?.humanLeftMs ?? -1) >= 0,
+    `the wide event says when they left (${presenceEvent?.humanLeftMs})`,
+  )
+  check(
+    acked(presenceAck.lines),
+    `the relay acknowledged the ending before the kill (${presenceAck.lines.join(",") || "no ended_ack line"})`,
+  )
+  const leaverGone = await fetch(presenceUrl, { cache: "no-store" })
+  await leaverGone.text()
+  check(
+    leaverGone.status !== 200,
+    `its relay was destroyed too (${leaverGone.status})`,
   )
 
   // --- The cheap second case: nobody comes -------------------------------

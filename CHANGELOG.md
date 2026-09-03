@@ -5,6 +5,101 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.7.0
+
+The handoff now knows whether anybody is on the other side, and the ending is
+confirmed before the sandbox dies.
+
+Both halves close gaps this project had written down and lived with: the first
+limitation in the README ("if the human silently closes the tab, the agent
+can't tell") and the observation logged in every live approval round, where a
+second viewer of the link saw nothing because the `ended` lost its race with
+the kill.
+
+**No new outcome.** A human who walked away ends the handoff as `timeout`, the
+value it has always had for "nobody answered". `HandoffOutcome` grew once
+already, in 0.4.0, and every growth is a `switch` in somebody else's code that
+quietly stops being exhaustive — while the decision a caller makes here is
+unchanged: nobody answered, do not blindly retry the same step. What changed is
+*why*, and why belongs in the wide event, which callers read rather than branch
+on. [ADR 0009](docs/adr/0009-peer-presence-and-ended-ack.md) has the argument
+and the rejected alternatives.
+
+### Added
+
+- **The relay reports the human's socket to the agent**: `{ "type":
+  "presence", "human": boolean }`, on every connect, replace and close of the
+  phone's socket, and once immediately after an agent connects, so a
+  reconnecting agent starts from the truth. It is the only signal there can be
+  — the relay answers the heartbeats itself, so a pong proves the relay is
+  alive and says nothing about the person.
+- **`humanGoneGraceMs`, default 60 000 ms, accepted between 5 000 and
+  2 147 483 647.** Once a human has been there and
+  their phone has been gone for the whole grace, the handoff ends instead of
+  waiting out `timeoutMs`. A phone that comes back inside the grace resets it,
+  which is what makes 60 s the right default: the preview proxy cuts an idle
+  WebSocket after exactly 60 s and the phone reconnects about a second later,
+  so a shorter grace would end healthy handoffs on the platform's own
+  housekeeping. A handoff nobody ever opened is deliberately untouched and
+  waits the full `timeoutMs` — an unscanned QR code is the ordinary wait, not
+  somebody leaving.
+- **Three fields on the wide event**: `humanSeen: boolean` and `endedEarly:
+  boolean` (both **required** — additive for anyone who receives the event, one
+  edit for a TypeScript consumer that builds a `HandoffEvent` literal in a
+  test) and `humanLeftMs?: number`, the last time the phone disappeared, in ms
+  since the handoff started. `timeout` now has two shapes, and these tell them
+  apart: `endedEarly: true` is somebody who came and left; `humanSeen: false`
+  is a link that never reached anyone. Two different problems, two different
+  fixes.
+- **The presence report carries what an absent agent missed**: `seen` (has a
+  human ever been here) and `sinceMs` (how old this news is), both optional so
+  an older relay still speaks the protocol. A whole visit can begin and end
+  while the agent's socket is down — the proxy's 60 s cut, a reconnect backoff
+  — and a bare current state cannot tell that apart from a link nobody ever
+  opened. The agent uses `sinceMs` to run the grace from the moment the human
+  actually left rather than from the moment it heard about it.
+- **`{ "type": "ended_ack" }` from the relay**, sent once it has stored the
+  ending for whoever opens the link next. `sendFinal` waits up to 2 s for it
+  before `raiseHand` destroys the sandbox. Without it the ending was written to
+  a socket whose process was already being deleted — measurable in approval
+  mode, which tears down in milliseconds and has no `storageState` capture to
+  hold the door open. Against a relay that cannot answer, teardown proceeds
+  exactly as before.
+- **`invalid_option`**, an eighth `HandraiseErrorCode`. Today it is a
+  `humanGoneGraceMs` outside 5 000–2 147 483 647 ms — below the floor the
+  phone's own reconnect would end handoffs, and above the ceiling a Node timer
+  collapses to one millisecond. Checked
+  before any sandbox exists, like the mode checks, and refused rather than
+  clamped: a caller who asks for a 10 ms grace has misunderstood the option,
+  and silently substituting a minute would hide that until a handoff ended on a
+  network blip in production.
+- **A live e2e case for each half.** A scripted human opens the handoff and
+  closes the socket without answering — the run asserts the handoff ends on the
+  absence rather than on the wait, after the grace, with `endedEarly: true`.
+  For the ending, two assertions that used to be a log line: the answering
+  phone is told over the wire in both approval rounds, and a second holder of
+  the link who never answered — connected, watching, while a channel decides —
+  is told how it ended, 306 ms after the answer in the run these notes were
+  written from. Somebody who only *starts* opening the link after the answer is
+  measured and not asserted: the sandbox stops serving about a second later,
+  which is roughly what a fresh HTTPS and WebSocket handshake costs.
+  [ADR 0009](docs/adr/0009-peer-presence-and-ended-ack.md) says why that window
+  is not worth a live sandbox.
+
+### Changed
+
+- **`RelayMessage` has a third direction.** `RelayToAgent` joins `AgentToHuman`
+  and `HumanToAgent` in `src/relay/protocol.ts`; the relay is no longer only a
+  forwarder between two peers. The phone never receives either new message, and
+  the vocabulary test that keeps the relay's `MSG` constants and the protocol's
+  unions in step now spans all three.
+- **`RelayConnectionStats` carries `endedAcked`** (internal to the package),
+  and `raiseHand` logs one `ended_ack` line with it and the wait it cost.
+- **`HandoffResult.durationMs` is frozen at settlement**, the same number the
+  wide event has always carried. It used to be measured after teardown, so the
+  ending's receipt, the CDP detach and the relay's destruction were counted as
+  time the human took. Nobody waited for those.
+
 ## [0.6.0] - 2026-09-02
 
 QR passthrough, and typed errors on everything `raiseHand` throws.
@@ -468,7 +563,7 @@ Initial release. Human-in-the-loop handoff for Solari cloud browsers.
   so two simultaneous handoffs is the plan-tier ceiling.
 - TypeScript/Node only.
 
-[Unreleased]: https://github.com/Sy-D/handraise/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Sy-D/handraise/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/Sy-D/handraise/releases/tag/v0.6.0
 [0.5.1]: https://github.com/Sy-D/handraise/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Sy-D/handraise/releases/tag/v0.5.0

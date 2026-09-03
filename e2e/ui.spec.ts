@@ -32,6 +32,7 @@ import type {
   FrameMeta,
   HumanToAgent,
   RelayMessage,
+  RelayToAgent,
 } from "../src/relay/protocol"
 import type { HandoffMode } from "../src/types"
 
@@ -85,11 +86,25 @@ interface AgentClient {
   /** Put bytes on the wire that the protocol has no way to describe. */
   sendRaw(text: string): void
   next(): Promise<RelayMessage>
-  /** Every message this socket has seen, in order. `next()` never consumes it,
-   *  so a test can assert that something was sent *exactly once*. */
+  /** Every message the *phone* has sent, in order. `next()` never consumes it,
+   *  so a test can assert that something was sent *exactly once*. The relay's
+   *  own messages — `presence`, `ended_ack` — are not the phone's and are not
+   *  here: every test in this file is about what the page puts on the wire. */
   received: RelayMessage[]
   close(): void
 }
+
+/**
+ * What the relay says for itself, rather than forwarding from the phone. Keyed
+ * by the protocol union, so a third member does not compile until this harness
+ * knows whether to count it as something the page sent.
+ */
+const RELAY_ORIGINATED = new Set<string>(
+  Object.keys({
+    presence: true,
+    ended_ack: true,
+  } satisfies Record<RelayToAgent["type"], true>),
+)
 
 interface Box {
   x: number
@@ -176,6 +191,7 @@ async function connectAgent(port: number): Promise<AgentClient> {
 
   socket.on("message", (raw: Buffer) => {
     const message = parseMessage(raw.toString("utf8"))
+    if (RELAY_ORIGINATED.has(message.type)) return
     received.push(message)
     const waiter = waiters.shift()
     if (waiter) waiter(message)

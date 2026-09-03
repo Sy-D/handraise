@@ -24,8 +24,11 @@ export const GUEST_SERVER_JS = `/**
  * Routing contract (src/relay/protocol.ts): everything an agent sends goes to
  * the human and vice versa, byte for byte. The exceptions are answering
  * \`{"type":"ping"}\` with \`{"type":"pong"}\`, keeping the last \`frame\`/\`state\` so
- * a human who joins late sees something instantly, and the mode: this process
- * is started as a takeover relay or an approval relay and routes only the human
+ * a human who joins late sees something instantly, the two things this process
+ * says on its own behalf to the agent — \`presence\`, because only this side can
+ * see the phone's socket, and \`ended_ack\`, because the agent destroys the
+ * sandbox as soon as it has sent the ending — and the mode: this process is
+ * started as a takeover relay or an approval relay and routes only the human
  * messages that mode has. A hidden button is not a restriction — the human's
  * socket is reachable from any HTTP client.
  */
@@ -74,6 +77,9 @@ const MSG = {
   ABORT: "abort",
   APPROVE: "approve",
   DENY: "deny",
+  // relay -> agent, on the relay's own behalf
+  PRESENCE: "presence",
+  ENDED_ACK: "ended_ack",
   // either direction
   PING: "ping",
   PONG: "pong",
@@ -172,6 +178,9 @@ const CLOSE_GRACE_MS = 1000
 
 const PONG = JSON.stringify({ type: MSG.PONG })
 
+/** The receipt for \`ended\`, sent once this process has stored it. */
+const ENDED_ACK = JSON.stringify({ type: MSG.ENDED_ACK })
+
 /** role -> peer. At most one connection per role; a new one replaces the old. */
 const peers = new Map()
 
@@ -208,6 +217,65 @@ let humanEnded = false
 
 /** When the relay last forwarded a \`scanqr\`. See SCAN_INTERVAL_MS. */
 let lastScanAt = 0
+
+/**
+ * The \`human\` value the current agent has been told, or null when it has been
+ * told nothing yet — a fresh agent socket, which must hear the state whatever
+ * it is.
+ *
+ * This relay answers the heartbeats itself, so the agent cannot tell a phone
+ * that was closed from a phone whose owner is reading a code off another
+ * device. Only this process knows, and it is the one fact worth volunteering.
+ */
+let announcedHuman = null
+
+/**
+ * The presence history an absent agent missed, which is all of it that matters:
+ * whether a human was ever here, and when the state last changed.
+ *
+ * A bare current state is not enough. An agent's socket can be down for
+ * seconds — the proxy's 60 s cut, a reconnect backoff — and a human can open
+ * the link, read the page and close it inside that gap. Both announcements
+ * find no agent and are dropped, and "nobody is here" is also what a link
+ * nobody ever opened says. These two fields are the difference.
+ */
+let humanEverSeen = false
+let humanStateSince = Date.now()
+/** The last state these two were computed against. */
+let lastHumanState = false
+
+/**
+ * Tell the agent what is known about the human, when that has changed.
+ *
+ * Called on every connect, replace and close of the human socket, and once
+ * right after an agent connects. Deduplicated against the last value sent, so
+ * a stale socket finishing its close does not report a departure that already
+ * happened — but never suppressed for a new agent, whose \`announcedHuman\` is
+ * null, and whose report therefore carries the history above.
+ *
+ * The bookkeeping happens before the agent is looked up, because the case this
+ * exists for is the one where there is no agent to tell.
+ */
+function announcePresence() {
+  const human = peers.has("human")
+  if (human !== lastHumanState) {
+    lastHumanState = human
+    humanStateSince = Date.now()
+    if (human) humanEverSeen = true
+  }
+  const agent = peers.get("agent")
+  if (!agent || human === announcedHuman) return
+  announcedHuman = human
+  sendText(
+    agent,
+    JSON.stringify({
+      type: MSG.PRESENCE,
+      human,
+      seen: humanEverSeen,
+      sinceMs: Date.now() - humanStateSince,
+    }),
+  )
+}
 
 /**
  * Forget everything that shows the remote page. Not the ending, which a late
@@ -345,7 +413,10 @@ function closePeer(peer, reason) {
     // what keeps the human muted: the handback they are about to send has to
     // be read, held, and given to whichever agent connects next.
     resumeHuman()
-  }
+    // Whatever the last agent was told about the human is not something the
+    // next one heard. It is told the state on connect, from scratch.
+    announcedHuman = null
+  } else announcePresence()
   // Detach the reader so a replaced client that ignores the close frame can no
   // longer feed route(); a lingering listener is how a peer keeps injecting.
   if (peer.read) peer.socket.removeListener("data", peer.read)
@@ -384,13 +455,17 @@ function messageType(payload) {
 }
 
 /** Keep what a human who joins late has to be shown, and drop what they must not. */
-function rememberFromAgent(type, payload) {
+function rememberFromAgent(peer, type, payload) {
   if (type === MSG.ENDED) {
     // Terminal: keep the ending for a late human, drop everything that could
     // show the logged-in page to whoever opens the link next.
     lastEnded = payload
     forgetPage()
     pendingForAgent = null
+    // The receipt, sent after the store and not before it: the agent destroys
+    // this sandbox seconds later, and what it is waiting to hear is that
+    // whoever opens the link next will be told how the handoff ended.
+    sendText(peer, ENDED_ACK)
     return
   }
   // The agent goes on sending until it learns it has been answered — it
@@ -467,7 +542,7 @@ function route(peer, payload, opcode) {
     sendText(peer, PONG)
     return
   }
-  if (peer.role === "agent") rememberFromAgent(type, payload)
+  if (peer.role === "agent") rememberFromAgent(peer, type, payload)
   else if (!acceptFromHuman(type, payload)) return
   // Newest frame wins: drop a frame bound for a backpressured receiver rather
   // than queue it in memory. Control and terminal messages are never dropped.
@@ -659,6 +734,16 @@ server.on("upgrade", (req, socket, head) => {
       if (lastFocus) write(peer, lastFocus, OP_TEXT)
     }
   }
+
+  // Whether there is a human on the other side, and what this socket missed.
+  // For a new agent that is the current state plus the history; for a new phone
+  // it is the change the agent has been waiting for.
+  //
+  // Before the buffered answer below, and that order is load-bearing: the
+  // answer settles the handoff, and a settled handoff refuses everything it
+  // learns afterwards. Announced second, a visit that happened during the
+  // outage would be reported as a handoff nobody ever opened.
+  announcePresence()
 
   // A reconnecting agent that missed the human's handback/abort while it was
   // away gets it now, so the handoff resolves instead of falsely timing out.

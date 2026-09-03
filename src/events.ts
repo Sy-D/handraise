@@ -60,6 +60,31 @@ export interface HandoffEvent {
   qrHits: number
   /** Agent-socket reconnects during the handoff (the 60 s idle cut, drops). */
   reconnects: number
+  /**
+   * Whether a human was ever connected to the relay. False is the QR code
+   * nobody scanned — the difference between "nobody came" and "somebody came
+   * and could not finish", which no other field in this event can tell apart.
+   */
+  humanSeen: boolean
+  /**
+   * When the human's phone last disappeared while the handoff was running, in
+   * ms since it started — whether or not the phone came back.
+   *
+   * A reconnect overwrites it, so it is the last departure and not the first,
+   * and a `resolved` handoff can carry one: the socket dropped at the 60 s
+   * proxy cut, came back a second later, and the human handed back. It is
+   * absent on a handoff nobody opened and on one whose phone never dropped,
+   * and a departure after the handoff has ended is not recorded at all.
+   * `endedEarly` is the field that says the human was gone at the end.
+   */
+  humanLeftMs?: number
+  /**
+   * Whether the handoff ended because the human was gone for the whole
+   * `humanGoneGraceMs`, rather than because `timeoutMs` ran out. The outcome
+   * is `timeout` either way; this is the field that says which of the two
+   * happened, and `timeoutMs - durationMs` is what it saved.
+   */
+  endedEarly: boolean
   /** Whether cookies + localStorage were captured after a handback. */
   storageStateCaptured: boolean
   /**

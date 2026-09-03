@@ -10,8 +10,9 @@
  *    valid for an hour, so a dropped socket is recovered with backoff for as
  *    long as the handoff is running.
  * 3. The relay answers `ping` itself and does not forward it. A pong proves
- *    the relay is alive; it proves nothing about the human. There is no signal
- *    for "the human closed the tab" — the timeout is the honest answer.
+ *    the relay is alive; it proves nothing about the human. The relay says
+ *    that in its own words instead — `presence`, reported here as `onPresence`
+ *    — because it is the only party that can see the phone's socket.
  */
 import WebSocket from "ws"
 
@@ -25,7 +26,23 @@ import {
 
 const MAX_BACKOFF_MS = 8_000
 const BASE_BACKOFF_MS = 500
-const CLOSE_GRACE_MS = 2_000
+/**
+ * How long a terminal message waits for a reconnect, and how long `close()`
+ * waits for the close handshake. Exported for the tests that pin what a relay
+ * which is gone for good costs.
+ */
+export const CLOSE_GRACE_MS = 2_000
+
+/**
+ * How long `sendFinal` waits for `ended_ack` before it stops caring.
+ *
+ * The sandbox is destroyed within a second or so of this call, and the ack is
+ * the only proof that the ending was stored rather than merely written to a
+ * socket that died with the process. Two seconds is the same grace the write
+ * itself gets: long enough for a round trip to us-west and a reconnect, short
+ * enough that a relay which cannot answer never becomes the caller's problem.
+ */
+export const ENDED_ACK_TIMEOUT_MS = 2_000
 
 export interface RelayConnectionOptions {
   /** `wss://…/ws?role=agent&pt_token=…`, exactly as `startRelay()` returned it. */
@@ -34,6 +51,18 @@ export interface RelayConnectionOptions {
   onMessage: (message: HumanToAgent) => void
   /** Called on every successful connect, including reconnects. */
   onOpen?: () => void
+  /**
+   * Called with what the relay knows about the human: whether one is connected
+   * now, whether one ever was, and how old that news is in ms. Once shortly
+   * after every connect, and then on every change. The relay is the only party
+   * that can see the phone's socket — it answers the heartbeats itself — so
+   * this is the sole signal that a tab was closed.
+   *
+   * `seen` and `sinceMs` are normalised here: a relay too old to send them
+   * reports the current state as everything it knows, which is what this
+   * callback did before they existed.
+   */
+  onPresence?: (human: boolean, seen: boolean, sinceMs: number) => void
   /** Heartbeat period. Defaults to the protocol's 20 s. */
   heartbeatMs?: number
 }
@@ -47,9 +76,14 @@ export interface RelayConnection {
   send(message: AgentToHuman | Heartbeat): Promise<void>
   /**
    * Send a terminal message (the `ended` frame), waiting up to the close grace
-   * period for a reconnect to finish if the socket is momentarily down. The
-   * human's phone hangs on "Reconnecting…" forever if this is dropped, so it is
-   * worth the short wait that `send` deliberately refuses for stale frames.
+   * period for a reconnect to finish if the socket is momentarily down, and
+   * then up to `ENDED_ACK_TIMEOUT_MS` for the relay's `ended_ack` — re-sending
+   * the ending on any reconnect inside that window, because a socket that dies
+   * between the write and the relay's store is exactly what the wait is for. The human's
+   * phone hangs on "Reconnecting…" forever if this is dropped, so it is worth
+   * the short wait that `send` deliberately refuses for stale frames — and the
+   * caller destroys the sandbox next, so "written" is not the same as
+   * "stored". `stats().endedAcked` says which of the two happened.
    */
   sendFinal(message: AgentToHuman): Promise<void>
   isOpen(): boolean
@@ -66,6 +100,13 @@ export interface RelayConnectionStats {
    * second one connects; both are recovered here, and both count.
    */
   reconnects: number
+  /**
+   * Whether the relay confirmed it had stored the ending before `sendFinal`
+   * gave up on it. False until `sendFinal` is called, and false afterwards
+   * against a relay too old to answer — in which case the ending was still
+   * sent, it is only its survival past the sandbox that is unproven.
+   */
+  endedAcked: boolean
 }
 
 function toText(data: WebSocket.RawData): string {
@@ -99,6 +140,29 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
   let opens = 0
   let heartbeat: ReturnType<typeof setInterval> | null = null
   let reconnect: ReturnType<typeof setTimeout> | null = null
+  // Set while `sendFinal` is waiting for the receipt, and called by the
+  // `ended_ack` branch of `handle`. Null at every other moment, so a stray ack
+  // — a relay that answers twice, a reconnect that replays one — resolves
+  // nothing but is still latched below.
+  let acknowledgeEnded: (() => void) | null = null
+  // The latch. Set the moment an ack arrives, waiter or no waiter: on a fast
+  // link the relay can store the ending and answer before the local send
+  // callback has resumed `sendFinal`, and an ack that fell into that gap used
+  // to be thrown away — teardown then waited its full two seconds and called
+  // an ending the relay was holding unacknowledged.
+  let endedAcked = false
+  // The ending, while `sendFinal` is waiting for its receipt. A socket can die
+  // between the local write and the relay's store, and this connection then
+  // reconnects inside the ack window — which is the whole justification for
+  // waiting. The reconnect carries the ending again.
+  //
+  // Sending it twice is expected and safe: the relay's store is an assignment
+  // (`lastEnded = payload`) and it acks each copy, while a second ack outside
+  // an active waiter resolves nothing. A socket that was already down when
+  // `sendFinal` was called takes both routes — the delivery poll and this
+  // re-send — so the phone can be told the same ending twice, which is the
+  // ending it is already showing.
+  let pendingEnding: AgentToHuman | null = null
 
   const send = (message: AgentToHuman | Heartbeat): Promise<void> =>
     new Promise<void>((resolve) => {
@@ -110,12 +174,13 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       live.send(JSON.stringify(message), () => resolve())
     })
 
-  const sendFinal = (message: AgentToHuman): Promise<void> =>
-    new Promise<void>((resolve) => {
+  /** Write `message`, waiting out a reconnect. Resolves true if it went out. */
+  const deliverFinal = (message: AgentToHuman): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
       const trySend = (): boolean => {
         const live = socket
         if (!live || live.readyState !== WebSocket.OPEN) return false
-        live.send(JSON.stringify(message), () => resolve())
+        live.send(JSON.stringify(message), () => resolve(true))
         return true
       }
       if (trySend()) return
@@ -124,7 +189,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       // cleanup is never blocked.
       const giveUp = setTimeout(() => {
         clearInterval(poll)
-        resolve()
+        resolve(false)
       }, CLOSE_GRACE_MS)
       const poll = setInterval(() => {
         if (trySend()) {
@@ -134,10 +199,56 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       }, 25)
     })
 
+  /** Wait for `ended_ack`, or for the ack deadline, whichever comes first. */
+  const waitForAck = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      if (endedAcked) {
+        resolve()
+        return
+      }
+      const giveUp = setTimeout(() => {
+        acknowledgeEnded = null
+        resolve()
+      }, ENDED_ACK_TIMEOUT_MS)
+      acknowledgeEnded = () => {
+        clearTimeout(giveUp)
+        acknowledgeEnded = null
+        resolve()
+      }
+    })
+
+  const sendFinal = async (message: AgentToHuman): Promise<void> => {
+    // Held for the reconnect handler above, for as long as this is waiting.
+    pendingEnding = message
+    // No receipt for a message that was never written. The relay is gone —
+    // that is the `disconnected` path — and two more seconds of waiting for it
+    // to say so is teardown the caller pays for nothing.
+    if (await deliverFinal(message)) await waitForAck()
+    pendingEnding = null
+  }
+
   const handle = (message: RelayMessage): void => {
     switch (message.type) {
       case "ping":
         void send({ type: "pong" })
+        return
+      case "presence":
+        // The relay's own report, not a human message — and dropped once the
+        // handoff is shutting down, for the same reason a human message is:
+        // the phone closes its socket the instant it renders the ending, so
+        // the last thing this connection hears is a departure from a handoff
+        // that is already over. The core refuses it too (`watchPresence.stop`).
+        if (!shuttingDown) {
+          options.onPresence?.(
+            message.human,
+            message.seen ?? message.human,
+            message.sinceMs ?? 0,
+          )
+        }
+        return
+      case "ended_ack":
+        endedAcked = true
+        acknowledgeEnded?.()
         return
       case "tap":
       case "char":
@@ -168,6 +279,9 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
       attempt = 0
       opens += 1
       options.onOpen?.()
+      // Last, so the ending is the final thing this socket carries.
+      const ending = pendingEnding
+      if (ending && !endedAcked) live.send(JSON.stringify(ending))
     })
     live.on("message", (data: WebSocket.RawData) => {
       const message = parse(toText(data))
@@ -191,7 +305,7 @@ export function connectRelay(options: RelayConnectionOptions): RelayConnection {
     send,
     sendFinal,
     isOpen: () => socket?.readyState === WebSocket.OPEN,
-    stats: () => ({ reconnects: Math.max(0, opens - 1) }),
+    stats: () => ({ reconnects: Math.max(0, opens - 1), endedAcked }),
     close() {
       shuttingDown = true
       if (heartbeat) clearInterval(heartbeat)
